@@ -547,9 +547,19 @@ impl InstalledRuntime {
         private_root: &Path,
         port: u16,
     ) -> Result<NativeSidecar, String> {
+        self.start_bound_sidecar_threads(qualified, cache, private_root, port, 1)
+    }
+    pub(crate) fn start_bound_sidecar_threads(
+        &self,
+        qualified: &[&QualifiedRuntime],
+        cache: &Path,
+        private_root: &Path,
+        port: u16,
+        threads: u32,
+    ) -> Result<NativeSidecar, String> {
         let mut child = self.checked(|| {
             self.runtime
-                .start_bound_sidecar(qualified, cache, private_root, port)
+                .start_bound_sidecar_threads(qualified, cache, private_root, port, threads)
         })?;
         child.hold_lease(self.lease.clone());
         Ok(child)

@@ -533,6 +533,7 @@ impl VerifiedRuntime {
             Invocation::Serve {
                 port,
                 qualified: &[],
+                threads: 1,
             },
         )
     }
@@ -552,6 +553,18 @@ impl VerifiedRuntime {
         private_root: &Path,
         port: u16,
     ) -> Result<NativeSidecar, String> {
+        self.start_bound_sidecar_threads(qualified, cache, private_root, port, 1)
+    }
+    /// As `start_bound_sidecar`, serving up to `threads` requests at once (one, when the
+    /// worker runs one task at a time).
+    pub(crate) fn start_bound_sidecar_threads(
+        &self,
+        qualified: &[&QualifiedRuntime],
+        cache: &Path,
+        private_root: &Path,
+        port: u16,
+        threads: u32,
+    ) -> Result<NativeSidecar, String> {
         if !(1..=64).contains(&qualified.len())
             || port < 1024
             || qualified
@@ -560,7 +573,16 @@ impl VerifiedRuntime {
         {
             return Err("runtime_qualification_binding_invalid".into());
         }
-        self.launch(cache, private_root, Invocation::Serve { port, qualified })
+        let threads = threads.clamp(1, 64);
+        self.launch(
+            cache,
+            private_root,
+            Invocation::Serve {
+                port,
+                qualified,
+                threads,
+            },
+        )
     }
     fn launch(
         &self,
@@ -655,12 +677,21 @@ impl VerifiedRuntime {
             .env("MKL_NUM_THREADS", "1")
             .env("MACHINE_LEARNING_MODEL_INTRA_OP_THREADS", "4")
             .env("MACHINE_LEARNING_MODEL_INTER_OP_THREADS", "1")
-            .env("MACHINE_LEARNING_REQUEST_THREADS", "1")
+            .env(
+                "MACHINE_LEARNING_REQUEST_THREADS",
+                match &invocation {
+                    // As many requests at once as the worker runs tasks at once.
+                    Invocation::Serve { threads, .. } => threads.to_string(),
+                    Invocation::Qualify { .. } => "1".into(),
+                },
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         match invocation {
-            Invocation::Serve { port, qualified } => {
+            Invocation::Serve {
+                port, qualified, ..
+            } => {
                 if qualified.len() > 1 {
                     // Older signed runtimes must reject this invocation rather than use only the last pair.
                     command.arg("--binding-set");
@@ -821,6 +852,8 @@ enum Invocation<'a> {
     Serve {
         port: u16,
         qualified: &'a [&'a QualifiedRuntime],
+        /// How many requests the process serves at once.
+        threads: u32,
     },
     Qualify {
         spec: &'a [u8],

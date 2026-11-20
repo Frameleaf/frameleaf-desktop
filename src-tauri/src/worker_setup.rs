@@ -29,6 +29,12 @@ pub(crate) struct SetupStatus {
     /// What the AI runtime process said when it last ended by itself: its exit status and the
     /// last lines of its error output. Shown under the stop reason; cleared by a finished task.
     pub detail: Option<String>,
+    /// How many tasks this computer runs at once, when the server lets it hold several.
+    pub concurrent_tasks: u32,
+    /// The most this computer runs at once since it ran short of memory doing more. Kept for
+    /// as long as AI processing runs, across restarts of its setup.
+    #[serde(skip)]
+    pub(crate) capacity_ceiling: Option<u32>,
 }
 #[derive(Clone, Serialize, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -81,6 +87,8 @@ impl Progress {
             completed_tasks: current.completed_tasks,
             providers: current.providers.clone(),
             detail: current.detail.clone(),
+            concurrent_tasks: current.concurrent_tasks,
+            capacity_ceiling: current.capacity_ceiling,
         };
         if *current == status {
             return;
@@ -113,6 +121,21 @@ impl Progress {
         let Some(report) = report else { return };
         eprintln!("worker_runtime_exited: {report}");
         self.update(|status| status.detail = Some(report));
+    }
+    fn capacity_ceiling(&self) -> Option<u32> {
+        self.status.lock().unwrap().capacity_ceiling
+    }
+    /// Run no more than this many tasks at once from now on.
+    fn lower_capacity(&self, ceiling: u32) {
+        self.update(|status| {
+            let ceiling = ceiling.max(1);
+            status.capacity_ceiling =
+                Some(status.capacity_ceiling.map_or(ceiling, |c| c.min(ceiling)));
+            status.concurrent_tasks = status.concurrent_tasks.min(ceiling);
+        });
+    }
+    fn running_at_once(&self, tasks: u32) {
+        self.update(|status| status.concurrent_tasks = tasks);
     }
     fn completed_tasks(&self) -> u64 {
         self.status.lock().unwrap().completed_tasks
@@ -379,6 +402,60 @@ fn provider_independent(code: &str) -> bool {
     code == "desktop_qualification_hold"
         || code.starts_with("desktop_clip_index_")
         || code == "desktop_clip_space_unavailable"
+}
+/// How many tasks of each kind the server lets one computer run at once (`concurrency` in the
+/// `/models` reply, from the administrator's Jobs setting). One where the reply does not say.
+fn inventory_concurrency(inventory: &serde_json::Value) -> std::collections::BTreeMap<String, u32> {
+    inventory["workloads"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let limit = entry["concurrency"].as_u64().unwrap_or(1).clamp(1, 64) as u32;
+            Some((entry["workload"].as_str()?.to_owned(), limit))
+        })
+        .collect()
+}
+/// How many tasks this computer can work on at once, whatever the server would allow.
+///
+/// - Memory: beside the loaded models (`model_memory`), each task in hand needs working memory
+///   of its own, taken as a quarter of the models' and at least 256 MB. What is free now, less
+///   the models, says how many fit. Unknown free memory is one task.
+/// - The device: a graphics card or neural engine works on several inputs at once, up to
+///   eight here. The processor already gives each task four threads, so one task, or two on a
+///   computer with eight cores or more.
+///
+/// It is a starting point, not a promise: a graphics card's own memory is not something this
+/// app can read, so running short while working lowers it (`Progress::lower_capacity`).
+fn local_capacity(
+    accelerated: bool,
+    cores: usize,
+    available_memory: Option<u64>,
+    model_memory: u64,
+) -> u32 {
+    let per_task = (model_memory / 4).max(256 * 1024 * 1024);
+    let by_memory =
+        available_memory.map_or(1, |free| 1 + free.saturating_sub(model_memory) / per_task);
+    let by_device = if accelerated {
+        8
+    } else {
+        (cores / 4).clamp(1, 2) as u64
+    };
+    by_memory.clamp(1, by_device) as u32
+}
+/// How many tasks to run at once: what the server allows for the tasks that are ready, what
+/// this computer can take, and no more than it managed since it last ran short of memory.
+fn concurrent_tasks(
+    limits: &std::collections::BTreeMap<String, u32>,
+    ready: &std::collections::BTreeSet<String>,
+    local: u32,
+    ceiling: Option<u32>,
+) -> u32 {
+    let allowed: u32 = ready
+        .iter()
+        .map(|workload| limits.get(workload).copied().unwrap_or(1))
+        .sum();
+    allowed.min(local).min(ceiling.unwrap_or(u32::MAX)).max(1)
 }
 /// The server withdraws a model from this computer after this many failed tasks in a row
 /// (`native_predictor::counts_against_grant`) and then leases it nothing for that model.
@@ -1319,9 +1396,11 @@ async fn prepare_on(
     if !caps.features.worker_auto_setup {
         return Err("server_update_required".into());
     }
+    let several_leases = caps.features.worker_concurrent_leases;
     let worker = WorkerTransport::load(&saved)?
         .with_clock_skew(caps.clock_skew_ms)
-        .with_withdrawal_notice(caps.features.worker_withdrawal_notice);
+        .with_withdrawal_notice(caps.features.worker_withdrawal_notice)
+        .with_concurrent_leases(several_leases);
     let (source, provider) = (
         installed.source_revision().to_owned(),
         installed.provider().to_owned(),
@@ -1334,12 +1413,14 @@ async fn prepare_on(
     // The server decides which models run here, and may change its mind at any time: asked
     // again while working, a different answer sets this computer up again with the new models.
     let signature = inventory_signature(&inventory);
+    // How many tasks of each kind the server lets this computer run at once.
+    let mut limits = inventory_concurrency(&inventory);
+    // A question that fails changes nothing; the claims report a server in trouble.
+    let latest_inventory = || async { worker.model_inventory(&source, &provider).await.ok() };
     let models_changed = || async {
-        // A question that fails changes nothing; the claims report a server in trouble.
-        worker
-            .model_inventory(&source, &provider)
+        latest_inventory()
             .await
-            .is_ok_and(|value| inventory_signature(&value) != signature)
+            .is_some_and(|value| inventory_signature(&value) != signature)
     };
     let mut models_checked = std::time::Instant::now();
     let (groups, statuses) = inventory_profiles(
@@ -1721,6 +1802,15 @@ async fn prepare_on(
             *memory = (*memory).max(profile.minimum_memory());
         }
         let required_memory = memory_by_cache.values().sum();
+        // For choosing how many tasks to run at once: which tasks are ready, and whether any
+        // runs on a graphics card or neural engine.
+        let ready: std::collections::BTreeSet<String> = accepted_profiles
+            .iter()
+            .filter_map(|profile| profile.model_key().split(':').next().map(str::to_owned))
+            .collect();
+        let accelerated = accepted_profiles
+            .iter()
+            .any(|profile| profile.provider() != crate::provider_selection::CPU);
         let combined = paths.data.join("model-sets");
         let cancelled = progress.cancelled.clone();
         let cache = tauri::async_runtime::spawn_blocking(move || {
@@ -1766,6 +1856,20 @@ async fn prepare_on(
                 continue 'qualification;
             }
             progress.set("starting-worker", None);
+            // One task at a time unless the server lets a desktop hold several leases. Then:
+            // as many as the server's Jobs setting allows and this computer can take.
+            let free_memory = tauri::async_runtime::spawn_blocking(crate::resource_policy::sample)
+                .await
+                .ok()
+                .and_then(|status| status.available_memory);
+            let cores = std::thread::available_parallelism().map_or(1, |cores| cores.get());
+            let local = local_capacity(accelerated, cores, free_memory, required_memory);
+            let mut at_once = match several_leases {
+                true => concurrent_tasks(&limits, &ready, local, progress.capacity_ceiling()),
+                false => 1,
+            };
+            progress.running_at_once(at_once);
+            let threads = at_once;
             let scratch = paths.data.join("scratch");
             let cache = cache.clone();
             let (runtime, proofs, mut predictor) =
@@ -1782,7 +1886,8 @@ async fn prepare_on(
                         .iter()
                         .map(|(proof, accepted)| (proof, accepted))
                         .collect();
-                    let predictor = installed.start(&bindings, &cache, &scratch, port, now)?;
+                    let predictor =
+                        installed.start(&bindings, &cache, &scratch, port, now, threads)?;
                     Ok::<_, String>((installed, prepared, predictor))
                 })
                 .await
@@ -1849,9 +1954,26 @@ async fn prepare_on(
                 // The server may have changed a task's model, or turned a task on or off.
                 if models_checked.elapsed() >= MODEL_RECHECK {
                     models_checked = std::time::Instant::now();
-                    if models_changed().await {
-                        predictor.stop()?;
-                        return Err("worker_models_changed".into());
+                    if let Some(latest) = latest_inventory().await {
+                        if inventory_signature(&latest) != signature {
+                            predictor.stop()?;
+                            return Err("worker_models_changed".into());
+                        }
+                        // The administrator's Jobs setting is followed without setting up
+                        // again: the next claim asks for what it allows now. The runtime
+                        // process serves as many requests as it was started for, so a higher
+                        // setting takes full effect when the process next starts.
+                        limits = inventory_concurrency(&latest);
+                        if several_leases {
+                            at_once = concurrent_tasks(
+                                &limits,
+                                &ready,
+                                local,
+                                progress.capacity_ceiling(),
+                            )
+                            .min(threads);
+                            progress.running_at_once(at_once);
+                        }
                     }
                 }
                 progress.set("working", None);
@@ -1861,6 +1983,7 @@ async fn prepare_on(
                         &worker,
                         &accepted,
                         &mut cancel,
+                        several_leases.then_some(at_once),
                         |workload| progress.active(Some(workload)),
                     ),
                     lease_interruption(&progress, &clock),
@@ -1870,59 +1993,75 @@ async fn prepare_on(
                 .await;
                 progress.active(None);
                 match completed {
-                    Ok(Step::Completed) => {
-                        failures.completed();
-                        strikes.completed(predictor.claimed_model());
-                        progress.completed();
-                    }
-                    Ok(step @ (Step::Dropped(_) | Step::Busy(_))) => {
-                        let (code, task_failed) = match step {
-                            Step::Dropped(code) => (code, true),
-                            Step::Busy(code) => (code, false),
-                            _ => unreachable!(),
-                        };
-                        if task_failed && strikes.failed(predictor.claimed_model(), &code) {
-                            // By now the server has withdrawn the model and will lease nothing
-                            // for it: qualify again, which grants it again.
+                    Ok(steps) => {
+                        let batch = steps.len();
+                        let (mut requalify, mut refused, mut idle) = (false, 0usize, false);
+                        let mut dropped: Option<String> = None;
+                        for task in steps {
+                            match task.step {
+                                Step::Completed => {
+                                    failures.completed();
+                                    strikes.completed(task.model.as_deref());
+                                    progress.completed();
+                                }
+                                Step::Idle => idle = true,
+                                Step::Busy(code) => dropped = Some(code),
+                                Step::Dropped(code) => {
+                                    refused += usize::from(code == "runtime_prediction_refused");
+                                    // By now the server has withdrawn the model and will lease
+                                    // nothing for it: qualify again, which grants it again.
+                                    requalify |= strikes.failed(task.model.as_deref(), &code);
+                                    dropped = Some(code);
+                                }
+                            }
+                        }
+                        // The model refused half or more of the tasks it was given at once:
+                        // most likely too many for this computer's memory. Run half as many.
+                        if batch > 1 && refused * 2 >= batch {
+                            at_once = (at_once / 2).max(1);
+                            progress.lower_capacity(at_once);
+                        }
+                        if requalify {
                             predictor.stop()?;
                             continue 'qualification;
                         }
-                        // FD-52: the accelerated runtime's process died while inferring: its
-                        // workloads move to the processor instead of crashing on every restart.
-                        let lane = predictor.failed_lane().map(str::to_owned);
-                        if lane.is_some_and(|lane| plan.demote_runtime(&lane, &code)) {
-                            progress.crashed(predictor.exit_report());
-                            predictor.stop()?;
-                            continue 'qualification;
+                        if let Some(code) = dropped {
+                            // FD-52: the accelerated runtime's process died while inferring: its
+                            // workloads move to the processor instead of crashing on every restart.
+                            let lane = predictor.failed_lane().map(str::to_owned);
+                            if lane.is_some_and(|lane| plan.demote_runtime(&lane, &code)) {
+                                progress.crashed(predictor.exit_report());
+                                predictor.stop()?;
+                                continue 'qualification;
+                            }
+                            let (delay, show) = failures.dropped();
+                            if show {
+                                // A long run of failed tasks or server errors: say why while waiting.
+                                progress.set("reconnecting", Some(code));
+                            }
+                            cancellable(
+                                async {
+                                    tokio::time::sleep(delay).await;
+                                    Ok(())
+                                },
+                                &progress.cancelled,
+                            )
+                            .await?;
+                            if !predictor.is_running()? {
+                                // Inference was cut short: load the models again before the next claim.
+                                break;
+                            }
+                        } else if idle {
+                            progress.set("waiting-for-work", None);
+                            cancellable(
+                                async {
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                    Ok(())
+                                },
+                                &progress.cancelled,
+                            )
+                            .await?;
                         }
-                        let (delay, show) = failures.dropped();
-                        if show {
-                            // A long run of failed tasks or server errors: say why while waiting.
-                            progress.set("reconnecting", Some(code));
-                        }
-                        cancellable(
-                            async {
-                                tokio::time::sleep(delay).await;
-                                Ok(())
-                            },
-                            &progress.cancelled,
-                        )
-                        .await?;
-                        if !predictor.is_running()? {
-                            // Inference was cut short: load the models again before the next claim.
-                            break;
-                        }
-                    }
-                    Ok(Step::Idle) => {
-                        progress.set("waiting-for-work", None);
-                        cancellable(
-                            async {
-                                tokio::time::sleep(Duration::from_secs(1)).await;
-                                Ok(())
-                            },
-                            &progress.cancelled,
-                        )
-                        .await?;
                     }
                     Err(reason) if reason.starts_with("resource_") => {
                         predictor.stop()?;
@@ -1947,6 +2086,12 @@ async fn prepare_on(
                         check_cancel(&progress.cancelled)?;
                         // Why the process ended, for the page and the log, before it is cleared.
                         progress.crashed(predictor.exit_report());
+                        // The runtime ended or stopped answering while working on several
+                        // tasks at once: the likeliest cause is memory. One at a time from
+                        // here on, instead of stopping.
+                        if at_once > 1 && runtime_crash(&reason) {
+                            progress.lower_capacity(1);
+                        }
                         let lane = predictor.failed_lane().map(str::to_owned);
                         if lane.is_some_and(|lane| plan.demote_runtime(&lane, &reason)) {
                             predictor.stop()?;
@@ -3535,6 +3680,161 @@ mod tests {
                 "desktop_qualification_hold"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn several_tasks_run_at_once_each_under_its_own_lease() {
+        use crate::native_predictor::steps_with;
+        let server = FakeServer::start();
+        server.offer_concurrent_leases(3);
+        let device = server.enrol();
+        let worker = server.session(&device).await.unwrap();
+        let qualification = server.qualification(&worker).await;
+        server.queue(&device, 5);
+        let (_keep, mut cancel) = tokio::sync::watch::channel(false);
+        let (running, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let steps = steps_with(
+            &worker,
+            &[&qualification],
+            &mut cancel,
+            Some(3),
+            |_| async {
+                let now = running.fetch_add(1, Ordering::AcqRel) + 1;
+                most.fetch_max(now, Ordering::AcqRel);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                running.fetch_sub(1, Ordering::AcqRel);
+                Ok(serde_json::json!({}))
+            },
+        )
+        .await
+        .unwrap();
+        // Room for three: three were claimed, worked on together, and each reported.
+        assert_eq!(steps, [Step::Completed, Step::Completed, Step::Completed]);
+        assert_eq!(most.load(Ordering::Acquire), 3);
+        assert_eq!(server.completed(&device), 3);
+        assert_eq!(server.reports(&device), ["result", "result", "result"]);
+        // The first claim waits for work; the ones for more room do not hold the line.
+        let (slots, waits) = server.claims();
+        assert_eq!(slots, [3, 2, 1]);
+        assert_eq!(waits, [20_000, 0, 0]);
+
+        // One task the model refuses is that task's outcome only: the others are done.
+        let turn = AtomicUsize::new(0);
+        let steps = steps_with(&worker, &[&qualification], &mut cancel, Some(3), |_| {
+            let refused = turn.fetch_add(1, Ordering::AcqRel) == 0;
+            async move {
+                match refused {
+                    true => Err("runtime_prediction_refused".into()),
+                    false => Ok(serde_json::json!({})),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| **step == Step::Completed)
+                .count(),
+            1
+        );
+        assert_eq!(server.failures(), ["input-invalid"]);
+        assert_eq!(server.completed(&device), 4);
+    }
+
+    #[tokio::test]
+    async fn a_stop_hands_back_every_lease_it_holds() {
+        use crate::native_predictor::steps_with;
+        let server = FakeServer::start();
+        server.offer_concurrent_leases(3);
+        let device = server.enrol();
+        let worker = server.session(&device).await.unwrap();
+        let qualification = server.qualification(&worker).await;
+        server.queue(&device, 3);
+        let (stop, mut cancel) = tokio::sync::watch::channel(false);
+        let predicting = AtomicUsize::new(0);
+        let all_running = tokio::sync::Notify::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            returning_lease(
+                steps_with(
+                    &worker,
+                    &[&qualification],
+                    &mut cancel,
+                    Some(3),
+                    |_| async {
+                        if predicting.fetch_add(1, Ordering::AcqRel) == 2 {
+                            all_running.notify_one();
+                        }
+                        std::future::pending::<Result<serde_json::Value, String>>().await
+                    },
+                ),
+                async {
+                    all_running.notified().await;
+                    "worker_setup_cancelled".to_owned()
+                },
+                &stop,
+                LEASE_RETURN,
+            ),
+        )
+        .await
+        .expect("the stop waited for the tasks");
+        assert_eq!(result, Err("worker_setup_cancelled".into()));
+        assert_eq!(server.failures(), ["cancelled", "cancelled", "cancelled"]);
+    }
+
+    #[test]
+    fn the_number_of_tasks_at_once_follows_the_server_and_this_computers_limits() {
+        const GB: u64 = 1024 * 1024 * 1024;
+        // The processor: one task, or two with eight cores, memory allowing.
+        assert_eq!(local_capacity(false, 4, Some(32 * GB), 2 * GB), 1);
+        assert_eq!(local_capacity(false, 8, Some(32 * GB), 2 * GB), 2);
+        assert_eq!(local_capacity(false, 16, Some(32 * GB), 2 * GB), 2);
+        // A graphics card or neural engine: up to eight, by the memory that is free beside
+        // the models (2 GB of models: half a gigabyte of working memory for each task).
+        assert_eq!(local_capacity(true, 8, Some(32 * GB), 2 * GB), 8);
+        assert_eq!(local_capacity(true, 8, Some(3 * GB), 2 * GB), 3);
+        assert_eq!(local_capacity(true, 8, Some(GB), 2 * GB), 1);
+        // Free memory that can't be read is one task.
+        assert_eq!(local_capacity(true, 8, None, 2 * GB), 1);
+
+        let inventory = serde_json::json!({"workloads":[
+            {"workload":"clip","state":"eligible","concurrency":4},
+            {"workload":"face","state":"eligible","concurrency":2},
+            {"workload":"ocr","state":"eligible"},
+            {"workload":"enrichment","state":"unsupported","concurrency":900},
+        ]});
+        let limits = inventory_concurrency(&inventory);
+        assert_eq!(limits["clip"], 4);
+        // A reply that does not say (an older server) is one; a nonsense number is capped.
+        assert_eq!((limits["ocr"], limits["enrichment"]), (1, 64));
+        let ready = |tasks: &[&str]| tasks.iter().map(|task| task.to_string()).collect();
+        // What the server allows for the ready tasks, capped by this computer...
+        assert_eq!(
+            concurrent_tasks(&limits, &ready(&["clip", "face"]), 8, None),
+            6
+        );
+        assert_eq!(
+            concurrent_tasks(&limits, &ready(&["clip", "face"]), 3, None),
+            3
+        );
+        assert_eq!(concurrent_tasks(&limits, &ready(&["ocr"]), 8, None), 1);
+        // ...and by what it managed since it last ran short of memory.
+        assert_eq!(
+            concurrent_tasks(&limits, &ready(&["clip", "face"]), 8, Some(1)),
+            1
+        );
+
+        // Running short lowers the number for as long as AI processing runs, never raises it.
+        let progress = quiet();
+        progress.running_at_once(6);
+        progress.lower_capacity(3);
+        progress.lower_capacity(5);
+        assert_eq!(progress.capacity_ceiling(), Some(3));
+        progress.set("working", None);
+        assert_eq!(progress.capacity_ceiling(), Some(3));
+        assert_eq!(progress.status.lock().unwrap().concurrent_tasks, 3);
     }
 
     #[test]

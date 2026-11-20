@@ -756,6 +756,7 @@ impl Runtimes {
         private_root: &Path,
         port: u16,
         now_ms: i64,
+        threads: u32,
     ) -> Result<NativePredictor, String> {
         let mut runtimes = vec![(&self.cpu.installed, port)];
         if let Some(lane) = &self.accelerated {
@@ -768,7 +769,7 @@ impl Runtimes {
             drop(reservation);
             runtimes.push((&lane.installed, second));
         }
-        NativePredictor::start_lanes_at(&runtimes, bindings, cache, private_root, now_ms)
+        NativePredictor::start_lanes_at(&runtimes, bindings, cache, private_root, now_ms, threads)
     }
 }
 

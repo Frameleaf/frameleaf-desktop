@@ -528,6 +528,8 @@ struct Connection {
     clock: Arc<ServerClock>,
     /// The server understands `reportWithdrawn` on a claim (`features.workerWithdrawalNotice`).
     report_withdrawn: bool,
+    /// The server lets this computer hold several leases (`features.workerConcurrentLeases`).
+    concurrent_leases: bool,
 }
 /// How far the server's clock is ahead of this computer's (`transport::clock_skew`), and when
 /// that was read. The difference only holds while this computer's clock keeps time: after it is
@@ -996,8 +998,12 @@ impl WorkerTransport {
         let mut connection = self.0.lock().await;
         connection.ensure_current().await?;
         // Protocol 2: the reply carries the server's catalogue profile of each model it selected.
-        let payload = serde_json::json!({"runtimeSourceRevision":source,"provider":provider,"protocolVersion":2})
-            .to_string();
+        let mut payload = serde_json::json!({"runtimeSourceRevision":source,"provider":provider,"protocolVersion":2});
+        if connection.concurrent_leases {
+            // The reply then says how many tasks of each kind may run at once here.
+            payload["concurrentLeases"] = true.into();
+        }
+        let payload = payload.to_string();
         let response = connection
             .request(
                 Method::POST,
@@ -1030,6 +1036,13 @@ impl WorkerTransport {
         self.0.get_mut().report_withdrawn = supported;
         self
     }
+    /// Hold several leases at once, where the server offers it. Only then does `/models` ask
+    /// for each task's `concurrency` and a claim carry `slots`: an older server refuses a
+    /// field it does not know.
+    pub(crate) fn with_concurrent_leases(mut self, supported: bool) -> Self {
+        self.0.get_mut().concurrent_leases = supported;
+        self
+    }
     fn over(connection: Connection) -> Self {
         let clock = connection.clock.clone();
         Self(Mutex::new(connection), clock)
@@ -1053,6 +1066,7 @@ impl WorkerTransport {
             checkpoint: credentials::save_worker_checkpoint,
             clock: Arc::default(),
             report_withdrawn: false,
+            concurrent_leases: false,
         }))
     }
     pub async fn request_qualification(
@@ -1187,13 +1201,29 @@ impl WorkerTransport {
         &self,
         qualifications: &[&AcceptedQualification],
     ) -> Result<Option<(usize, ClaimedTask)>, String> {
+        self.claim_with(qualifications, None, 20_000).await
+    }
+    /// As `claim_many`. `slots`: how many more tasks this computer can take right now; sent
+    /// only to a server that lets a desktop hold several leases, which then returns a new
+    /// lease each time, never one already held. `wait_ms`: how long the server may hold the
+    /// request open for work to arrive; zero while leases are held, because signed requests go
+    /// one at a time and a held-open claim would keep their heartbeats and results waiting.
+    pub(crate) async fn claim_with(
+        &self,
+        qualifications: &[&AcceptedQualification],
+        slots: Option<u32>,
+        wait_ms: u32,
+    ) -> Result<Option<(usize, ClaimedTask)>, String> {
         let mut connection = self.0.lock().await;
         connection.resync().await?;
         let at = connection.now()?;
         let keys = claim_models(qualifications, &connection.worker, at)?;
         connection.ensure_current().await?;
         claim_models(qualifications, &connection.worker, connection.now()?)?;
-        let mut payload = serde_json::json!({"modelKeys":keys,"waitMs":20000});
+        let mut payload = serde_json::json!({"modelKeys":keys,"waitMs":wait_ms.min(20_000)});
+        if let Some(slots) = slots.filter(|_| connection.concurrent_leases) {
+            payload["slots"] = slots.clamp(1, 64).into();
+        }
         if connection.report_withdrawn {
             payload["reportWithdrawn"] = true.into();
         }

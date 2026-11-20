@@ -62,6 +62,12 @@ struct State {
     dateless: bool,
     /// The server understands `reportWithdrawn` on a claim and advertises it.
     withdrawal_notice: bool,
+    /// The server lets a desktop hold several leases: how many, when it does.
+    concurrency: Option<u32>,
+    /// The `slots` of every claim that carried it, in order.
+    slots: Vec<u64>,
+    /// The `waitMs` of every claim, in order.
+    waits: Vec<u64>,
     /// Every authenticated request's path, in the order the server handled it.
     handled: Vec<String>,
 }
@@ -101,6 +107,7 @@ impl State {
                 json!({"protocolVersion":1,"serverId":"fixture-server","features":{
                 "enrollment":true,"worker":true,"workerSession":true,"workerAutoSetup":true,
                 "workerWithdrawalNotice":self.withdrawal_notice,
+                "workerConcurrentLeases":self.concurrency.is_some(),
                 "sources":false,"nativeHost":false}}),
             );
         }
@@ -189,15 +196,33 @@ impl State {
             ("POST", "/api/desktop/worker/claim", _) => {
                 // As the server: a field it does not know is refused, whatever its value. A
                 // server from before the notice does not know `reportWithdrawn`.
-                let known: &[&str] = match self.withdrawal_notice {
-                    true => &["modelKeys", "waitMs", "reportWithdrawn"],
-                    false => &["modelKeys", "waitMs"],
-                };
+                let mut known = vec!["modelKeys", "waitMs"];
+                if self.withdrawal_notice {
+                    known.push("reportWithdrawn");
+                }
+                // And one from before several leases does not know `slots`.
+                if self.concurrency.is_some() {
+                    known.push("slots");
+                }
                 if payload
                     .as_object()
                     .is_some_and(|fields| fields.keys().any(|key| !known.contains(&key.as_str())))
                 {
                     return refuse(400, "desktop_worker_payload_invalid");
+                }
+                self.waits
+                    .push(payload["waitMs"].as_u64().unwrap_or(20_000));
+                if let Some(slots) = payload["slots"].as_u64() {
+                    self.slots.push(slots);
+                    // A new lease only while this desktop holds fewer than the task allows.
+                    let held = self
+                        .leases
+                        .values()
+                        .filter(|(owner, _)| owner == &device)
+                        .count();
+                    if held as u32 >= self.concurrency.unwrap_or(1) {
+                        return reply(json!({"task":null}));
+                    }
                 }
                 if self.withdrawn.contains(&device) && payload["reportWithdrawn"] == true {
                     return refuse(409, "desktop_qualification_hold");
@@ -369,6 +394,7 @@ impl FakeServer {
             .ok_or("desktop_protocol_unsupported")?;
         let skew = capabilities.clock_skew_ms;
         let notice = capabilities.features.worker_withdrawal_notice;
+        let several = capabilities.features.worker_concurrent_leases;
         let worker =
             transport::issue_worker_session_as(&client, saved, &device.identity, skew).await?;
         Ok(WorkerTransport::over(Connection {
@@ -380,8 +406,11 @@ impl FakeServer {
             checkpoint: |_, _| Ok(()),
             clock: Arc::default(),
             report_withdrawn: false,
+            concurrent_leases: false,
         })
         .with_clock_skew(skew)
+        // As `worker_setup::prepare_on`: several leases only where the server offers them.
+        .with_concurrent_leases(several)
         // As `worker_setup::prepare_on`: only a server that advertises the notice is asked.
         .with_withdrawal_notice(notice))
     }
@@ -449,6 +478,15 @@ impl FakeServer {
     /// Put the server's clock this many seconds ahead of this computer's (negative: behind).
     pub(crate) fn set_clock_offset(&self, seconds: i64) {
         self.state.lock().unwrap().clock_offset = seconds;
+    }
+    /// Let a desktop hold up to this many leases at once, and advertise it, from now on.
+    pub(crate) fn offer_concurrent_leases(&self, concurrency: u32) {
+        self.state.lock().unwrap().concurrency = Some(concurrency);
+    }
+    /// The `slots` and the `waitMs` of the claims so far.
+    pub(crate) fn claims(&self) -> (Vec<u64>, Vec<u64>) {
+        let state = self.state.lock().unwrap();
+        (state.slots.clone(), state.waits.clone())
     }
     /// Understand and advertise the withdrawal notice from now on.
     pub(crate) fn offer_withdrawal_notice(&self) {
@@ -870,4 +908,31 @@ async fn after_this_computers_clock_moves_the_server_time_is_read_again_before_a
             .as_deref(),
         Some("worker_request_interrupted")
     );
+}
+
+#[tokio::test]
+async fn slots_are_sent_only_to_a_server_that_lets_a_desktop_hold_several_leases() {
+    let server = FakeServer::start();
+    let device = server.enrol();
+    server.queue(&device, 2);
+    // A server from before several leases refuses a claim that carries `slots`: it is never
+    // sent the field, whatever room this computer has, and gives one task as it always did.
+    let worker = server.session(&device).await.unwrap();
+    let qualification = server.qualification(&worker).await;
+    let claimed = worker.claim_with(&[&qualification], Some(4), 20_000).await;
+    assert!(claimed.unwrap().is_some());
+    assert_eq!(server.claims(), (vec![], vec![20_000]));
+    // One that offers them is told how many more tasks there is room for, and hands over a
+    // new lease each time until this desktop holds as many as the task allows.
+    server.offer_concurrent_leases(2);
+    let worker = server.session(&device).await.unwrap();
+    let qualification = server.qualification(&worker).await;
+    server.queue(&device, 3);
+    let first = worker.claim_with(&[&qualification], Some(4), 20_000).await;
+    let second = worker.claim_with(&[&qualification], Some(3), 0).await;
+    let third = worker.claim_with(&[&qualification], Some(2), 0).await;
+    let (first, second) = (first.unwrap().unwrap().1, second.unwrap().unwrap().1);
+    assert_ne!(first.id, second.id);
+    assert!(third.unwrap().is_none());
+    assert_eq!(server.claims(), (vec![4, 3, 2], vec![20_000, 20_000, 0, 0]));
 }

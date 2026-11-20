@@ -316,8 +316,9 @@ async fn next_task(
     transport: &WorkerTransport,
     qualifications: &[&AcceptedQualification],
     cancel: &mut watch::Receiver<bool>,
+    slots: Option<u32>,
 ) -> Result<Result<(usize, ClaimedTask), Step>, String> {
-    let claim = transport.claim_many(qualifications);
+    let claim = transport.claim_with(qualifications, slots, 20_000);
     tokio::pin!(claim);
     let claimed = tokio::select! {
         biased;
@@ -338,6 +339,91 @@ async fn next_task(
         // Nothing was claimed and nothing is wrong with this session: ask again after a pause.
         Err(code) if server_unavailable(&code) => Ok(Err(Step::Busy(code))),
         Err(code) => Err(code),
+    }
+}
+/// The tasks to run at once: the first is waited for, as one always was; while there is room
+/// (`slots`, from a server that lets a desktop hold several leases) more are asked for without
+/// waiting, and what the server hands over is what runs. A refused or failed extra claim just
+/// ends the asking: the tasks in hand are run.
+async fn claim_batch(
+    transport: &WorkerTransport,
+    qualifications: &[&AcceptedQualification],
+    cancel: &mut watch::Receiver<bool>,
+    slots: Option<u32>,
+) -> Result<Result<Vec<(usize, ClaimedTask)>, Step>, String> {
+    let first = match next_task(transport, qualifications, cancel, slots).await? {
+        Ok(claimed) => claimed,
+        Err(step) => return Ok(Err(step)),
+    };
+    let mut claimed = vec![first];
+    while let Some(room) = slots
+        .map(|slots| slots.saturating_sub(claimed.len() as u32))
+        .filter(|room| *room > 0 && !*cancel.borrow())
+    {
+        match transport.claim_with(qualifications, Some(room), 0).await {
+            Ok(Some(next)) => claimed.push(next),
+            _ => break,
+        }
+    }
+    Ok(Ok(claimed))
+}
+/// What became of one claimed task, and which model it was for.
+#[derive(Debug, PartialEq)]
+pub(crate) struct TaskStep {
+    /// The model key of the task; `None` when the step claimed nothing.
+    pub model: Option<String>,
+    pub step: Step,
+}
+impl TaskStep {
+    fn unclaimed(step: Step) -> Vec<Self> {
+        vec![Self { model: None, step }]
+    }
+}
+/// Run the claimed tasks side by side, each under its own lease with its own heartbeat. One
+/// task failing, being refused or losing its lease is that task's outcome only.
+async fn run_batch<'a, F, P>(
+    transport: &WorkerTransport,
+    qualifications: &[&AcceptedQualification],
+    cancel: &watch::Receiver<bool>,
+    claimed: &'a [(usize, ClaimedTask)],
+    predict: F,
+) -> Vec<Result<(), TaskFailure>>
+where
+    F: Fn(usize, &'a ClaimedTask, Vec<u8>) -> P,
+    P: Future<Output = Result<Value, String>>,
+{
+    let predict = &predict;
+    futures_util::future::join_all(claimed.iter().map(|(index, task)| {
+        let mut cancel = cancel.clone();
+        async move {
+            let run = |input| predict(*index, task, input);
+            run_claimed(transport, task, qualifications[*index], &mut cancel, run).await
+        }
+    }))
+    .await
+}
+/// Tell the server what became of each task. The first failure that is not confined to one
+/// task is returned after every task has been settled.
+async fn settle_batch(
+    transport: &WorkerTransport,
+    qualifications: &[&AcceptedQualification],
+    claimed: &[(usize, ClaimedTask)],
+    outcomes: Vec<Result<(), TaskFailure>>,
+) -> Result<Vec<TaskStep>, String> {
+    let mut steps = Vec::new();
+    let mut fatal = None;
+    for ((index, task), outcome) in claimed.iter().zip(outcomes) {
+        match settle(transport, task, qualifications[*index], outcome).await {
+            Ok(step) => steps.push(TaskStep {
+                model: Some(task.model_key.clone()),
+                step,
+            }),
+            Err(code) => fatal = fatal.or(Some(code)),
+        }
+    }
+    match fatal {
+        Some(code) => Err(code),
+        None => Ok(steps),
     }
 }
 /// One claimed task, from its input to an acknowledged result.
@@ -437,12 +523,34 @@ where
     F: FnOnce(Vec<u8>) -> P,
     P: Future<Output = Result<Value, String>>,
 {
-    let (index, task) = match next_task(transport, qualifications, cancel).await? {
+    let (index, task) = match next_task(transport, qualifications, cancel, None).await? {
         Ok(claimed) => claimed,
         Err(step) => return Ok(step),
     };
     let outcome = run_claimed(transport, &task, qualifications[index], cancel, predict).await;
     settle(transport, &task, qualifications[index], outcome).await
+}
+/// As the worker with room for `slots` tasks at once, with the local model replaced.
+#[cfg(test)]
+pub(crate) async fn steps_with<F, P>(
+    transport: &WorkerTransport,
+    qualifications: &[&AcceptedQualification],
+    cancel: &mut watch::Receiver<bool>,
+    slots: Option<u32>,
+    predict: F,
+) -> Result<Vec<Step>, String>
+where
+    F: Fn(Vec<u8>) -> P,
+    P: Future<Output = Result<Value, String>>,
+{
+    let claimed = match claim_batch(transport, qualifications, cancel, slots).await? {
+        Ok(claimed) => claimed,
+        Err(step) => return Ok(vec![step]),
+    };
+    let run = |_, _, input| predict(input);
+    let outcomes = run_batch(transport, qualifications, cancel, &claimed, run).await;
+    let steps = settle_batch(transport, qualifications, &claimed, outcomes).await?;
+    Ok(steps.into_iter().map(|task| task.step).collect())
 }
 
 /// How long every runtime process may take to answer its first health check.
@@ -454,8 +562,6 @@ pub struct NativePredictor {
     roles: Vec<BoundRole>,
     /// The process that was not serving when `ready` last failed.
     failed: Option<usize>,
-    /// The model key of the task last claimed.
-    claimed: Option<String>,
 }
 struct Lane {
     child: NativeSidecar,
@@ -537,7 +643,7 @@ impl NativePredictor {
         private_root: &Path,
     ) -> Result<Self, String> {
         let now = (OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
-        Self::start_lanes_at(runtimes, bindings, cache, private_root, now)
+        Self::start_lanes_at(runtimes, bindings, cache, private_root, now, 1)
     }
     /// `now_ms`: the server's time (`WorkerTransport::now`), which stamped the qualifications.
     pub(crate) fn start_lanes_at(
@@ -546,6 +652,8 @@ impl NativePredictor {
         cache: &Path,
         private_root: &Path,
         now_ms: i64,
+        // How many tasks the worker runs at once: each process serves that many requests.
+        threads: u32,
     ) -> Result<Self, String> {
         if !(1..=64).contains(&bindings.len()) {
             return Err("worker_model_binding_invalid".into());
@@ -584,7 +692,13 @@ impl NativePredictor {
                 continue;
             }
             // A failure here drops (and so stops) the processes already started.
-            let child = installed.start_bound_sidecar(&proofs, cache, private_root, *port)?;
+            let child = installed.start_bound_sidecar_threads(
+                &proofs,
+                cache,
+                private_root,
+                *port,
+                threads,
+            )?;
             children.push((
                 Lane {
                     child,
@@ -614,7 +728,6 @@ impl NativePredictor {
             children: children.into_iter().map(|(lane, _)| lane).collect(),
             roles,
             failed: None,
-            claimed: None,
         })
     }
     /// Stop every process; the first failure is reported after all were asked to stop.
@@ -635,10 +748,6 @@ impl NativePredictor {
             }
         }
         Ok(true)
-    }
-    /// The model key of the task the last step claimed, if it claimed one.
-    pub(crate) fn claimed_model(&self) -> Option<&str> {
-        self.claimed.as_deref()
     }
     /// Why a runtime process ended by itself, if one did (`NativeSidecar::exit_report`).
     pub(crate) fn exit_report(&mut self) -> Option<String> {
@@ -723,14 +832,15 @@ impl NativePredictor {
         qualifications: &[&AcceptedQualification],
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<bool, String> {
-        match self
-            .execute_next_with_activity(transport, qualifications, cancel, |_| {})
-            .await?
-        {
-            Step::Completed => Ok(true),
-            Step::Idle => Ok(false),
+        let mut steps = self
+            .execute_next_with_activity(transport, qualifications, cancel, None, |_| {})
+            .await?;
+        // One task at a time here: one step.
+        match steps.pop().map(|task| task.step) {
+            Some(Step::Completed) => Ok(true),
+            Some(Step::Idle) | None => Ok(false),
             // This owner has no way to carry on after a dropped task: it ends with the error.
-            Step::Dropped(code) | Step::Busy(code) => {
+            Some(Step::Dropped(code) | Step::Busy(code)) => {
                 self.stop()?;
                 Err(code)
             }
@@ -741,15 +851,16 @@ impl NativePredictor {
         transport: &WorkerTransport,
         qualifications: &[&AcceptedQualification],
         cancel: &mut watch::Receiver<bool>,
-        on_claim: impl FnOnce(&str),
-    ) -> Result<Step, String> {
+        slots: Option<u32>,
+        on_claim: impl FnMut(&str),
+    ) -> Result<Vec<TaskStep>, String> {
         let mut active = ActiveExecution {
             predictor: self,
             retain: false,
         };
         let outcome = active
             .predictor
-            .execute(transport, qualifications, cancel, on_claim)
+            .execute(transport, qualifications, cancel, slots, on_claim)
             .await;
         if outcome.is_err() {
             active.predictor.stop()?;
@@ -757,13 +868,16 @@ impl NativePredictor {
         active.retain = true;
         outcome
     }
+    /// Claim what there is room for (`slots`; `None` is one task, as before a server offered
+    /// several leases) and run it side by side.
     async fn execute(
         &mut self,
         transport: &WorkerTransport,
         qualifications: &[&AcceptedQualification],
         cancel: &mut watch::Receiver<bool>,
-        on_claim: impl FnOnce(&str),
-    ) -> Result<Step, String> {
+        slots: Option<u32>,
+        mut on_claim: impl FnMut(&str),
+    ) -> Result<Vec<TaskStep>, String> {
         if self.roles.len() != qualifications.len()
             || self
                 .roles
@@ -773,52 +887,62 @@ impl NativePredictor {
         {
             return Err("worker_predictor_qualification_changed".into());
         }
-        self.claimed = None;
         self.ready(cancel).await?;
-        let (index, task) = match next_task(transport, qualifications, cancel).await? {
+        let claimed = match claim_batch(transport, qualifications, cancel, slots).await? {
             Ok(claimed) => claimed,
-            Err(step) => return Ok(step),
+            Err(step) => return Ok(TaskStep::unclaimed(step)),
         };
-        self.claimed = Some(task.model_key.clone());
-        if let Some((workload, _)) = task.model_key.split_once(':') {
-            on_claim(workload);
+        for (_, task) in &claimed {
+            if let Some((workload, _)) = task.model_key.split_once(':') {
+                on_claim(workload);
+            }
         }
-        let qualification = qualifications[index];
-        let role = &self.roles[index];
-        let lane = role.lane;
-        let child = &mut self.children[lane].child;
-        let claimed = &task;
-        let outcome = run_claimed(
+        let roles = &self.roles;
+        // Shared by the tasks in hand: each checks its own process after its prediction.
+        let children = std::sync::Mutex::new(&mut self.children);
+        let outcomes = run_batch(
             transport,
-            claimed,
-            qualification,
+            qualifications,
             cancel,
-            |input| async move {
-                let value = role
-                    .client
-                    .predict(claimed, &input, transport.now()?)
-                    .await
-                    // The local model refused this one input; the process itself is still serving.
-                    .map_err(|code| match code.starts_with("server_http_") {
-                        true => "runtime_prediction_refused".into(),
-                        false => code,
-                    })?;
-                if !child.is_running()? {
-                    return Err("runtime_process_stopped".into());
+            &claimed,
+            |index, task, input| {
+                let (role, children) = (&roles[index], &children);
+                async move {
+                    let value = role
+                        .client
+                        .predict(task, &input, transport.now()?)
+                        .await
+                        // The local model refused this one input; the process itself is still serving.
+                        .map_err(|code| match code.starts_with("server_http_") {
+                            true => "runtime_prediction_refused".into(),
+                            false => code,
+                        })?;
+                    if !children.lock().unwrap()[role.lane].child.is_running()? {
+                        return Err("runtime_process_stopped".into());
+                    }
+                    Ok(value)
                 }
-                Ok(value)
             },
         )
         .await;
-        if outcome.is_err() {
-            // Before this owner stops anything itself.
-            self.blame_exited(lane);
+        drop(children);
+        for ((index, _), outcome) in claimed.iter().zip(&outcomes) {
+            if outcome.is_err() {
+                // Before this owner stops anything itself.
+                self.blame_exited(self.roles[*index].lane);
+            }
         }
-        if outcome.as_ref().is_err_and(|failure| failure.inferring) {
-            // Terminate inference before waiting for a failed/cancelled lease acknowledgement.
+        // A prediction given up on is still running in the process. With one task in hand the
+        // process is stopped before the server is told, as it always was. With several, it is
+        // stopped only when every one of them was given up (a stop, a pause): one task's late
+        // deadline or lost lease must not end the others' work.
+        let abandoned = |outcome: &Result<(), TaskFailure>| {
+            outcome.as_ref().is_err_and(|failure| failure.inferring)
+        };
+        if outcomes.iter().all(abandoned) {
             self.stop()?;
         }
-        settle(transport, &task, qualification, outcome).await
+        settle_batch(transport, qualifications, &claimed, outcomes).await
     }
 }
 
@@ -1411,7 +1535,6 @@ mod tests {
                 lane: 0,
             }],
             failed: None,
-            claimed: None,
         };
         assert!(predictor.is_running().unwrap());
         // FD-52: nothing listens on the port, so the lane is running but not serving yet.
@@ -1495,7 +1618,6 @@ mod tests {
                 children: vec![lane(19996, "processor"), lane(19997, "accelerated")],
                 roles: vec![role(processor_port, 0), role(accelerated_port, 1)],
                 failed: None,
-                claimed: None,
             };
             runtime.block_on(async {
                 let (_keep, mut never) = watch::channel(false);

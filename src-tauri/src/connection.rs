@@ -509,6 +509,11 @@ pub struct Features {
     /// `409 desktop_qualification_hold`, when the claim asks (`reportWithdrawn`).
     #[serde(default)]
     pub worker_withdrawal_notice: bool,
+    /// The server lets a desktop hold several leases at once: `/models` says how many each
+    /// task may run (`concurrency`) and a claim says how many more this computer can take
+    /// (`slots`). Without it a desktop holds one lease, as before.
+    #[serde(default)]
+    pub worker_concurrent_leases: bool,
     pub sources: bool,
     pub native_host: bool,
 }
