@@ -204,7 +204,9 @@ lease".
       on;
     - the runtime process ends or stops answering with several tasks in hand: half as many
       as it had in hand, and half again each time it happens, down to one. The graphics card
-      keeps the work. What counts is the tasks actually in hand, not the number allowed.
+      keeps the work. What counts is the tasks actually in hand, not the number allowed,
+      and a task dropped for a reason of its own while the crash was being reported is still
+      one of them.
     - **The graphics card keeps the work after a crash** (owner decision: "Yes, keep the
       GPU"). With one task in hand, a graphics card's or neural engine's runtime that ends
       or stops answering is started again on the same device, after a wait that grows with
@@ -212,7 +214,7 @@ lease".
     - Only the third crash in a row, with no task finished on that runtime in between, moves
       its work to the processor (a task the processor finishes beside it does not end the
       row). What counts as one of the three: its process ending or its answer breaking off
-      under its one task; its process found gone between tasks; and its process dying under
+      under its one task, whether its process is already gone or still lingers; its process found gone between tasks; and its process dying under
       a task that was dropped for a reason of its own, such as its deadline (the third is
       then shown as the process having stopped). The count is kept while the app runs: a
       setup that starts again in between (a lost session, say) does not start it again, and
@@ -220,6 +222,11 @@ lease".
       to qualify again, the move to the processor comes first, and a restart keeps its wait.
       The tray then says "on the processor (acceleration stopped, retried later)" and the AI
       page says the process stopped three times in a row and is tried again later.
+    - The server counts each of those crashes as a failure, so at the third it withdraws the
+      model from this computer and holds it for 300 seconds before it may qualify again
+      (`desktop_qualification_hold`, for that model on this computer whatever the device).
+      The processor therefore takes that model's work after the hold; the computer's other
+      models carry on meanwhile.
     - That move is not lasting. Nothing is written to disk, so the next start of the app
       tries the graphics card at once. While the app runs it is tried again by itself after
       30 minutes; if it crashes out again without 50 of its own tasks finished in a row in
@@ -235,8 +242,8 @@ lease".
       remembered for that runtime and device until a newer runtime or Retry Setup. A runtime
       that starts and does not answer in time moves to the processor for that run, as
       before. The processor's own runtime has nowhere to move to: at one task at a time
-      after a step down it is started once more, and otherwise its crashes are counted
-      across restarts (`runtime_crash_loop`), as before.
+      after a step down it is started once more, at once, and otherwise its crashes are
+      counted across restarts (`runtime_crash_loop`), as before.
     It does not stop. After 50 tasks in a row with none refused and no crash, one more runs
     at once again, up to what the server allows and this computer can take; until then, and
     after stopping and starting AI processing, the number starts from the estimate again.

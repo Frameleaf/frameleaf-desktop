@@ -726,11 +726,6 @@ where
     Ok(steps)
 }
 
-/// After a prediction's connection broke off: how often, and how many times, the process is
-/// looked at to see whether it has ended (half a second in all).
-const EXIT_CHECK_EVERY: Duration = Duration::from_millis(20);
-const EXIT_CHECKS: u32 = 25;
-
 /// How long every runtime process may take to answer its first health check.
 const READY_DEADLINE: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 15 });
 
@@ -1084,8 +1079,9 @@ impl NativePredictor {
         let children = std::sync::Mutex::new(&mut self.children);
         // Set when this owner stops the processes itself: that is not a process to blame.
         let stopped_here = std::sync::atomic::AtomicBool::new(false);
-        // The lane whose process ended by itself under a prediction. With one task in hand
-        // this owner stops every process next (`abandon`), so it has to be noted before.
+        // The lane whose process ended, or whose answer broke off, under a prediction. With
+        // one task in hand this owner stops every process next (`abandon`), so it has to be
+        // noted before.
         const NONE: usize = usize::MAX;
         let exited = std::sync::atomic::AtomicUsize::new(NONE);
         let exited = &exited;
@@ -1128,28 +1124,19 @@ impl NativePredictor {
                         Err(code) if code.starts_with("server_http_") => {
                             return Err("runtime_prediction_refused".into())
                         }
-                        Err(code) => {
-                            // The connection broke off. A process that is ending is gone a
-                            // moment later: wait that moment, so its end is told apart from
-                            // a healthy process this owner stops.
-                            // (The answer breaking off after its first line is the same end.)
-                            let broke_off = matches!(
+                        // Its answer broke off, before or after the first line: this runtime
+                        // stopped answering, whether its process is already gone or still
+                        // lingers. It is the one that failed, and it is reported as a crash.
+                        Err(code)
+                            if matches!(
                                 code.as_str(),
                                 "runtime_prediction_interrupted" | "server_response_interrupted"
-                            );
-                            for _ in 0..if broke_off { EXIT_CHECKS } else { 0 } {
-                                if !running().unwrap_or(true) {
-                                    exited.store(role.lane, Ordering::Release);
-                                    // Reported as the runtime being gone, like any crash.
-                                    return Err(match code.as_str() {
-                                        "runtime_prediction_interrupted" => code,
-                                        _ => "runtime_process_stopped".into(),
-                                    });
-                                }
-                                tokio::time::sleep(EXIT_CHECK_EVERY).await;
-                            }
-                            return Err(code);
+                            ) =>
+                        {
+                            exited.store(role.lane, Ordering::Release);
+                            return Err("runtime_prediction_interrupted".into());
                         }
+                        Err(code) => return Err(code),
                     };
                     if !running()? {
                         exited.store(role.lane, Ordering::Release);
@@ -1160,16 +1147,14 @@ impl NativePredictor {
             },
         )
         .await;
-        drop(children);
-        // A process that is gone without this owner having stopped it ended by itself. Where
-        // this owner did stop them, only one seen to have ended before that is blamed.
-        if !stopped_here.load(Ordering::Acquire) {
+        // The runtime seen to fail under a prediction is blamed. Otherwise a process that is
+        // gone without this owner having stopped it ended by itself.
+        if let Some(lane) = Some(exited.load(Ordering::Acquire)).filter(|lane| *lane != NONE) {
+            self.failed = Some(lane);
+        } else if !stopped_here.load(Ordering::Acquire) {
             for lane in 0..self.children.len() {
                 self.blame_exited(lane);
             }
-        } else if let Some(lane) = Some(exited.load(Ordering::Acquire)).filter(|lane| *lane != NONE)
-        {
-            self.failed = Some(lane);
         }
         outcome
     }
@@ -1191,6 +1176,7 @@ pub(crate) mod testing {
         root: PathBuf,
         pack: VerifiedRuntime,
         port: u16,
+        dies: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
     impl DyingRuntime {
         pub(crate) fn build() -> Self {
@@ -1236,6 +1222,8 @@ pub(crate) mod testing {
             let serving = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = serving.local_addr().unwrap().port();
             let flag = root.join("die");
+            let dies = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let dying = dies.clone();
             std::thread::spawn(move || {
                 for socket in serving.incoming() {
                     let Ok(mut socket) = socket else { break };
@@ -1245,12 +1233,22 @@ pub(crate) mod testing {
                         let _ = socket.write_all(
                             b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\npong",
                         );
-                    } else {
+                    } else if dying.load(std::sync::atomic::Ordering::Acquire) {
                         fs::write(&flag, b"").unwrap();
                     }
                 }
             });
-            Self { root, pack, port }
+            Self {
+                root,
+                pack,
+                port,
+                dies,
+            }
+        }
+        /// `true` (the start): its process ends when asked to predict. `false`: only its
+        /// answer breaks off, and the process lives on until it is stopped.
+        pub(crate) fn dies(&self, dies: bool) {
+            self.dies.store(dies, std::sync::atomic::Ordering::Release);
         }
         pub(crate) fn manifest(&self) -> &str {
             self.pack.manifest_sha256()

@@ -470,6 +470,8 @@ pub(crate) enum AfterCrash {
     /// One task in hand on a graphics card or neural engine: the same runtime again, after a
     /// wait that grows with each crash in a row.
     Again(u32),
+    /// One task in hand on the processor after a step down: its runtime once more, at once.
+    Once,
     /// The runtime itself is failing: the processor takes its work, or the crash is counted.
     Failing,
 }
@@ -524,7 +526,7 @@ impl RuntimeTrouble {
             1 if stepped_down => {
                 self.processor_at_one += 1;
                 match self.processor_at_one < PROCESSOR_CRASHES_AT_ONE {
-                    true => AfterCrash::Again(self.processor_at_one),
+                    true => AfterCrash::Once,
                     false => AfterCrash::Failing,
                 }
             }
@@ -2505,7 +2507,10 @@ async fn prepare_on(
                     // crash in a row with no task finished in between is a failing runtime
                     // (FD-52 below). So is one that did not start.
                     Err(_)
-                        if matches!(crash, Some(AfterCrash::Fewer(_) | AfterCrash::Again(_))) =>
+                        if matches!(
+                            crash,
+                            Some(AfterCrash::Fewer(_) | AfterCrash::Again(_) | AfterCrash::Once)
+                        ) =>
                     {
                         check_cancel(&progress.cancelled)?;
                         progress.crashed(predictor.exit_report());
@@ -4639,9 +4644,10 @@ mod tests {
         assert_eq!(trouble.crashed(1, false, false), AfterCrash::Failing);
         // At one after stepping down: the same runtime once more, then it is failing; a
         // task finished in between starts that count again.
-        assert_eq!(trouble.crashed(1, false, true), AfterCrash::Again(1));
+        // Started again at once, with no wait, as it always was.
+        assert_eq!(trouble.crashed(1, false, true), AfterCrash::Once);
         assert_eq!(trouble.completed(false), (false, false));
-        assert_eq!(trouble.crashed(1, false, true), AfterCrash::Again(1));
+        assert_eq!(trouble.crashed(1, false, true), AfterCrash::Once);
         assert_eq!(trouble.crashed(1, false, true), AfterCrash::Failing);
 
         // A long run of finished tasks lets one more run at once; trouble starts the run again.
@@ -4740,8 +4746,9 @@ mod tests {
     async fn a_graphics_card_whose_runtime_dies_under_one_task_keeps_the_work_until_the_third() {
         use crate::native_predictor::{testing::DyingRuntime, Pool, TaskStep};
         use crate::provider_selection::tests::{directory, end_rest, plan_on};
-        // The real predictor over a real runtime process that ends by itself when its one
-        // task reaches it, three times in a row, judged as the work loop judges it.
+        // The real predictor over a real runtime process that fails under its one task,
+        // three times in a row, judged as the work loop judges it. The second time its
+        // answer only breaks off and the process lingers: the same runtime failing.
         let runtime = DyingRuntime::build();
         let manifest = runtime.manifest().to_owned();
         let data = directory();
@@ -4754,6 +4761,7 @@ mod tests {
         let (progress, mut trouble) = (quiet(), RuntimeTrouble::default());
         let mut judged = Vec::new();
         for crash in 1..=CRASHES_AT_ONE {
+            runtime.dies(crash != 2);
             server.queue(&device, 1);
             let mut predictor = runtime.start("fixture-model", qualification.id());
             let (_keep, mut cancel) = tokio::sync::watch::channel(false);
