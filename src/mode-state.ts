@@ -57,8 +57,10 @@ export type WorkerView = {
   pill: { label: string; tone: 'ok' | 'wait' | 'off' | 'bad' };
   /** Tasks this computer finished since AI processing last started, when the backend reports it. */
   finished: string | null;
+  /** What the AI runtime said when it last stopped by itself, shown in small text while there is a problem. */
+  diagnostic: string | null;
 };
-type WorkerSetup = { state: string; code?: string | null; control?: string; activeWorkload?: string | null; completedTasks?: number | null };
+type WorkerSetup = { state: string; code?: string | null; control?: string; activeWorkload?: string | null; completedTasks?: number | null; detail?: string | null };
 
 // Setup stopped and stays stopped until the person acts: [headline, what to do].
 const needsYou: Partial<Record<WorkerReason, readonly [string, string]>> = {
@@ -75,6 +77,11 @@ const needsYou: Partial<Record<WorkerReason, readonly [string, string]>> = {
   'setup-mismatch': ['This computer needs setting up again', 'This computer’s AI setup does not match your current sign-in. Sign out and sign in again to set it up again.'],
   'credential-store': ['Unlock your credential store', 'Unlock your computer’s credential store, then choose Retry Setup.'],
 };
+// Stop reasons whose own words say more than their family's: what happened and what to do.
+const ownCopy: Readonly<Record<string, string>> = Object.fromEntries([
+  'runtime_qualification_timeout', 'worker_qualification_refused', 'worker_device_refused', 'worker_sign_in_required',
+  'model_disk_space_insufficient', 'runtime_store_busy', 'runtime_store_lock_failed',
+].map(code => [code, errorCopy(code) ?? '']));
 // The worker is retrying by itself: [headline, what is happening].
 const retrying: Partial<Record<WorkerReason, readonly [string, string]>> = {
   network: ['Reconnecting to your server', 'Your server is not answering. If it is only reachable on your home network, AI processing continues when this computer is back on that network. Frameleaf keeps trying by itself.'],
@@ -89,6 +96,11 @@ const pausedFor: Partial<Record<WorkerReason, string>> = {
   metered: 'Waiting for an unmetered network',
   resumed: 'Rechecking after sleep',
 };
+function retryingCopy(code: string): string | null {
+  if (['runtime_process_stopped', 'runtime_not_ready', 'runtime_prediction_interrupted', 'worker_qualification_restart', 'worker_challenge_busy'].includes(code)) return errorCopy(code);
+  if (/^server_http_5\d\d$/.test(code) || code === 'server_http_429') return `${errorCopy(code)!.replace(/ (Try again|Wait a minute, then try again|Check that it is online, then try again)[^.]*\.$/, '.')} Frameleaf keeps trying by itself.`;
+  return null;
+}
 const progress: Readonly<Record<string, string>> = {
   'preparing-runtime': 'Checking the signed runtime included with this app.',
   'preparing-models': 'Verifying the selected model files. You can keep using Photos while this runs.',
@@ -97,8 +109,8 @@ const progress: Readonly<Record<string, string>> = {
   'starting-worker': 'Starting the checked models locally before requesting work from your server.',
 };
 
-export function workerView({ connectionState, workerSupported, computer, setup }: {
-  connectionState: string; workerSupported: boolean; computer: string; setup: WorkerSetup | null;
+export function workerView({ connectionState, connectionCode, workerSupported, computer, setup }: {
+  connectionState: string; connectionCode?: string | null; workerSupported: boolean; computer: string; setup: WorkerSetup | null;
 }): WorkerView {
   const state = setup?.state || connectionState || '';
   const code = setup?.code ?? null;
@@ -109,7 +121,7 @@ export function workerView({ connectionState, workerSupported, computer, setup }
     : null;
   const label = workerStatus({ state, workerSupported });
   const view = (headline: string, detail: string, attention: WorkerAttention, pill: WorkerView['pill'], action: WorkerAction = null, reference: string | null = null): WorkerView =>
-    ({ headline, detail, reference, attention, action, pill, finished });
+    ({ headline, detail, reference, attention, action, pill, finished, diagnostic: attention === 'none' ? null : setup?.detail?.trim() || null });
   const needs = (headline: string, detail: string, action: WorkerAction = null, reference: string | null = null) =>
     view(headline, detail, 'needs-you', { label: 'Needs you', tone: 'bad' }, action, reference);
   const waits = (headline: string, detail: string) => view(headline, detail, 'waiting', { label: 'Waiting', tone: 'wait' });
@@ -117,7 +129,10 @@ export function workerView({ connectionState, workerSupported, computer, setup }
   // The connection itself is the problem: nothing below can run until it is fixed.
   if (connectionState === 'identity-changed') return needs('Server identity changed', 'Processing is stopped. Verify the server before signing in again.');
   if (connectionState === 'offline') return needs('Server unavailable', 'Your server did not answer when Frameleaf last checked. If it is only reachable on your home network, connect to that network, then choose Check Again.', 'check-server');
-  if (connectionState === 'enrollment-failed') return needs('Computer setup needs attention', 'Photo sign-in succeeded, but this computer could not be enrolled. Reopen the app to retry setup.');
+  if (connectionState === 'enrollment-failed') {
+    const why = connectionCode ? errorCopy(connectionCode) : null;
+    return needs('Computer setup needs attention', why ? `Photo sign-in succeeded, but this computer could not be enrolled. ${why}` : 'Photo sign-in succeeded, but this computer could not be enrolled. Reopen the app to retry setup.');
+  }
 
   if (setup?.activeWorkload) return view('Processing on this computer', 'This computer processes one selected AI task at a time while power, network and memory allow.', 'none', { label: 'Working', tone: 'ok' });
   switch (state) {
@@ -138,7 +153,8 @@ export function workerView({ connectionState, workerSupported, computer, setup }
     case 'reconnecting': {
       const reason = workerReason(code);
       const [headline, detail] = (reason && retrying[reason]) ?? [label, 'Waiting to reconnect to your server. This computer will recheck its session, models and resources before processing again.'];
-      return waits(headline, detail);
+      // A reason with words of its own (a busy server, a runtime that stopped) says them.
+      return waits(headline, (code && retryingCopy(code)) || detail);
     }
     case 'no-eligible-work':
       if (code === 'server_update_required') return waits('Your server needs an update', errorCopy(code)!);
@@ -152,9 +168,12 @@ export function workerView({ connectionState, workerSupported, computer, setup }
       if (code === 'runtime_os_unsupported') return needs('This Mac’s macOS is too old for AI processing', errorCopy(code)!);
       // This build ships without a runtime: retrying, or installing it again, would not change that.
       if (code === 'runtime_pack_unavailable') return needs('AI processing is not included in this version', errorCopy(code)!);
+      if (code === 'runtime_crash_loop') return needs('The AI runtime keeps stopping', errorCopy(code)!, 'retry-setup');
+      if (code === 'clock_invalid') return needs('This computer’s date and time look wrong', `${errorCopy(code)!} Then choose Retry Setup.`, 'retry-setup');
       const reason = workerReason(code);
       const known = reason && needsYou[reason];
-      if (known) return needs(known[0], known[1], 'retry-setup');
+      // The headline names the kind of problem; the detail is this code's own.
+      if (known) return needs(known[0], (code && ownCopy[code]) || known[1], 'retry-setup');
       const { message, reference } = describeError(code ?? '', 'AI setup could not finish. Photos remain available. Retry setup when your server and network are ready.');
       return needs(label, message, 'retry-setup', reference);
     }

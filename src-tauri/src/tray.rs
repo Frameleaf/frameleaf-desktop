@@ -68,12 +68,20 @@ pub(crate) fn labels(status: &SetupStatus, connected: bool) -> Labels {
                 Some("network_unknown") => "checking network",
                 Some("memory_low") => "waiting for memory",
                 Some("memory_unknown") => "checking memory",
+                Some("system_resumed") => "rechecking after sleep",
+                Some("worker_policy_required") => "turned off on your server",
+                Some("worker_lan_required") => "away from the home network",
+                Some("clock_invalid") => "check the date and time",
                 _ => "paused",
             },
             "stopped" => "stopped",
+            "no-eligible-work" if status.code.as_deref() == Some("server_update_required") => {
+                "server needs an update"
+            }
             "no-eligible-work" => "no work assigned",
+            "model-download-required" => "models need downloading",
             "" => "not set up",
-            _ => "needs attention",
+            _ => stopped_for(status.code.as_deref().unwrap_or_default()),
         };
         format!("AI processing: {word}")
     };
@@ -88,6 +96,43 @@ pub(crate) fn labels(status: &SetupStatus, connected: bool) -> Labels {
         can_toggle: connected,
         can_pause_hour: connected && !paused,
         can_stop: connected && status.control != WorkerControl::Stopped,
+    }
+}
+
+/// Why AI processing stopped and waits for the person, in a few words for the menu. The AI
+/// processing page says the rest.
+fn stopped_for(code: &str) -> &'static str {
+    match code {
+        "runtime_crash_loop" => "AI runtime keeps stopping",
+        "runtime_out_of_memory" => "not enough memory",
+        "runtime_output_mismatch" => "model check failed",
+        "runtime_model_missing" => "model files missing",
+        "runtime_qualification_timeout" => "model check took too long",
+        "runtime_os_unsupported" | "runtime_os_unknown" => "macOS too old",
+        "runtime_pack_unavailable" => "not in this version",
+        "runtime_signature_invalid" | "worker_runtime_unsigned" => "reinstall Frameleaf",
+        "worker_qualification_report_refused" | "worker_challenge_rejected" => "update Frameleaf",
+        "worker_device_refused" => "computer not approved",
+        "worker_sign_in_required" => "sign in again",
+        "clock_invalid" => "check the date and time",
+        "model_disk_space_insufficient" => "disk is full",
+        "model_download_invalid" | "model_download_hash_mismatch" => "model download failed",
+        "runtime_store_busy" | "runtime_store_lock_failed" => "another Frameleaf is open",
+        "server_http_401" | "server_http_403" => "server refused this computer",
+        "server_http_404"
+        | "desktop_protocol_unsupported"
+        | "desktop_worker_session_unavailable" => "server needs an update",
+        _ if code.starts_with("credential_") => "unlock your credential store",
+        _ if code.starts_with("runtime_epoch_") => "needs recovery",
+        _ if code.starts_with("runtime_process_")
+            || matches!(code, "runtime_start_failed" | "runtime_not_ready") =>
+        {
+            "AI runtime could not start"
+        }
+        _ if code.starts_with("model_file_") || code.starts_with("runtime_store_") => {
+            "could not save AI files"
+        }
+        _ => "needs attention",
     }
 }
 
@@ -309,10 +354,11 @@ fn on_menu(app: &AppHandle, id: &str) {
             tauri::async_runtime::spawn(async move {
                 let state = app.state::<crate::DesktopState>();
                 let current = state.0.lock().await;
-                if let Some(Err(code)) = current
-                    .as_ref()
-                    .map(|saved| crate::open_photos_window(&app, saved))
-                {
+                let opened = match current.as_ref() {
+                    Some(saved) => crate::open_photos_checked(&app, saved).await,
+                    None => Ok(()),
+                };
+                if let Err(code) = opened {
                     let _ = app.emit_to("main", "tray-action-failed", code);
                     show_main(&app);
                 }
@@ -674,6 +720,60 @@ mod tests {
             true,
         );
         assert_eq!(failed.worker, "AI processing: needs attention");
+        // Each reason it stopped for is named; only one this app has no words for is general.
+        let mut said = std::collections::BTreeSet::new();
+        for (code, words) in [
+            ("runtime_crash_loop", "AI runtime keeps stopping"),
+            ("runtime_out_of_memory", "not enough memory"),
+            ("runtime_output_mismatch", "model check failed"),
+            ("model_disk_space_insufficient", "disk is full"),
+            ("worker_runtime_unsigned", "reinstall Frameleaf"),
+            ("worker_device_refused", "computer not approved"),
+            ("worker_sign_in_required", "sign in again"),
+            ("clock_invalid", "check the date and time"),
+            (
+                "credential_store_unavailable",
+                "unlock your credential store",
+            ),
+            ("runtime_start_failed", "AI runtime could not start"),
+        ] {
+            let label = labels(
+                &status("setup-needs-attention", WorkerControl::Running, Some(code)),
+                true,
+            );
+            assert_eq!(label.worker, format!("AI processing: {words}"), "{code}");
+            assert!(said.insert(label.worker), "{code}");
+        }
+        for (state, code, words) in [
+            (
+                "paused",
+                "worker_policy_required",
+                "turned off on your server",
+            ),
+            (
+                "paused",
+                "worker_lan_required",
+                "away from the home network",
+            ),
+            (
+                "no-eligible-work",
+                "server_update_required",
+                "server needs an update",
+            ),
+            (
+                "no-eligible-work",
+                "worker_no_eligible_workloads",
+                "no work assigned",
+            ),
+            (
+                "model-download-required",
+                "model_download_permission_required",
+                "models need downloading",
+            ),
+        ] {
+            let label = labels(&status(state, WorkerControl::Running, Some(code)), true);
+            assert_eq!(label.worker, format!("AI processing: {words}"), "{code}");
+        }
         assert_eq!(
             labels(&status("qualifying", WorkerControl::Running, None), true).worker,
             "AI processing: getting ready"

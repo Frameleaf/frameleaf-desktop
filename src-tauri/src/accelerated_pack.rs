@@ -520,7 +520,7 @@ fn release_client() -> Result<reqwest::Client, String> {
         .map_err(|_| "network_client_unavailable".into())
 }
 fn release_client_builder() -> reqwest::ClientBuilder {
-    crate::transport::streaming_client_builder()
+    crate::transport::public_client_builder()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::limited(5))
 }

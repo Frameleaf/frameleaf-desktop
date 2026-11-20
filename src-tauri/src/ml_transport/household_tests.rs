@@ -16,7 +16,9 @@ const INPUT: &[u8] = b"fixture input";
 const MODEL: &str = "fixture-model";
 
 fn stamp(seconds: i64) -> String {
-    let d = OffsetDateTime::now_utc() + time::Duration::seconds(seconds);
+    stamp_at(OffsetDateTime::now_utc() + time::Duration::seconds(seconds))
+}
+fn stamp_at(d: OffsetDateTime) -> String {
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         d.year(),
@@ -50,6 +52,28 @@ struct State {
     /// device → every result or failure report that passed authentication
     reports: HashMap<String, Vec<&'static str>>,
     completed: HashMap<String, u32>,
+    /// Seconds the server's clock is ahead of this computer's.
+    clock_offset: i64,
+    /// Every `fail` code reported, in order.
+    failures: Vec<String>,
+    /// Devices the server has withdrawn the model from.
+    withdrawn: HashSet<String>,
+    /// Answer without a `Date` header (a proxy's page, a broken server).
+    dateless: bool,
+    /// The server understands `reportWithdrawn` on a claim and advertises it.
+    withdrawal_notice: bool,
+    /// The server lets a desktop hold several leases: how many, when it does.
+    concurrency: Option<u32>,
+    /// The `slots` of every claim that carried it, in order.
+    slots: Vec<u64>,
+    /// The `waitMs` of every claim, in order.
+    waits: Vec<u64>,
+    /// Claims that have arrived, counted before they are answered, and how long each is
+    /// kept waiting for its answer (a slow link).
+    claims_received: u32,
+    claim_delay: std::time::Duration,
+    /// Every authenticated request's path, in the order the server handled it.
+    handled: Vec<String>,
 }
 
 fn refuse(status: u16, message: &str) -> (u16, Vec<u8>) {
@@ -61,6 +85,18 @@ fn reply(value: Value) -> (u16, Vec<u8>) {
 }
 
 impl State {
+    fn now(&self) -> OffsetDateTime {
+        OffsetDateTime::now_utc() + time::Duration::seconds(self.clock_offset)
+    }
+    /// A time on the server's own clock, as it stamps every deadline.
+    fn stamp(&self, seconds: i64) -> String {
+        stamp_at(self.now() + time::Duration::seconds(seconds))
+    }
+    /// As the server: a request timed more than two minutes from its clock is refused.
+    fn timely(&self, timestamp: Option<u64>) -> bool {
+        let now = (self.now().unix_timestamp_nanos() / 1_000_000) as i64;
+        timestamp.is_some_and(|at| (now - at as i64).abs() <= 120_000)
+    }
     fn respond(
         &mut self,
         method: &str,
@@ -70,8 +106,23 @@ impl State {
         body: &[u8],
     ) -> (u16, Vec<u8>) {
         let body: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+        if (method, path) == ("GET", "/api/desktop/capabilities") {
+            return reply(
+                json!({"protocolVersion":1,"serverId":"fixture-server","features":{
+                "enrollment":true,"worker":true,"workerSession":true,"workerAutoSetup":true,
+                "workerWithdrawalNotice":self.withdrawal_notice,
+                "workerConcurrentLeases":self.concurrency.is_some(),
+                "sources":false,"nativeHost":false}}),
+            );
+        }
         if (method, path) == ("POST", "/api/desktop/devices/session") {
             let device = body["deviceId"].as_str().unwrap_or_default().to_owned();
+            if let Some((_, status, body)) = self.forced.get_mut(&device).and_then(|queue| {
+                let index = queue.iter().position(|(part, _, _)| path.contains(part))?;
+                queue.remove(index)
+            }) {
+                return (status, body.into_bytes());
+            }
             let Some(epoch) = self
                 .epochs
                 .get(&device)
@@ -80,15 +131,19 @@ impl State {
             else {
                 return refuse(401, "desktop_worker_credential_invalid");
             };
+            // As the server: the device is checked first, then the request's timestamp.
+            if !self.timely(body["timestamp"].as_u64()) {
+                return refuse(401, "desktop_proof_expired");
+            }
             let session = Session {
                 id: Uuid::new_v4().to_string(),
                 token: format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
                 sequence: 0,
                 qualification: Uuid::new_v4().to_string(),
-                qualification_expires: stamp(600),
+                qualification_expires: self.stamp(600),
             };
             let response = json!({"sessionId":session.id,"workerToken":session.token,
-                "authorizationEpoch":epoch,"expiresAt":stamp(3600),
+                "authorizationEpoch":epoch,"expiresAt":self.stamp(3600),
                 "scopes":["library-inference"],"modelKeys":[]});
             // As on the server: a new session ends everything the device held under the old one.
             self.leases.retain(|_, (owner, _)| owner != &device);
@@ -103,6 +158,7 @@ impl State {
         let proof: Option<crate::worker::WorkerProof> = proof
             .and_then(|header| STANDARD.decode(header).ok())
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        let timely = self.timely(proof.as_ref().map(|proof| proof.timestamp));
         let Some((device, session)) = proof.and_then(|proof| {
             self.sessions.iter_mut().find_map(|(device, session)| {
                 (session.id == proof.session_id
@@ -116,6 +172,11 @@ impl State {
         }) else {
             return refuse(401, "desktop_worker_credential_invalid");
         };
+        // A good credential with a timestamp too far from the server's clock.
+        if !timely {
+            return refuse(401, "desktop_proof_expired");
+        }
+        self.handled.push(path.to_owned());
         if let Some(queue) = self.forced.get_mut(&device) {
             if let Some(index) = queue.iter().position(|(part, _, _)| path.contains(part)) {
                 let (_, status, body) = queue.remove(index).unwrap();
@@ -137,6 +198,39 @@ impl State {
         };
         match (method, path, task) {
             ("POST", "/api/desktop/worker/claim", _) => {
+                // As the server: a field it does not know is refused, whatever its value. A
+                // server from before the notice does not know `reportWithdrawn`.
+                let mut known = vec!["modelKeys", "waitMs"];
+                if self.withdrawal_notice {
+                    known.push("reportWithdrawn");
+                }
+                // And one from before several leases does not know `slots`.
+                if self.concurrency.is_some() {
+                    known.push("slots");
+                }
+                if payload
+                    .as_object()
+                    .is_some_and(|fields| fields.keys().any(|key| !known.contains(&key.as_str())))
+                {
+                    return refuse(400, "desktop_worker_payload_invalid");
+                }
+                self.waits
+                    .push(payload["waitMs"].as_u64().unwrap_or(20_000));
+                if let Some(slots) = payload["slots"].as_u64() {
+                    self.slots.push(slots);
+                    // A new lease only while this desktop holds fewer than the task allows.
+                    let held = self
+                        .leases
+                        .values()
+                        .filter(|(owner, _)| owner == &device)
+                        .count();
+                    if held as u32 >= self.concurrency.unwrap_or(1) {
+                        return reply(json!({"task":null}));
+                    }
+                }
+                if self.withdrawn.contains(&device) && payload["reportWithdrawn"] == true {
+                    return refuse(409, "desktop_qualification_hold");
+                }
                 let waiting = self.queued.entry(device.clone()).or_default();
                 if *waiting == 0 {
                     return reply(json!({"task":null}));
@@ -153,12 +247,12 @@ impl State {
                     "qualificationExpiresAt":live.qualification_expires,
                     "modelKey":MODEL,"configJson":"{}","configSha256":hash(b"{}"),
                     "inputSha256":hash(INPUT),"inputKind":"image","maxInputBytes":1024,
-                    "expiresAt":stamp(60),"executionDeadline":stamp(120)}}))
+                    "expiresAt":self.stamp(60),"executionDeadline":self.stamp(120)}}))
             }
             ("POST", "/api/desktop/worker/heartbeat", _) => {
                 let id = payload["id"].as_str().unwrap_or_default();
                 if held(&self.leases, id) == Some(self.revision) {
-                    reply(json!({"accepted":true,"expiresAt":stamp(60)}))
+                    reply(json!({"accepted":true,"expiresAt":self.stamp(60)}))
                 } else {
                     reply(json!({"accepted":false,"expiresAt":null}))
                 }
@@ -173,6 +267,10 @@ impl State {
             ("POST", _, Some((id, kind @ ("result" | "fail")))) => {
                 let kind = if kind == "result" { "result" } else { "fail" };
                 self.reports.entry(device.clone()).or_default().push(kind);
+                if kind == "fail" {
+                    let code = payload["code"].as_str().unwrap_or_default();
+                    self.failures.push(code.to_owned());
+                }
                 match held(&self.leases, id) {
                     None => reply(json!({"accepted":false})),
                     Some(revision) if revision != self.revision => {
@@ -220,15 +318,36 @@ fn serve(mut stream: TcpStream, state: &StdMutex<State>) -> Option<()> {
                 .then(|| value.trim().to_owned())
         })
     };
-    let (status, body) = state.lock().unwrap().respond(
-        method,
-        path,
-        header("authorization"),
-        header("x-frameleaf-desktop-proof"),
-        &bytes[end + 4..],
-    );
+    if path.ends_with("/worker/claim") {
+        let delay = {
+            let mut state = state.lock().unwrap();
+            state.claims_received += 1;
+            state.claim_delay
+        };
+        std::thread::sleep(delay);
+    }
+    let (status, body, date) = {
+        let mut state = state.lock().unwrap();
+        let (status, body) = state.respond(
+            method,
+            path,
+            header("authorization"),
+            header("x-frameleaf-desktop-proof"),
+            &bytes[end + 4..],
+        );
+        let date = state
+            .now()
+            .format(&time::format_description::well_known::Rfc2822)
+            .unwrap();
+        let date = match state.dateless {
+            true => String::new(),
+            false => format!("Date: {date}\r\n"),
+        };
+        (status, body, date)
+    };
+    // As every real server: the response says what time the server thinks it is.
     let head = format!(
-        "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} Fixture\r\n{date}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes()).ok()?;
@@ -280,30 +399,32 @@ impl FakeServer {
     /// Issue a worker session the way `transport::issue_worker_session` does, with this device's key.
     pub(crate) async fn session(&self, device: &Device) -> Result<WorkerTransport, String> {
         let saved = &device.saved;
-        let request = crate::worker::session_request(
-            &device.identity,
-            &saved.server_id,
-            &saved.account_id,
-            &device.id,
-        )?;
         let client = transport::client()?;
-        let response: SessionResponse = transport::json(
-            client
-                .post(format!("{}api/desktop/devices/session", self.url))
-                .json(&request)
-                .send()
-                .await
-                .map_err(|_| "worker_session_setup_interrupted")?,
-        )
-        .await?;
-        Ok(WorkerTransport(Mutex::new(Connection {
+        // As `worker_setup::refresh_session`: the capabilities reply shows the server's clock.
+        let capabilities = transport::capabilities(&client, saved)
+            .await?
+            .ok_or("desktop_protocol_unsupported")?;
+        let skew = capabilities.clock_skew_ms;
+        let notice = capabilities.features.worker_withdrawal_notice;
+        let several = capabilities.features.worker_concurrent_leases;
+        let worker =
+            transport::issue_worker_session_as(&client, saved, &device.identity, skew).await?;
+        Ok(WorkerTransport::over(Connection {
             client,
             base: normalize_server(&saved.server)?,
-            worker: crate::worker::bind_session(saved, &response)?,
+            worker,
             identity: serde_json::from_value(serde_json::to_value(&device.identity).unwrap())
                 .unwrap(),
             checkpoint: |_, _| Ok(()),
-        })))
+            clock: Arc::default(),
+            report_withdrawn: false,
+            concurrent_leases: false,
+        })
+        .with_clock_skew(skew)
+        // As `worker_setup::prepare_on`: several leases only where the server offers them.
+        .with_concurrent_leases(several)
+        // As `worker_setup::prepare_on`: only a server that advertises the notice is asked.
+        .with_withdrawal_notice(notice))
     }
     /// The qualification the server holds for this worker's session, as `prepare` would obtain it.
     pub(crate) async fn qualification(&self, worker: &WorkerTransport) -> AcceptedQualification {
@@ -314,7 +435,7 @@ impl FakeServer {
             .sessions
             .get(&connection.worker.device_id)
             .filter(|session| session.id == connection.worker.session_id)
-            .map_or((Uuid::new_v4().to_string(), stamp(600)), |session| {
+            .map_or((Uuid::new_v4().to_string(), state.stamp(600)), |session| {
                 (
                     session.qualification.clone(),
                     session.qualification_expires.clone(),
@@ -366,6 +487,53 @@ impl FakeServer {
             .or_default()
             .push_back((path.into(), status, body.to_string()));
     }
+    /// Put the server's clock this many seconds ahead of this computer's (negative: behind).
+    pub(crate) fn set_clock_offset(&self, seconds: i64) {
+        self.state.lock().unwrap().clock_offset = seconds;
+    }
+    /// Let a desktop hold up to this many leases at once, and advertise it, from now on.
+    pub(crate) fn offer_concurrent_leases(&self, concurrency: u32) {
+        self.state.lock().unwrap().concurrency = Some(concurrency);
+    }
+    /// Keep every claim waiting this long for its answer.
+    pub(crate) fn slow_claims(&self, delay: std::time::Duration) {
+        self.state.lock().unwrap().claim_delay = delay;
+    }
+    /// How many claims have arrived, answered or not.
+    pub(crate) fn claims_received(&self) -> u32 {
+        self.state.lock().unwrap().claims_received
+    }
+    /// The `slots` and the `waitMs` of the claims so far.
+    pub(crate) fn claims(&self) -> (Vec<u64>, Vec<u64>) {
+        let state = self.state.lock().unwrap();
+        (state.slots.clone(), state.waits.clone())
+    }
+    /// Understand and advertise the withdrawal notice from now on.
+    pub(crate) fn offer_withdrawal_notice(&self) {
+        self.state.lock().unwrap().withdrawal_notice = true;
+    }
+    /// Answer without a `Date` header from now on.
+    pub(crate) fn without_date(&self, dateless: bool) {
+        self.state.lock().unwrap().dateless = dateless;
+    }
+    /// As the server after three failed tasks in a row: withdraw the model from this device.
+    pub(crate) fn withdraw_model(&self, device: &Device) {
+        self.state
+            .lock()
+            .unwrap()
+            .withdrawn
+            .insert(device.id.clone());
+    }
+    /// Every `fail` code the server was sent, in order.
+    pub(crate) fn failures(&self) -> Vec<String> {
+        self.state.lock().unwrap().failures.clone()
+    }
+    /// The last path component of every authenticated request, in the order handled.
+    pub(crate) fn handled(&self) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        let last = |path: &String| path.rsplit('/').next().unwrap_or_default().to_owned();
+        state.handled.iter().map(last).collect()
+    }
     pub(crate) fn completed(&self, device: &Device) -> u32 {
         let state = self.state.lock().unwrap();
         state.completed.get(&device.id).copied().unwrap_or(0)
@@ -397,11 +565,10 @@ fn only_named_refusals_are_translated_for_the_worker_loop() {
         ),
         (403, "desktop_worker_lan_required", "worker_lan_required"),
         (409, "desktop_pool_policy_changed", "worker_policy_changed"),
-        // The same words under another status, or anything unnamed, stay opaque.
-        (403, "desktop_worker_credential_invalid", "server_http_403"),
+        // Anything unnamed stays opaque.
         (401, "", "server_http_401"),
         (409, "desktop_pool_route_changed", "server_http_409"),
-        (500, "desktop_pool_policy_changed", "server_http_500"),
+        (500, "Internal server error", "server_http_500"),
     ] {
         assert_eq!(worker_refusal(status, message), expected);
     }
@@ -438,9 +605,10 @@ async fn a_revoked_device_cannot_obtain_a_new_session() {
         worker.claim_many(&[&qualification]).await.err().as_deref(),
         Some("worker_session_rejected")
     );
+    // Named, and not the session refusal the worker answers by asking for another session.
     assert_eq!(
         server.session(&device).await.err().as_deref(),
-        Some("server_http_401")
+        Some("worker_device_refused")
     );
 }
 
@@ -528,4 +696,263 @@ async fn a_result_is_not_sent_once_the_last_granted_lease_has_run_out() {
     let result = worker.complete(&task, &json!({}), &qualification).await;
     assert_eq!(result, Ok(true));
     assert_eq!(server.reports(&device), ["result"]);
+}
+
+#[tokio::test]
+async fn a_wrong_clock_on_this_computer_does_not_stop_the_worker() {
+    // The server's clock is an hour ahead of this computer's, then a day behind it.
+    for offset in [3600, -86_400] {
+        let server = FakeServer::start();
+        server.set_clock_offset(offset);
+        let device = server.enrol();
+        // The server refuses requests timed two minutes from its own clock, and every deadline
+        // it sends is on its own clock.
+        let worker = server.session(&device).await.unwrap();
+        let qualification = server.qualification(&worker).await;
+        server.queue(&device, 1);
+        let claimed = worker.claim_many(&[&qualification]).await;
+        let (_, mut task) = claimed.unwrap().expect("the queued task");
+        assert_eq!(worker.input(&task, &qualification).await.unwrap(), INPUT);
+        assert!(worker.heartbeat(&mut task, &qualification).await.unwrap());
+        let result = worker.complete(&task, &json!({}), &qualification).await;
+        assert_eq!(result, Ok(true), "{offset}");
+        assert_eq!(server.completed(&device), 1);
+    }
+}
+
+#[test]
+fn the_clock_difference_is_read_from_the_date_header_and_small_ones_are_ignored() {
+    let local = 1_795_118_400_000; // 2026-11-19T20:00:00Z
+    let skew = |date| transport::clock_skew_from(Some(date), local);
+    // As servers write it, and as RFC 2822 does.
+    assert_eq!(skew("Thu, 19 Nov 2026 20:00:00 GMT"), Some(0));
+    assert_eq!(skew("Thu, 19 Nov 2026 20:00:20 GMT"), Some(0));
+    assert_eq!(skew("Thu, 19 Nov 2026 19:59:40 +0000"), Some(0));
+    // A real difference, plus the two seconds `Date` can be behind.
+    assert_eq!(skew("Thu, 19 Nov 2026 21:00:00 GMT"), Some(3_602_000));
+    assert_eq!(skew("Wed, 18 Nov 2026 20:00:00 GMT"), Some(-86_398_000));
+    // Nothing usable: the last known difference stays.
+    assert_eq!(skew("yesterday"), None);
+    assert_eq!(transport::clock_skew_from(None, local), None);
+}
+
+#[tokio::test]
+async fn signed_requests_reach_the_server_one_at_a_time_in_sequence_order() {
+    let server = FakeServer::start();
+    let device = server.enrol();
+    let worker = server.session(&device).await.unwrap();
+    let qualification = server.qualification(&worker).await;
+    server.queue(&device, 1);
+    let claimed = worker.claim_many(&[&qualification]).await;
+    let (_, task) = claimed.unwrap().unwrap();
+    // Heartbeats and the result asked for at the same moment, many times over.
+    let mut beats = Vec::new();
+    for _ in 0..8 {
+        let mut lease = task.clone();
+        let (worker, qualification) = (&worker, &qualification);
+        beats.push(async move { worker.heartbeat(&mut lease, qualification).await });
+    }
+    let later = beats.split_off(4);
+    let (done, all) = (json!({}), [&qualification]);
+    let (first, second, result, third) = tokio::join!(
+        futures_util::future::join_all(beats),
+        futures_util::future::join_all(later),
+        worker.complete(&task, &done, &qualification),
+        worker.claim_many(&all),
+    );
+    // None was refused for arriving after a higher sequence number.
+    assert!(
+        first.iter().chain(&second).all(|beat| beat.is_ok()),
+        "{first:?} {second:?}"
+    );
+    assert_eq!(result, Ok(true));
+    assert!(third.is_ok());
+    // All eleven passed the server's sequence check: the claim, eight heartbeats, the result
+    // and the second claim.
+    let handled = server.handled();
+    assert_eq!(handled.len(), 11, "{handled:?}");
+    assert_eq!(
+        handled.iter().filter(|path| *path == "heartbeat").count(),
+        8
+    );
+}
+
+#[tokio::test]
+async fn a_new_field_in_a_reply_is_ignored() {
+    let server = FakeServer::start();
+    let device = server.enrol();
+    let worker = server.session(&device).await.unwrap();
+    let qualification = server.qualification(&worker).await;
+    // A heartbeat acknowledgement and a claim from a newer server.
+    server.queue(&device, 1);
+    let claimed = worker.claim_many(&[&qualification]).await;
+    let (_, mut task) = claimed.unwrap().unwrap();
+    server.respond_next(
+        &device,
+        "/heartbeat",
+        200,
+        json!({"accepted":true,"expiresAt":stamp(60),"somethingNew":1}),
+    );
+    assert!(worker.heartbeat(&mut task, &qualification).await.unwrap());
+}
+
+#[tokio::test]
+async fn a_refused_timestamp_is_a_clock_problem_and_the_next_request_is_timed_right() {
+    let server = FakeServer::start();
+    let device = server.enrol();
+    let worker = server.session(&device).await.unwrap();
+    let qualification = server.qualification(&worker).await;
+    // The server's clock is now ten minutes from this computer's, which the worker has not
+    // seen yet: its next request is timed wrong, and refused for that, not for its credential.
+    server.set_clock_offset(600);
+    assert_eq!(
+        worker.maintain_session().await.err().as_deref(),
+        None,
+        "nothing is sent while the session is current"
+    );
+    let source = "0".repeat(40);
+    assert_eq!(
+        worker
+            .model_inventory(&source, "CPUExecutionProvider")
+            .await
+            .err()
+            .as_deref(),
+        Some("clock_invalid")
+    );
+    // That refusal carried the server's time: the same session's next request is accepted.
+    let again = worker
+        .model_inventory(&source, "CPUExecutionProvider")
+        .await;
+    assert_ne!(again.err().as_deref(), Some("clock_invalid"));
+    // It passed the server's credential and timestamp checks: only then is a request recorded.
+    assert_eq!(server.handled(), ["models"]);
+    let _ = qualification;
+    // At session issue a refused timestamp is the clock too, never "this device is refused".
+    let stale = transport::issue_worker_session_as(
+        &transport::client().unwrap(),
+        &device.saved,
+        &device.identity,
+        0,
+    )
+    .await;
+    assert_eq!(stale.err().as_deref(), Some("clock_invalid"));
+}
+
+#[tokio::test]
+async fn a_claim_learns_of_a_withdrawn_model_only_from_a_server_that_offers_the_notice() {
+    let server = FakeServer::start();
+    let device = server.enrol();
+    server.queue(&device, 1);
+    server.withdraw_model(&device);
+    // A server that does not advertise the notice is not sent the field (it would refuse the
+    // whole claim): the claim behaves as it always did.
+    let worker = server.session(&device).await.unwrap();
+    let qualification = server.qualification(&worker).await;
+    assert!(worker
+        .claim_many(&[&qualification])
+        .await
+        .unwrap()
+        .is_some());
+    // One that advertises it is asked, and says at once that a model was withdrawn.
+    server.queue(&device, 1);
+    server.offer_withdrawal_notice();
+    let worker = server.session(&device).await.unwrap();
+    let qualification = server.qualification(&worker).await;
+    assert_eq!(
+        worker.claim_many(&[&qualification]).await.err().as_deref(),
+        Some("worker_model_withdrawn")
+    );
+}
+
+#[tokio::test]
+async fn after_this_computers_clock_moves_the_server_time_is_read_again_before_any_deadline() {
+    let server = FakeServer::start();
+    let device = server.enrol();
+    let worker = server.session(&device).await.unwrap();
+    let qualification = server.qualification(&worker).await;
+    server.queue(&device, 1);
+    let claimed = worker.claim_many(&[&qualification]).await;
+    let (_, task) = claimed.unwrap().unwrap();
+    // In the middle of the task the OS corrects this computer's clock. The difference the
+    // worker held is now wrong by an hour: judged by it, the lease would look long expired.
+    worker.1.set(3_600_000);
+    worker.1.set_back_an_hour_ago();
+    assert!(worker.1.suspect());
+    // The result is not judged by the stale difference: the server is asked the time first.
+    let result = worker.complete(&task, &json!({}), &qualification).await;
+    assert_eq!(result, Ok(true));
+    assert!(!worker.1.suspect());
+    assert_eq!(worker.1.skew_ms(), 0);
+
+    // An answer with no `Date` can't confirm a correction that was in use: nothing is judged
+    // by it, and the next call asks again.
+    server.queue(&device, 1);
+    worker.1.set(3_600_000);
+    worker.1.set_back_an_hour_ago();
+    server.without_date(true);
+    assert_eq!(
+        worker.claim_many(&[&qualification]).await.err().as_deref(),
+        Some("worker_request_interrupted")
+    );
+    assert!(worker.1.suspect());
+    server.without_date(false);
+    assert!(worker
+        .claim_many(&[&qualification])
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(worker.1.skew_ms(), 0);
+    // With no correction in use, a server that never sends `Date` is worked with as before.
+    worker.1.set_back_an_hour_ago();
+    server.without_date(true);
+    assert!(worker
+        .claim_many(&[&qualification])
+        .await
+        .unwrap()
+        .is_none());
+    server.without_date(false);
+
+    // When the server can't be asked, nothing is judged by a difference that may not hold: the
+    // call fails like any request that did not get through, not as an expired qualification.
+    let unreachable = WorkerTransport::over(Connection {
+        base: Url::parse("http://127.0.0.1:1/").unwrap(),
+        ..worker.0.into_inner()
+    });
+    unreachable.1.set(3_600_000);
+    unreachable.1.set_back_an_hour_ago();
+    assert_eq!(
+        unreachable
+            .claim_many(&[&qualification])
+            .await
+            .err()
+            .as_deref(),
+        Some("worker_request_interrupted")
+    );
+}
+
+#[tokio::test]
+async fn slots_are_sent_only_to_a_server_that_lets_a_desktop_hold_several_leases() {
+    let server = FakeServer::start();
+    let device = server.enrol();
+    server.queue(&device, 2);
+    // A server from before several leases refuses a claim that carries `slots`: it is never
+    // sent the field, whatever room this computer has, and gives one task as it always did.
+    let worker = server.session(&device).await.unwrap();
+    let qualification = server.qualification(&worker).await;
+    let claimed = worker.claim_with(&[&qualification], Some(4), 20_000).await;
+    assert!(claimed.unwrap().is_some());
+    assert_eq!(server.claims(), (vec![], vec![20_000]));
+    // One that offers them is told how many more tasks there is room for, and hands over a
+    // new lease each time until this desktop holds as many as the task allows.
+    server.offer_concurrent_leases(2);
+    let worker = server.session(&device).await.unwrap();
+    let qualification = server.qualification(&worker).await;
+    server.queue(&device, 3);
+    let first = worker.claim_with(&[&qualification], Some(4), 20_000).await;
+    let second = worker.claim_with(&[&qualification], Some(3), 0).await;
+    let third = worker.claim_with(&[&qualification], Some(2), 0).await;
+    let (first, second) = (first.unwrap().unwrap().1, second.unwrap().unwrap().1);
+    assert_ne!(first.id, second.id);
+    assert!(third.unwrap().is_none());
+    assert_eq!(server.claims(), (vec![4, 3, 2], vec![20_000, 20_000, 0, 0]));
 }

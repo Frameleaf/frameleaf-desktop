@@ -109,7 +109,9 @@ test('the server address field takes an address with no scheme, and the backend 
   // type="url" refuses "192.168.1.20:2283" before the app ever sees it.
   assert.match(field, /type="text"/);
   assert.match(field, /inputmode="url"/);
-  assert.match(source('src-tauri/src/server_login.rs'), /pub\(crate\) async fn server_sign_in_options\([\s\S]{0,300}let base = crate::connection::typed_server\(&server\)\?;/);
+  // `typed_servers` is `typed_server` plus what a lookup of a home name allows (HTTPS first, then plain HTTP).
+  assert.match(source('src-tauri/src/server_login.rs'), /pub\(crate\) async fn server_sign_in_options\([\s\S]{0,300}let candidates = crate::connection::typed_servers\(&server\)\.await\?;/);
+  assert.match(source('src-tauri/src/connection.rs'), /fn typed_candidates\([\s\S]{0,1200}match typed_server\(typed\)/);
   // A path is accepted now, so the copy no longer tells the person to remove it.
   assert.doesNotMatch(errorCopy('server_requires_https_origin')!, /path/);
 });

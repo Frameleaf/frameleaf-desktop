@@ -126,11 +126,15 @@ fn is_digest(value: &str, length: usize) -> bool {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
+/// A relative file name that is safe on every system this app runs on, and that is the same
+/// path inside a download address: letters, digits, `.`, `_`, `-` and `/` only, so nothing in it
+/// can be read as an escape (`%2e%2e`), a query (`?`), a fragment (`#`) or another host.
 fn safe_path(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 4096
-        && !value.contains(['\\', ':'])
-        && !value.chars().any(char::is_control)
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'))
         && value.split('/').all(|part| {
             let stem = part.split('.').next().unwrap_or("").to_ascii_uppercase();
             !part.is_empty()
@@ -758,6 +762,33 @@ pub(crate) fn shared_cache(
 mod tests {
     use super::*;
     #[test]
+    fn an_artifact_name_cannot_change_the_address_it_is_downloaded_from() {
+        for name in [
+            "visual/model.onnx",
+            "models--frameleaf--ViT-B-32__openai/refs/main",
+            "detection/model.onnx",
+            "config.json",
+        ] {
+            assert!(safe_path(name), "{name}");
+        }
+        for name in [
+            "%2e%2e/secret",
+            "visual/model.onnx?download=1",
+            "visual/model.onnx#fragment",
+            "visual/%2fmodel.onnx",
+            "a b/model.onnx",
+            "visual;x/model.onnx",
+            "user@host/model.onnx",
+            "../model.onnx",
+            "visual//model.onnx",
+            "C:/model.onnx",
+            "visual\\model.onnx",
+            "",
+        ] {
+            assert!(!safe_path(name), "{name}");
+        }
+    }
+    #[test]
     fn admits_the_qualified_face_detector_and_512_value_recognizer() {
         let profile: ProfileData =
             serde_json::from_str(include_str!("../tests/fixtures/face-profile.json")).unwrap();
@@ -1352,8 +1383,24 @@ mod tests {
             .collect();
         assert_eq!(twins.len(), 60);
         let expected: Vec<&str> = expected.into_iter().chain(twins).collect();
-        assert_eq!(profiles.len(), expected.len());
-        for (profile, expected) in profiles.iter().zip(expected) {
+        // Epoch 17 appends the server's own AI build as nine smart-search profiles, so that
+        // build is a catalogue identity. No desktop runtime is built from that source and no
+        // desktop is offered them; they parse and build a challenge like any other profile,
+        // and their digests are the server's to pin.
+        const SERVER_AI_SOURCE: &str = "95593fc6887c74a705c85b0ab8c9685c79afb0e4";
+        let (desktop, server_ai) = profiles.split_at(expected.len());
+        assert_eq!(server_ai.len(), 9);
+        for profile in server_ai {
+            assert_eq!(profile.runtime_source_revision, SERVER_AI_SOURCE);
+            assert_eq!(profile.workload, "clip");
+            assert!(profile
+                .challenge("d621bd72-ad35-4199-95ab-76300756a38e")
+                .is_ok());
+        }
+        assert!(desktop
+            .iter()
+            .all(|profile| profile.runtime_source_revision != SERVER_AI_SOURCE));
+        for (profile, expected) in desktop.iter().zip(expected) {
             let (spec, _) = profile
                 .challenge("d621bd72-ad35-4199-95ab-76300756a38e")
                 .unwrap();

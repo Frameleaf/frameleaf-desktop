@@ -296,7 +296,14 @@ fn actual_native_nas_library_jobs() {
                 .await
                 .unwrap();
             accepted
-                .write_evidence(&evidence_dir, "test", profile, &installed, &proof)
+                .write_evidence(
+                    &evidence_dir,
+                    "test",
+                    profile,
+                    &installed,
+                    &proof,
+                    worker.now().unwrap(),
+                )
                 .unwrap();
             prepared.push((proof, accepted));
         }

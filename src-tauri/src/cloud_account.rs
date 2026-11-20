@@ -812,9 +812,16 @@ fn rank(candidate: &Candidate) -> u8 {
 pub(crate) fn order_candidates(candidates: Vec<Candidate>) -> Vec<Candidate> {
     let mut usable: Vec<Candidate> = Vec::new();
     for candidate in candidates {
-        let Ok(base) = normalize_server(&candidate.uri) else {
+        // Checked without taking the address into use: an entry this app can't use must not
+        // change how its name is connected to. Plain HTTP only to what is local by its shape;
+        // a listed name is reached over HTTPS.
+        let Ok(base) = crate::connection::server_origin(&candidate.uri) else {
             continue;
         };
+        if base.scheme() == "http" && !base.host().is_some_and(crate::connection::is_local_network)
+        {
+            continue;
+        }
         let candidate = Candidate {
             uri: base.to_string(),
             ..candidate
@@ -959,9 +966,7 @@ pub(crate) async fn connect_cloud_server(
         // A server found on this network or typed in: an address on this network or one the account
         // lists for this instance, answering as that instance.
         Some(base) => {
-            if !base.host().is_some_and(crate::connection::is_local_network)
-                && !address_listed(&listed.await?, &base)
-            {
+            if !crate::connection::is_home_server(&base) && !address_listed(&listed.await?, &base) {
                 return Err("cloud_server_address_unlisted".into());
             }
             if probe(client.clone(), base.clone()).await? != instance {

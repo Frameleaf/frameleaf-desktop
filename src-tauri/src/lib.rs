@@ -117,6 +117,8 @@ async fn prepare(saved: &mut SavedConnection, keep_worker_session: bool) -> (Con
         worker: false,
         worker_session: false,
         worker_auto_setup: false,
+        worker_withdrawal_notice: false,
+        worker_concurrent_leases: false,
         sources: false,
         native_host: false,
     };
@@ -198,6 +200,8 @@ async fn prepare_view(
         worker: false,
         worker_session: false,
         worker_auto_setup: false,
+        worker_withdrawal_notice: false,
+        worker_concurrent_leases: false,
         sources: false,
         native_host: false,
     };
@@ -217,7 +221,7 @@ async fn prepare_view(
             if !caps.features.enrollment {
                 return ConnectionView::new(saved, "unsupported-server".into(), caps.features);
             }
-            match transport::enroll(client, saved).await {
+            match transport::enroll(client, saved, caps.clock_skew_ms).await {
                 Ok(enrollment) => {
                     saved.device_id = Some(enrollment.id);
                     if credentials::save("connection", saved).is_err() {
@@ -235,7 +239,9 @@ async fn prepare_view(
                         && worker_session_reusable(
                             saved,
                             &credentials::load("worker-session"),
-                            time::OffsetDateTime::now_utc(),
+                            // By the server's clock, which stamped the session's expiry.
+                            time::OffsetDateTime::now_utc()
+                                + time::Duration::milliseconds(caps.clock_skew_ms),
                         );
                     if caps.features.worker_session && enrollment.state == "preparing" && !*kept {
                         // A new photo association must never reuse an earlier worker grant.
@@ -246,11 +252,16 @@ async fn prepare_view(
                                 caps.features,
                             );
                         }
-                        let issued = transport::issue_worker_session(client, saved).await;
-                        if issued
-                            .and_then(|worker| credentials::save("worker-session", &worker))
-                            .is_err()
-                        {
+                        // A refusal here is not the end: the worker asks again itself, names
+                        // the reason on the AI processing page, and waits out the ones that
+                        // pass (AI processing off for the account, away from the home network,
+                        // a busy server). Only a session that can't be saved stops it here.
+                        let issued =
+                            transport::issue_worker_session(client, saved, caps.clock_skew_ms)
+                                .await;
+                        if issued.is_ok_and(|worker| {
+                            credentials::save("worker-session", &worker).is_err()
+                        }) {
                             return ConnectionView::new(
                                 saved,
                                 "worker-setup-failed".into(),
@@ -260,7 +271,12 @@ async fn prepare_view(
                     }
                     ConnectionView::new(saved, enrollment.state, caps.features)
                 }
-                Err(_) => ConnectionView::new(saved, "enrollment-failed".into(), caps.features),
+                Err(code) => {
+                    let mut view =
+                        ConnectionView::new(saved, "enrollment-failed".into(), caps.features);
+                    view.code = Some(code);
+                    view
+                }
             }
         }
         Ok(None) => ConnectionView::new(saved, "unsupported-server".into(), unavailable),
@@ -612,6 +628,9 @@ pub(crate) async fn restore_saved(
     let checking = current
         .as_ref()
         .is_some_and(|held| saved_sign_in::same_session(held, &saved));
+    // The saved server is taken into use before its first client is built: a plain-HTTP home
+    // name is held to the home network, and reached directly, from the first request.
+    let _ = normalize_server(&saved.server);
     let plan = saved_sign_in::check(&transport::client()?, &saved)
         .await
         .plan();
@@ -834,12 +853,27 @@ async fn open_photos(
     require_local(&window)?;
     let current = state.0.lock().await;
     let saved = current.as_ref().ok_or("sign_in_required")?;
-    open_photos_window(&app, saved)
+    open_photos_checked(&app, saved).await
+}
+
+/// `open_photos_window` after a fresh look at where a plain-HTTP home name leads, when this
+/// app has not connected to it lately.
+pub(crate) async fn open_photos_checked(
+    app: &AppHandle,
+    saved: &SavedConnection,
+) -> Result<(), String> {
+    connection::refresh_home(&normalize_server(&saved.server)?).await;
+    open_photos_window(app, saved)
 }
 
 /// Shows the photo window for the signed-in connection, from the window or the tray alike.
 pub(crate) fn open_photos_window(app: &AppHandle, saved: &SavedConnection) -> Result<(), String> {
     let base = normalize_server(&saved.server)?;
+    // The window looks the server's name up itself. A plain-HTTP home name that does not lead
+    // home right now (another network) is not opened, and is not handed the session.
+    if !connection::leads_home_now(&base) {
+        return Err("server_unreachable_or_certificate_invalid".into());
+    }
     let expected = connection::photo_session_scope(saved);
     let state = app.state::<DesktopState>();
     let mut scope = state.1.lock().map_err(|_| "photo_window_unavailable")?;
@@ -1158,6 +1192,14 @@ pub fn run() {
                     let _ = window.show();
                     let _ = window.set_focus();
                 }
+            }
+            // The app is going: hand a held AI lease back to the server (`fail`, `cancelled`) so
+            // another computer gets the task now instead of when the lease runs out.
+            if matches!(event, tauri::RunEvent::Exit) {
+                let setup = app.state::<worker_setup::WorkerSetup>();
+                let _ = tauri::async_runtime::block_on(async {
+                    tokio::time::timeout(worker_setup::QUIT_GRACE, setup.stop()).await
+                });
             }
             // Windows ends a session by exiting this app without asking first.
             #[cfg(windows)]
