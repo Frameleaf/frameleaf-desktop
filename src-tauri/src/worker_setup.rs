@@ -2293,6 +2293,18 @@ async fn prepare_on(
                 };
                 match completed {
                     Ok(()) => {
+                        // The accelerated runtime crashed out. Decided before qualifying
+                        // again, which the same failures can ask for: its work moves to the
+                        // processor and it rests, and the setup that follows qualifies anew.
+                        if let (Some(AfterCrash::Failing), Some(code)) = (crash, &dropped) {
+                            let lane = predictor.failed_lane().map(str::to_owned);
+                            let code = crashed_out(crash, code.clone());
+                            if lane.is_some_and(|lane| plan.demote_runtime(&lane, &code)) {
+                                progress.crashed(predictor.exit_report());
+                                predictor.stop()?;
+                                continue 'qualification;
+                            }
+                        }
                         if requalify {
                             predictor.stop()?;
                             continue 'qualification;
@@ -4420,6 +4432,20 @@ mod tests {
         assert_eq!(
             out(None, "worker_execution_deadline"),
             "worker_execution_deadline"
+        );
+        // Three acknowledged deadline failures of one model ask to qualify again at the same
+        // moment the third crash is judged: the crash-out is still what the work loop acts on
+        // first (it checks `AfterCrash::Failing` before `requalify`).
+        let (mut trouble, mut strikes) = (RuntimeTrouble::default(), GrantStrikes::default());
+        let mut last = (None, false);
+        for _ in 0..CRASHES_AT_ONE {
+            let requalify = strikes.failed(Some("clip"), "worker_execution_deadline");
+            last = (Some(trouble.crashed(1, true)), requalify);
+        }
+        assert_eq!(last, (failing, true));
+        assert_eq!(
+            out(last.0, "worker_execution_deadline"),
+            "runtime_process_stopped"
         );
         // The processor's own runtime has nowhere to fall back to: counted by the restarts.
         assert_eq!(
