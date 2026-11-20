@@ -21,6 +21,29 @@ release tools. The app never reads it, and the release check keeps it equal to t
 When the desktop is the server (local-server mode), the packaged Frameleaf server reads its own
 catalogue like any other server. That is still the one catalogue.
 
+### The server's own AI is in the catalogue too
+
+Owner decisions made during this work, which replace the original design:
+
+- **No fallback to the plain model name.** The server's smart search used to fall back to the
+  bare model name when it had no catalogue identity for its own AI. That fallback is removed.
+  Once a desktop has been granted smart search, the server's own AI must serve a catalogue
+  identity as well, so every vector in a library is tied to one.
+- **The catalogue was recut for the server's current AI build** (epoch 17, 171 profiles). It
+  appends nine smart-search profiles for the processor (the image encoder and both text encoders
+  of `ViT-B-16-SigLIP-384__webli`, `ViT-B-32__openai` and `ViT-SO400M-16-SigLIP2-384__webli`)
+  under runtime source `95593fc6887c74a705c85b0ab8c9685c79afb0e4`. Each is a twin of the newest
+  processor profile for the same request: the same files, fixture and expected output, with a
+  model key of its own. Nothing was removed or changed; the first 162 profiles are as before.
+- **No desktop is offered those nine.** No desktop runtime is built or factory-signed from that
+  source, and `/models` lists a profile only for the runtime source the desktop reports. The
+  desktop parses them like any other profile and never runs them.
+- **One embedding space across runtime revisions.** The server treats released spaces as one
+  when they have the same model files and the same expected output for the same fixture; they
+  differ only in the runtime's preprocessing source. So the server's AI works under any runtime
+  revision's key, a second desktop on another runtime revision of the same model is accepted,
+  and a library that already has vectors the server made keeps them.
+
 ## Version signal
 
 `GET /api/desktop/capabilities` → `features.workerAutoSetup: true` on servers that follow this
@@ -29,6 +52,10 @@ document. Older servers omit the key. The desktop reads a missing key as `false`
 `features.workerWithdrawalNotice: true` says the server understands `reportWithdrawn` on a claim
 (see Leases). The desktop sends that field only to a server that advertises it, because a server
 from before it refuses a claim carrying a field it does not know.
+
+`features.workerConcurrentLeases: true` says a desktop may hold several leases at once (see
+Several tasks at once). Only then does the desktop send `concurrentLeases` to `/models` and
+`slots` on a claim; without it the desktop holds one lease, exactly as before.
 
 ## Setup sequence
 
@@ -107,6 +134,11 @@ On a `workerAutoSetup` server, `state` is one of:
 
 `pinned`, `legacy` and `unavailable` describe routing, and only older servers send them.
 
+With `"concurrentLeases": true` in the request (sent only to a server that advertises
+`workerConcurrentLeases`), each `eligible` entry also carries `"concurrency": <int ≥ 1>`: the
+administrator's Jobs setting for that task's queue (smart search, faces, text). Without the
+request field the reply is as above, so desktops already released never see the new field.
+
 ## What the server checks
 
 To issue a challenge:
@@ -130,11 +162,51 @@ A job whose admission lands on a home destination (Local or LAN) can go to a rea
 approved account, whatever the route's origin (default, pinned or legacy) and whether or not that
 destination's AI is up. Work an administrator sends to Frameleaf Cloud stays on Frameleaf Cloud.
 
+### Several tasks at once
+
+Owner decision made during this work: a desktop follows the administrator's Jobs concurrency
+setting instead of working one task at a time. This replaces "each desktop holds at most one
+lease".
+
+- **What the server allows.** `concurrency` in the `/models` reply, per task, from the Jobs
+  setting. The server hands over a new lease only while the desktop holds fewer than that many
+  for the task's workload.
+- **What the desktop can take.** One number for the whole runtime: the least of the server's
+  allowance for the tasks that are ready (their `concurrency` added up), what this computer can
+  take, and what it managed since it last ran short of memory.
+  - A graphics card or neural engine: up to eight at once. The processor: one, or two on a
+    computer with eight cores or more (each task already gets four threads).
+  - Memory: beside the loaded models, each task in hand is taken to need a quarter of the
+    models' memory, at least 256 MB; what is free now, less the models, says how many fit.
+  - A graphics card's own memory can't be read, so the number is a starting point. When the
+    model refuses half or more of the tasks it was given at once, the desktop runs half as
+    many from then on; when the runtime process ends or stops answering while working on
+    several, it goes to one. It does not stop, and it does not go back up until AI processing
+    is stopped and started again. Pauses for memory, power and network are unchanged.
+  - Nothing to set on the desktop.
+- **Claims.** `"slots": <1..64>` on every claim says how many more tasks the desktop can take
+  right now. A claim still returns at most one task; with `slots` it is always a new lease,
+  never one already held. The desktop waits for the first task as before (`waitMs` 20000), then
+  asks for more without waiting (`waitMs` 0) until it has no room or the server has nothing,
+  and runs what it was given side by side. It claims again when those are done.
+- **Each lease is its own.** Its own input, heartbeat, result and failure. A failure, a refused
+  input, a lost lease, a hold or a withdrawal touches only its own task or model; the others
+  finish and report. Stop, sign-out, library switch, quit and a pause for power or network
+  hand back every lease held, each with `fail` `cancelled`.
+- **One request at a time.** Signed requests still go one at a time in sequence order, which
+  is why the claims for more room do not wait.
+- The runtime process is started to serve as many requests at once as the desktop will run
+  tasks. The signed runtime takes one input per inference call, so several tasks are several
+  calls served side by side, not one batched call.
+- The server remembers held plus `slots` from the last claim as how many the desktop can run
+  at once, and starts that many extra queue jobs for it.
+
 ### Several desktops at once
 
-Any number of desktops can work the same queue. Each desktop holds at most one lease. `claim` takes
+Any number of desktops can work the same queue. `claim` takes
 the oldest task its qualified models can run, with `FOR UPDATE SKIP LOCKED`, so whichever desktop
-asks first gets the next item. To keep them busy, the server starts one extra job in a queue
+asks first gets the next item. To keep them busy, the server starts one extra job (as many as
+the desktop said it can run, where it holds several leases) in a queue
 (`smartSearch`, `faceDetection`, `ocr`) for a desktop only when all of these hold: the desktop is
 online (a request in the last 150 seconds: the lease plus 30 seconds), its account is still
 approved, it holds an unexpired qualification for the model the settings ask for now, and that
@@ -154,8 +226,8 @@ revision's key. `task.qualificationId` is the desktop's current qualification fo
 
 ### Leases
 
-- Each desktop holds one lease. It lasts 120 seconds from each heartbeat (the desktop sends one
-  every 20 seconds); the result or a failure ends it. Qualifying again while holding a lease does
+- A lease lasts 120 seconds from each heartbeat (the desktop sends one every 20 seconds for
+  each lease it holds); the result or a failure ends it. Qualifying again while holding a lease does
   not end it.
 - `POST /api/desktop/tasks/{id}/fail` `{code}` takes `inference-failed`, `input-invalid`,
   `model-unavailable` or `cancelled`, and the server logs the code. The desktop sends `cancelled`
@@ -259,6 +331,7 @@ These come from the desktop itself, before anything reaches the server:
 |---|---|---|
 | old | new | Works. Same endpoints and payloads; the server no longer refuses on routing or its own AI. An old desktop matches some refusals by status and name together, so a status that changed (policy-off at session issue: 401 → 403; on report: 409 → 403) shows it a general message instead of a named one. |
 | new | new | Works, with specific messages. |
+| new | new, without `workerConcurrentLeases` | Works, one task at a time. |
 | new | old | **Update your server** (`server_update_required`). The old server can't send its catalogue, and the desktop has none of its own. It checks again every few minutes. |
 | old | old | Unchanged. |
 
