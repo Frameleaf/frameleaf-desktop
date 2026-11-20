@@ -463,7 +463,7 @@ fn concurrent_tasks(
     allowed.min(local).min(ceiling.unwrap_or(u32::MAX)).max(1)
 }
 /// What a runtime that ended or stopped answering means for how the work goes on.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum AfterCrash {
     /// Several tasks were in hand: most likely memory. This many at once, on the same runtime.
     Fewer(u32),
@@ -486,6 +486,7 @@ const CLEAN_RUN: u32 = 50;
 struct RuntimeTrouble {
     at_one: u32,
     clean: u32,
+    clean_accelerated: u32,
 }
 impl RuntimeTrouble {
     /// `in_hand`: the tasks the runtime was working on when it ended. None is a runtime that
@@ -495,6 +496,7 @@ impl RuntimeTrouble {
     /// (`CRASH_LIMIT`), as they always were.
     fn crashed(&mut self, in_hand: u32, accelerated: bool) -> AfterCrash {
         self.clean = 0;
+        self.clean_accelerated = 0;
         match in_hand {
             0 => AfterCrash::Failing,
             1 if accelerated => {
@@ -514,16 +516,39 @@ impl RuntimeTrouble {
     fn refused(&mut self) {
         self.clean = 0;
     }
-    /// A task finished. `true` after a long run of them without trouble: one more may run at
-    /// once, and a runtime that rested after crashes has recovered.
-    fn completed(&mut self) -> bool {
-        self.at_one = 0;
+    /// A task finished; `accelerated`: on the graphics card's or neural engine's runtime.
+    /// First `true` after a long run of tasks without trouble: one more may run at once.
+    /// Second `true` after as long a run on the accelerated runtime: it has recovered from
+    /// its crashes. Only its own tasks say so, and only they end a row of its crashes: the
+    /// processor finishing other work beside it says nothing about the graphics card.
+    fn completed(&mut self, accelerated: bool) -> (bool, bool) {
         self.clean += 1;
         let raise = self.clean >= CLEAN_RUN;
         if raise {
             self.clean = 0;
         }
-        raise
+        if accelerated {
+            self.at_one = 0;
+            self.clean_accelerated += 1;
+        }
+        let recovered = self.clean_accelerated >= CLEAN_RUN;
+        if recovered {
+            self.clean_accelerated = 0;
+        }
+        (raise, recovered)
+    }
+}
+/// The reason work leaves the accelerated runtime. Its process died under a task that was
+/// dropped for a reason of its own (a deadline, say), for the third time in a row: that is
+/// the runtime crashing out, so it rests and is tried again later, and the tray and the AI
+/// page say so. A task handed back or short of memory keeps its own reason.
+fn crashed_out(crash: Option<AfterCrash>, code: String) -> String {
+    let own = code.ends_with("_cancelled")
+        || code.starts_with("resource_")
+        || crate::provider_selection::crashed(&code);
+    match crash {
+        Some(AfterCrash::Failing) if !own => "runtime_process_stopped".into(),
+        _ => code,
     }
 }
 /// The tasks in hand, counted as the pool claims and settles them. A task that ends the pool
@@ -2157,7 +2182,9 @@ async fn prepare_on(
                 // The tasks in hand. One that ends the pool with its failure stays counted:
                 // after a crash this is how many the runtime was working on.
                 let in_hand = InHand::default();
-                let mut clean_run = false;
+                let mut recovered = false;
+                // The models the graphics card or neural engine is working on in this plan.
+                let accelerated_models = plan.accelerated_models();
                 let (limits_now, ready_now) = (&limits, &ready);
                 let mut on_task = |task: crate::native_predictor::TaskStep| match task.step {
                     Step::Completed => {
@@ -2168,8 +2195,12 @@ async fn prepare_on(
                         refused_in_a_row = 0;
                         // A long run without trouble: one more at once than it last ran
                         // short at, up to what the server allows and this computer can take.
-                        let clean = trouble.completed();
-                        clean_run |= clean;
+                        let on_accelerated = task
+                            .model
+                            .as_deref()
+                            .is_some_and(|model| accelerated_models.contains(model));
+                        let (clean, well) = trouble.completed(on_accelerated);
+                        recovered |= well;
                         if clean && progress.capacity_ceiling().is_some() {
                             progress.raise_capacity();
                             let more = concurrent_tasks(
@@ -2240,7 +2271,7 @@ async fn prepare_on(
                 at_once = running;
                 // A runtime that ended or stopped answering: what it means depends on how
                 // many tasks it was working on, not on how many it was allowed.
-                if clean_run {
+                if recovered {
                     plan.recovered();
                 }
                 // The graphics card's or neural engine's own runtime is the one that ended.
@@ -2270,6 +2301,7 @@ async fn prepare_on(
                             // FD-52: the accelerated runtime's process died while inferring: its
                             // workloads move to the processor instead of crashing on every restart.
                             let lane = predictor.failed_lane().map(str::to_owned);
+                            let code = crashed_out(crash, code);
                             if let Some(AfterCrash::Again(crashes)) = crash {
                                 // The graphics card keeps the work: its runtime is started
                                 // again after a wait.
@@ -4365,8 +4397,30 @@ mod tests {
         let mut trouble = RuntimeTrouble::default();
         assert_eq!(trouble.crashed(1, true), AfterCrash::Again(1));
         assert_eq!(trouble.crashed(1, true), AfterCrash::Again(2));
-        assert!(!trouble.completed());
+        // The processor finishing other work in between does not end the row.
+        assert_eq!(trouble.completed(false), (false, false));
+        assert_eq!(trouble.crashed(1, true), AfterCrash::Failing);
         assert_eq!(trouble.crashed(1, true), AfterCrash::Again(1));
+        assert_eq!(trouble.completed(true), (false, false));
+        assert_eq!(trouble.crashed(1, true), AfterCrash::Again(1));
+        // The third crash under a task dropped for its own reason is still the runtime
+        // crashing out; a hand-back and a crash code are kept as they are.
+        let out = |crash, code: &str| crashed_out(crash, code.to_owned());
+        let failing = Some(AfterCrash::Failing);
+        assert_eq!(
+            out(failing, "worker_execution_deadline"),
+            "runtime_process_stopped"
+        );
+        assert_eq!(out(failing, "worker_cancelled"), "worker_cancelled");
+        assert_eq!(out(failing, "resource_memory"), "resource_memory");
+        assert_eq!(
+            out(failing, "runtime_prediction_interrupted"),
+            "runtime_prediction_interrupted"
+        );
+        assert_eq!(
+            out(None, "worker_execution_deadline"),
+            "worker_execution_deadline"
+        );
         // The processor's own runtime has nowhere to fall back to: counted by the restarts.
         assert_eq!(
             RuntimeTrouble::default().crashed(1, false),
@@ -4376,14 +4430,20 @@ mod tests {
         // A long run of finished tasks lets one more run at once; trouble starts the run again.
         let mut trouble = RuntimeTrouble::default();
         for _ in 1..CLEAN_RUN {
-            assert!(!trouble.completed());
+            assert_eq!(trouble.completed(false), (false, false));
         }
         trouble.refused();
         for _ in 1..CLEAN_RUN {
-            assert!(!trouble.completed());
+            assert_eq!(trouble.completed(false), (false, false));
         }
-        assert!(trouble.completed());
-        assert!(!trouble.completed());
+        // Only the processor's tasks: one more at once, and no word on the graphics card.
+        assert_eq!(trouble.completed(false), (true, false));
+        // The graphics card has recovered after as long a run of its own tasks.
+        for _ in 1..CLEAN_RUN {
+            assert!(!trouble.completed(true).1);
+        }
+        assert!(trouble.completed(true).1);
+        assert!(!trouble.completed(true).1);
         let progress = quiet();
         progress.raise_capacity();
         assert_eq!(progress.capacity_ceiling(), None);

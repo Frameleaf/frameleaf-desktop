@@ -612,6 +612,14 @@ impl Plan {
                 .iter()
                 .any(|group| self.choice(workload_of(group)).0 != CPU)
     }
+    /// The models this plan runs on the accelerated runtime.
+    pub(crate) fn accelerated_models(&self) -> BTreeSet<String> {
+        self.cpu
+            .iter()
+            .filter(|group| self.choice(workload_of(group)).0 != CPU)
+            .flat_map(|group| group.iter().map(|profile| profile.model_key().to_owned()))
+            .collect()
+    }
     /// Start a rest after the runtime crashed out: twice as long as its last one, if it has
     /// not worked well since.
     fn rest(&mut self, code: &str) {

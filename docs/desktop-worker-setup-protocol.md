@@ -209,14 +209,17 @@ lease".
       GPU"). With one task in hand, a graphics card's or neural engine's runtime that ends
       or stops answering is started again on the same device, after a wait that grows with
       each crash in a row. One crash never moves the work to the processor.
-    - Only the third crash in a row, with no task finished in between, moves that runtime's
-      work to the processor. The tray then says "on the processor (GPU stopped, retried
+    - Only the third crash in a row, with no task finished on that runtime in between, moves
+      its work to the processor (a task the processor finishes beside it does not end the
+      row). A crash under a task that was dropped for a reason of its own, such as its
+      deadline, counts the same, and the third is shown as the process having stopped. The
+      tray then says "on the processor (GPU stopped, retried
       later)" and the AI page says the process stopped three times in a row and is tried
       again later.
     - That move is not lasting. Nothing is written to disk, so the next start of the app
       tries the graphics card at once. While the app runs it is tried again by itself after
-      30 minutes; if it crashes out again without 50 tasks finished in a row in between, the
-      wait doubles each time, up to 8 hours. **Retry Setup** tries it at once.
+      30 minutes; if it crashes out again without 50 of its own tasks finished in a row in
+      between, the wait doubles each time, up to 8 hours. **Retry Setup** tries it at once.
     - Unchanged: a provider that fails its check (a different answer on the test picture, a
       signature or runtime the server does not accept, slower than the processor) is
       remembered for that runtime and device until a newer runtime or Retry Setup. A runtime
