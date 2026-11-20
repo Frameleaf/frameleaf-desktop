@@ -205,11 +205,24 @@ lease".
     - the runtime process ends or stops answering with several tasks in hand: half as many
       as it had in hand, and half again each time it happens, down to one. The graphics card
       keeps the work. What counts is the tasks actually in hand, not the number allowed.
-    - at one task at a time after such a step down, the runtime is started once more on the
-      same device; only when it ends again, with no task finished in between, is it treated
-      as failing (the work then moves to the processor, as before).
-    - a runtime that does not start at all, or one that ends with its only task on a
-      computer that never stepped down, is treated as failing at once, as before.
+    - **The graphics card keeps the work after a crash** (owner decision: "Yes, keep the
+      GPU"). With one task in hand, a graphics card's or neural engine's runtime that ends
+      or stops answering is started again on the same device, after a wait that grows with
+      each crash in a row. One crash never moves the work to the processor.
+    - Only the third crash in a row, with no task finished in between, moves that runtime's
+      work to the processor. The tray then says "on the processor (GPU stopped, retried
+      later)" and the AI page says the process stopped three times in a row and is tried
+      again later.
+    - That move is not lasting. Nothing is written to disk, so the next start of the app
+      tries the graphics card at once. While the app runs it is tried again by itself after
+      30 minutes; if it crashes out again without 50 tasks finished in a row in between, the
+      wait doubles each time, up to 8 hours. **Retry Setup** tries it at once.
+    - Unchanged: a provider that fails its check (a different answer on the test picture, a
+      signature or runtime the server does not accept, slower than the processor) is
+      remembered for that runtime and device until a newer runtime or Retry Setup. A runtime
+      that does not start in time moves to the processor for that run, as before. The
+      processor's own runtime has nowhere to move to: its crashes are counted across
+      restarts (`runtime_crash_loop`).
     It does not stop. After 50 tasks in a row with none refused and no crash, one more runs
     at once again, up to what the server allows and this computer can take; until then, and
     after stopping and starting AI processing, the number starts from the estimate again.

@@ -83,7 +83,18 @@ pub(crate) fn labels(status: &SetupStatus, connected: bool) -> Labels {
             "" => "not set up",
             _ => stopped_for(status.code.as_deref().unwrap_or_default()),
         };
-        format!("AI processing: {word}")
+        // The graphics card's work is on the processor after its runtime kept stopping.
+        let resting = matches!(status.state.as_str(), "working" | "waiting-for-work")
+            && status.providers.iter().any(|chosen| {
+                chosen
+                    .fallback
+                    .as_deref()
+                    .is_some_and(crate::provider_selection::crashed)
+            });
+        match resting {
+            true => format!("AI processing: {word} on the processor (GPU stopped, retried later)"),
+            false => format!("AI processing: {word}"),
+        }
     };
     let paused = status.control != WorkerControl::Running;
     Labels {
@@ -582,6 +593,24 @@ mod tests {
             control,
             ..SetupStatus::default()
         }
+    }
+
+    #[test]
+    fn the_menu_says_when_the_graphics_card_rests_after_its_runtime_kept_stopping() {
+        let provider = |fallback: Option<&str>| crate::provider_selection::WorkloadProvider {
+            workload: "clip".into(),
+            provider: "cpu".into(),
+            fallback: fallback.map(Into::into),
+        };
+        let mut working = status("working", WorkerControl::Running, None);
+        working.providers = vec![provider(Some("runtime_process_stopped"))];
+        assert_eq!(
+            labels(&working, true).worker,
+            "AI processing: working on the processor (GPU stopped, retried later)"
+        );
+        // Another reason for the processor is the AI page's to explain, as before.
+        working.providers = vec![provider(Some("provider_slower")), provider(None)];
+        assert_eq!(labels(&working, true).worker, "AI processing: working");
     }
 
     #[test]

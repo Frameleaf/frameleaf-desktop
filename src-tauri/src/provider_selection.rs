@@ -294,7 +294,34 @@ pub(crate) fn passing(code: &str) -> bool {
 /// FD-64: Retry Setup forgets what was remembered, so the provider is tried and measured again.
 pub(crate) fn forget(data: &Path) {
     let _ = std::fs::remove_file(data.join(REMEMBERED));
+    RESTS.lock().unwrap().remove(&data.join(REMEMBERED));
 }
+
+/// The accelerated runtime's process ended, or stopped answering, in the middle of its work.
+/// That is not a verdict on the provider: its work goes to the processor for a while and the
+/// provider is tried again by itself (`Plan::rest_ends`), unlike a provider that fails its
+/// check, which is remembered until a newer runtime or Retry Setup.
+pub(crate) fn crashed(code: &str) -> bool {
+    matches!(
+        code,
+        "runtime_process_stopped" | "runtime_prediction_interrupted"
+    )
+}
+/// How long the processor stands in after the accelerated runtime crashed out, the first time,
+/// and at most: each time it crashes out again without a good run in between, twice as long.
+const FIRST_REST: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const MOST_REST: std::time::Duration = std::time::Duration::from_secs(8 * 60 * 60);
+/// One accelerated runtime resting after it crashed out, for as long as this app runs: a
+/// restart of the app tries the provider again at once.
+struct Rest {
+    runtime: String,
+    device: String,
+    code: String,
+    wait: std::time::Duration,
+    until: std::time::Instant,
+}
+/// Keyed by where the remembered results of that data folder are kept.
+static RESTS: std::sync::Mutex<BTreeMap<PathBuf, Rest>> = std::sync::Mutex::new(BTreeMap::new());
 
 /// FD-64: the request for what the server offers the accelerated runtime failed. A failure the
 /// worker reconnects after (`Err`) ends this preparation so it is asked again; any other is the
@@ -510,6 +537,10 @@ pub(crate) struct Plan {
     failures: Option<Failures>,
     /// Refusals that hold for this run only (the server's answer may change).
     refused: BTreeMap<String, String>,
+    /// Where this data folder's results are remembered: the key of its rest (`RESTS`).
+    remembered: PathBuf,
+    /// The accelerated runtime is resting after crashes: the processor has its work until then.
+    resting: Option<std::time::Instant>,
 }
 impl Plan {
     pub(crate) fn new(
@@ -533,16 +564,75 @@ impl Plan {
             });
             offer
         });
+        let remembered = failures.to_path_buf();
         let failures = offer
             .as_ref()
             .map(|offer| Failures::load(failures, &offer.manifest_sha256, &offer.device));
+        // Still resting from crashes earlier in this run of the app: the processor keeps the
+        // work, with the reason, until the rest is over.
+        let (mut refused, mut resting) = (BTreeMap::new(), None);
+        if let (Some(offer), Some(rest)) = (&offer, RESTS.lock().unwrap().get(&remembered)) {
+            let same = rest.runtime == offer.manifest_sha256 && rest.device == offer.device;
+            if same && rest.until > std::time::Instant::now() {
+                resting = Some(rest.until);
+                for group in &offer.groups {
+                    refused.insert(workload_of(group).to_owned(), rest.code.clone());
+                }
+            }
+        }
         Self {
             cpu,
             offer,
             unavailable,
             failures,
-            refused: BTreeMap::new(),
+            refused,
+            remembered,
+            resting,
         }
+    }
+    /// When the accelerated runtime, resting after crashes, is to be tried again. The worker
+    /// then sets up again, and the plan made then chooses the provider as if nothing happened.
+    pub(crate) fn rest_ends(&self) -> Option<std::time::Instant> {
+        self.resting
+    }
+    /// The accelerated runtime has worked well for a good while: its next rest, should it
+    /// crash out again, starts from the shortest.
+    pub(crate) fn recovered(&self) {
+        if self.resting.is_none() {
+            RESTS.lock().unwrap().remove(&self.remembered);
+        }
+    }
+    /// Whether work is running on this accelerated runtime right now.
+    pub(crate) fn accelerates(&self, manifest_sha256: &str) -> bool {
+        self.offer
+            .as_ref()
+            .is_some_and(|offer| offer.manifest_sha256 == manifest_sha256)
+            && self
+                .cpu
+                .iter()
+                .any(|group| self.choice(workload_of(group)).0 != CPU)
+    }
+    /// Start a rest after the runtime crashed out: twice as long as its last one, if it has
+    /// not worked well since.
+    fn rest(&mut self, code: &str) {
+        let Some(offer) = &self.offer else { return };
+        let mut rests = RESTS.lock().unwrap();
+        let wait = rests
+            .get(&self.remembered)
+            .filter(|rest| rest.runtime == offer.manifest_sha256 && rest.device == offer.device)
+            .map_or(FIRST_REST, |rest| (rest.wait * 2).min(MOST_REST));
+        let until = std::time::Instant::now() + wait;
+        rests.insert(
+            self.remembered.clone(),
+            Rest {
+                runtime: offer.manifest_sha256.clone(),
+                device: offer.device.clone(),
+                code: code.into(),
+                wait,
+                until,
+            },
+        );
+        self.resting = Some(until);
     }
     fn accelerated_group(&self, workload: &str) -> Option<&Vec<ApprovedProfile>> {
         self.offer
@@ -665,7 +755,8 @@ impl Plan {
     }
     /// The accelerated runtime's process did not serve: every workload on it moves to the
     /// processor, remembered for this runtime epoch and device unless the cause is a passing
-    /// one (`passing`), which holds for this run only.
+    /// one (`passing`), which holds for this run only, or a crash (`crashed`), after which the
+    /// runtime rests and is tried again by itself.
     ///
     /// Stopping the worker, signing out or a pause for power or network is never the provider's
     /// fault, whatever process happened to be starting at that moment.
@@ -686,7 +777,10 @@ impl Plan {
             .collect();
         let mut changed = false;
         for workload in workloads {
-            changed |= self.demote(&workload, code, !passing(code));
+            changed |= self.demote(&workload, code, !passing(code) && !crashed(code));
+        }
+        if changed && crashed(code) {
+            self.rest(code);
         }
         changed
     }
@@ -1292,14 +1386,67 @@ mod tests {
                 "{code}"
             );
         }
-        // A process that died is the provider's failure and is remembered.
-        assert!(!passing("runtime_process_stopped") && !passing("runtime_output_mismatch"));
+        // A provider that fails its check is remembered; a process that died is not a verdict.
+        assert!(!passing("runtime_output_mismatch") && !crashed("runtime_output_mismatch"));
+        assert!(crashed("runtime_process_stopped") && crashed("runtime_prediction_interrupted"));
         // Memory another program held, or a check that ran out of time, says nothing lasting.
         assert!(passing("runtime_out_of_memory") && passing("runtime_qualification_timeout"));
-        let mut crashed = plan_on(&root, &manifest, "driver-2");
-        assert!(crashed.demote_runtime(&manifest, "runtime_process_stopped"));
-        let remembered = row("face", CPU, Some("runtime_process_stopped"));
-        assert_eq!(fallen(&plan_on(&root, &manifest, "driver-2")), remembered);
+
+        // The runtime crashed out: the processor has its work, with the reason, for half an
+        // hour, in every plan made while this app runs. Nothing is written to disk, so the
+        // app's next start tries the provider at once.
+        let rest = |root: &Path| {
+            let rests = RESTS.lock().unwrap();
+            rests.get(&root.join(REMEMBERED)).map(|rest| rest.wait)
+        };
+        let end_rest = |root: &Path| {
+            let mut rests = RESTS.lock().unwrap();
+            rests.get_mut(&root.join(REMEMBERED)).unwrap().until = std::time::Instant::now();
+        };
+        let before = std::fs::read(&record).ok();
+        let mut crashing = plan_on(&root, &manifest, "driver-2");
+        assert_eq!(crashing.rest_ends(), None);
+        assert!(crashing.accelerates(&manifest) && !crashing.accelerates(&"c".repeat(64)));
+        assert!(crashing.demote_runtime(&manifest, "runtime_process_stopped"));
+        assert!(!crashing.accelerates(&manifest));
+        assert_eq!(std::fs::read(&record).ok(), before);
+        assert_eq!(rest(&root), Some(FIRST_REST));
+        let resting = plan_on(&root, &manifest, "driver-2");
+        assert_eq!(
+            fallen(&resting),
+            row("face", CPU, Some("runtime_process_stopped"))
+        );
+        assert!(resting
+            .rest_ends()
+            .is_some_and(|at| at > std::time::Instant::now()));
+        // Resting says nothing about recovery, and another device is not resting.
+        resting.recovered();
+        assert_eq!(rest(&root), Some(FIRST_REST));
+        assert_eq!(
+            fallen(&plan_on(&root, &manifest, "driver-3")),
+            row("face", COREML, None)
+        );
+        // The rest is over: the provider is chosen again, by itself.
+        end_rest(&root);
+        let mut again = plan_on(&root, &manifest, "driver-2");
+        assert_eq!(fallen(&again), row("face", COREML, None));
+        assert_eq!(again.rest_ends(), None);
+        // It crashes out again without a good run in between: twice as long, up to the most.
+        assert!(again.demote_runtime(&manifest, "runtime_prediction_interrupted"));
+        assert_eq!(rest(&root), Some(FIRST_REST * 2));
+        for _ in 0..8 {
+            end_rest(&root);
+            let mut next = plan_on(&root, &manifest, "driver-2");
+            assert!(next.demote_runtime(&manifest, "runtime_process_stopped"));
+        }
+        assert_eq!(rest(&root), Some(MOST_REST));
+        // A good run after a rest: the next rest starts from the shortest again.
+        end_rest(&root);
+        let mut well = plan_on(&root, &manifest, "driver-2");
+        well.recovered();
+        assert_eq!(rest(&root), None);
+        assert!(well.demote_runtime(&manifest, "runtime_process_stopped"));
+        assert_eq!(rest(&root), Some(FIRST_REST));
 
         // Retry Setup forgets it: the provider is tried and measured again.
         forget(&root);

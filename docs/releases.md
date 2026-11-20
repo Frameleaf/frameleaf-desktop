@@ -799,8 +799,7 @@ validation; macOS and Linux ship without it.
    uses Azure Artifact Signing; see below.)
 2. **Release the server first** when `runtime/model-catalogue.json` has a higher
    epoch than the latest `frameleaf-v<version>` server release (today: Desktop
-   16, `frameleaf-v1.2.22` 15, so a server release carrying catalogue epoch 16
-   comes first).
+   17, `frameleaf-v1.2.25` 17, so no server release has to come first).
 3. **Merge everything that ships, including the version change**, to `main`.
    The commit to release is `<commit>`; `node tools/release_inputs.mjs v<version>`
    on it prints the tag.

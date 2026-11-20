@@ -467,14 +467,16 @@ fn concurrent_tasks(
 enum AfterCrash {
     /// Several tasks were in hand: most likely memory. This many at once, on the same runtime.
     Fewer(u32),
-    /// One task in hand, after running fewer for memory: the same runtime once more.
-    Again,
+    /// One task in hand on a graphics card or neural engine: the same runtime again, after a
+    /// wait that grows with each crash in a row.
+    Again(u32),
     /// The runtime itself is failing: the processor takes its work, or the crash is counted.
     Failing,
 }
-/// At one task at a time after stepping down, the runtime must end this many times in a row,
-/// with no task finished in between, before it is treated as failing.
-const CRASHES_AT_ONE: u32 = 2;
+/// A graphics card or neural engine keeps its work until its runtime has ended this many times
+/// in a row with one task in hand and no task finished in between (owner decision: one crash
+/// at a single task never moves the work to the processor).
+const CRASHES_AT_ONE: u32 = 3;
 /// This many tasks finished in a row, with none refused and no crash, lets one more run at
 /// once again after a step down.
 const CLEAN_RUN: u32 = 50;
@@ -487,17 +489,22 @@ struct RuntimeTrouble {
 }
 impl RuntimeTrouble {
     /// `in_hand`: the tasks the runtime was working on when it ended. None is a runtime that
-    /// did not start, which says nothing about memory. `stepped_down`: fewer tasks are
-    /// already being run at once than this computer was first taken to manage.
-    fn crashed(&mut self, in_hand: u32, stepped_down: bool) -> AfterCrash {
+    /// did not start, which says nothing about memory. `accelerated`: the runtime that ended
+    /// is the graphics card's or neural engine's. The processor's own runtime has no other
+    /// device to fall back to: its crashes are counted across restarts of the setup
+    /// (`CRASH_LIMIT`), as they always were.
+    fn crashed(&mut self, in_hand: u32, accelerated: bool) -> AfterCrash {
         self.clean = 0;
         match in_hand {
             0 => AfterCrash::Failing,
-            1 if stepped_down => {
+            1 if accelerated => {
                 self.at_one += 1;
                 match self.at_one < CRASHES_AT_ONE {
-                    true => AfterCrash::Again,
-                    false => AfterCrash::Failing,
+                    true => AfterCrash::Again(self.at_one),
+                    false => {
+                        self.at_one = 0;
+                        AfterCrash::Failing
+                    }
                 }
             }
             1 => AfterCrash::Failing,
@@ -507,7 +514,8 @@ impl RuntimeTrouble {
     fn refused(&mut self) {
         self.clean = 0;
     }
-    /// A task finished. `true` when one more may run at once.
+    /// A task finished. `true` after a long run of them without trouble: one more may run at
+    /// once, and a runtime that rested after crashes has recovered.
     fn completed(&mut self) -> bool {
         self.at_one = 0;
         self.clean += 1;
@@ -517,6 +525,38 @@ impl RuntimeTrouble {
         }
         raise
     }
+}
+/// The tasks in hand, counted as the pool claims and settles them. A task that ends the pool
+/// with its failure is never settled and stays counted: after a crash this is how many the
+/// runtime was working on.
+#[derive(Default)]
+struct InHand(std::sync::atomic::AtomicU32);
+impl InHand {
+    fn claimed(&self) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+    fn settled(&self, task: &crate::native_predictor::TaskStep) {
+        if task.model.is_some() {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    fn count(&self) -> u32 {
+        self.0.load(Ordering::Acquire)
+    }
+}
+/// The pool ended because the runtime ended or stopped answering: what comes next, with the
+/// number to run at once already lowered when it was a matter of memory.
+fn after_crash(
+    trouble: &mut RuntimeTrouble,
+    progress: &Progress,
+    in_hand: u32,
+    accelerated: bool,
+) -> AfterCrash {
+    let after = trouble.crashed(in_hand, accelerated);
+    if let AfterCrash::Fewer(fewer) = after {
+        progress.lower_capacity(fewer);
+    }
+    after
 }
 /// The server withdraws a model from this computer after this many failed tasks in a row
 /// (`native_predictor::counts_against_grant`) and then leases it nothing for that model.
@@ -698,6 +738,12 @@ async fn cancellable<T>(
         result = future => result,
         _ = async { loop { if cancel.load(Ordering::Acquire) { break; } tokio::time::sleep(Duration::from_millis(50)).await; } } => Err("worker_setup_cancelled".into())
     }
+}
+/// The wait before a runtime that crashed is started again on the same device: longer with
+/// each crash in a row. A stop ends the wait.
+async fn restart_wait(crashes: u32, cancel: &AtomicBool) -> Result<(), String> {
+    let wait = reconnect_delay(crashes, rand::random());
+    hold_off(Some(tokio::time::Instant::now() + wait), cancel).await
 }
 /// Wait out what is left of a pause before the next claim; a stop ends the wait.
 async fn hold_off(until: Option<tokio::time::Instant>, cancel: &AtomicBool) -> Result<(), String> {
@@ -2030,6 +2076,15 @@ async fn prepare_on(
                     predictor.stop()?;
                     return Err("worker_models_changed".into());
                 }
+                // A graphics card or neural engine that rested after crashes is tried again:
+                // set up again, and the plan made then gives it its work back.
+                if plan
+                    .rest_ends()
+                    .is_some_and(|due| std::time::Instant::now() >= due)
+                {
+                    predictor.stop()?;
+                    return Err("worker_models_changed".into());
+                }
                 // The server may have changed a task's model, or turned a task on or off.
                 if models_checked.elapsed() >= MODEL_RECHECK {
                     models_checked = std::time::Instant::now();
@@ -2075,9 +2130,11 @@ async fn prepare_on(
                     .filter(|(_, code)| code.starts_with("workload_"))
                     .map(|(at, code)| (*at + refused_task_retry(code)).max(work_due))
                     .min();
+                let rest_ends = plan.rest_ends();
                 let keep_claiming = || {
                     !progress.user_paused.load(Ordering::Acquire)
                         && std::time::Instant::now() < models_due
+                        && rest_ends.is_none_or(|due| std::time::Instant::now() < due)
                         && offer_due.is_none_or(|due| tokio::time::Instant::now() < due)
                         && worker.now().is_ok_and(|now| {
                             prepared.iter().all(|(proof, accepted)| {
@@ -2099,7 +2156,8 @@ async fn prepare_on(
                 let mut unclaimed: Option<Step> = None;
                 // The tasks in hand. One that ends the pool with its failure stays counted:
                 // after a crash this is how many the runtime was working on.
-                let in_hand = std::sync::atomic::AtomicU32::new(0);
+                let in_hand = InHand::default();
+                let mut clean_run = false;
                 let (limits_now, ready_now) = (&limits, &ready);
                 let mut on_task = |task: crate::native_predictor::TaskStep| match task.step {
                     Step::Completed => {
@@ -2110,7 +2168,9 @@ async fn prepare_on(
                         refused_in_a_row = 0;
                         // A long run without trouble: one more at once than it last ran
                         // short at, up to what the server allows and this computer can take.
-                        if trouble.completed() && progress.capacity_ceiling().is_some() {
+                        let clean = trouble.completed();
+                        clean_run |= clean;
+                        if clean && progress.capacity_ceiling().is_some() {
                             progress.raise_capacity();
                             let more = concurrent_tasks(
                                 limits_now,
@@ -2153,9 +2213,7 @@ async fn prepare_on(
                     }
                 };
                 let on_step = |task: crate::native_predictor::TaskStep| {
-                    if task.model.is_some() {
-                        in_hand.fetch_sub(1, Ordering::AcqRel);
-                    }
+                    in_hand.settled(&task);
                     on_task(task)
                 };
                 // A stop waits for every lease in hand to be handed back, one request each.
@@ -2167,7 +2225,7 @@ async fn prepare_on(
                         &mut cancel,
                         &pool,
                         |workload| {
-                            in_hand.fetch_add(1, Ordering::AcqRel);
+                            in_hand.claimed();
                             progress.active(Some(workload))
                         },
                         on_step,
@@ -2182,11 +2240,24 @@ async fn prepare_on(
                 at_once = running;
                 // A runtime that ended or stopped answering: what it means depends on how
                 // many tasks it was working on, not on how many it was allowed.
+                if clean_run {
+                    plan.recovered();
+                }
+                // The graphics card's or neural engine's own runtime is the one that ended.
+                let accelerated = predictor
+                    .failed_lane()
+                    .is_some_and(|lane| plan.accelerates(lane));
                 let crash = match &completed {
-                    Err(reason) if runtime_crash(reason) => Some(trouble.crashed(
-                        in_hand.load(Ordering::Acquire),
-                        progress.capacity_ceiling().is_some(),
+                    Err(reason) if runtime_crash(reason) => Some(after_crash(
+                        &mut trouble,
+                        &progress,
+                        in_hand.count(),
+                        accelerated,
                     )),
+                    // Its process died under a task that was dropped for a reason of its own.
+                    Ok(()) if dropped.is_some() && accelerated => {
+                        Some(after_crash(&mut trouble, &progress, 1, true))
+                    }
                     _ => None,
                 };
                 match completed {
@@ -2199,6 +2270,14 @@ async fn prepare_on(
                             // FD-52: the accelerated runtime's process died while inferring: its
                             // workloads move to the processor instead of crashing on every restart.
                             let lane = predictor.failed_lane().map(str::to_owned);
+                            if let Some(AfterCrash::Again(crashes)) = crash {
+                                // The graphics card keeps the work: its runtime is started
+                                // again after a wait.
+                                progress.crashed(predictor.exit_report());
+                                predictor.stop()?;
+                                restart_wait(crashes, &progress.cancelled).await?;
+                                break;
+                            }
                             if lane.is_some_and(|lane| plan.demote_runtime(&lane, &code)) {
                                 progress.crashed(predictor.exit_report());
                                 predictor.stop()?;
@@ -2239,16 +2318,19 @@ async fn prepare_on(
                     }
                     // With several tasks in hand the likeliest cause is memory, not the
                     // device: half as many on the same runtime, halved again each time down
-                    // to one. At one, after such a step down, the same runtime is given one
-                    // more go. Otherwise the runtime is failing (FD-52 below, then the crash
-                    // count): one that did not start, or one that ends again at one task.
-                    Err(_) if matches!(crash, Some(AfterCrash::Fewer(_) | AfterCrash::Again)) => {
+                    // to one. With one task in hand a graphics card or neural engine keeps
+                    // the work: its runtime is started again after a wait, and only the third
+                    // crash in a row with no task finished in between is a failing runtime
+                    // (FD-52 below). So is one that did not start.
+                    Err(_)
+                        if matches!(crash, Some(AfterCrash::Fewer(_) | AfterCrash::Again(_))) =>
+                    {
                         check_cancel(&progress.cancelled)?;
                         progress.crashed(predictor.exit_report());
-                        if let Some(AfterCrash::Fewer(fewer)) = crash {
-                            progress.lower_capacity(fewer);
-                        }
                         predictor.stop()?;
+                        if let Some(AfterCrash::Again(crashes)) = crash {
+                            restart_wait(crashes, &progress.cancelled).await?;
+                        }
                         break;
                     }
                     Err(reason) if reason.starts_with("resource_") => {
@@ -4272,15 +4354,20 @@ mod tests {
         assert_eq!(trouble.crashed(4, true), AfterCrash::Fewer(2));
         assert_eq!(trouble.crashed(3, true), AfterCrash::Fewer(1));
         assert_eq!(trouble.crashed(2, true), AfterCrash::Fewer(1));
-        // At one after stepping down: the same runtime once more, then it is failing.
-        assert_eq!(trouble.crashed(1, true), AfterCrash::Again);
+        // One task in hand on a graphics card: it keeps the work. The same runtime again,
+        // twice, and only the third crash in a row is a failing runtime.
+        assert_eq!(trouble.crashed(1, true), AfterCrash::Again(1));
+        assert_eq!(trouble.crashed(1, true), AfterCrash::Again(2));
         assert_eq!(trouble.crashed(1, true), AfterCrash::Failing);
-        // A task finished in between starts that count again.
+        // After that the count starts again (the card is tried again later).
+        assert_eq!(trouble.crashed(1, true), AfterCrash::Again(1));
+        // A task finished in between starts that count again too.
         let mut trouble = RuntimeTrouble::default();
-        assert_eq!(trouble.crashed(1, true), AfterCrash::Again);
+        assert_eq!(trouble.crashed(1, true), AfterCrash::Again(1));
+        assert_eq!(trouble.crashed(1, true), AfterCrash::Again(2));
         assert!(!trouble.completed());
-        assert_eq!(trouble.crashed(1, true), AfterCrash::Again);
-        // One task at a time from the start: failing at the first crash, as it always was.
+        assert_eq!(trouble.crashed(1, true), AfterCrash::Again(1));
+        // The processor's own runtime has nowhere to fall back to: counted by the restarts.
         assert_eq!(
             RuntimeTrouble::default().crashed(1, false),
             AfterCrash::Failing
@@ -4303,6 +4390,103 @@ mod tests {
         progress.lower_capacity(2);
         progress.raise_capacity();
         assert_eq!(progress.capacity_ceiling(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn a_crash_under_the_pool_lowers_what_runs_at_once_by_the_tasks_in_hand() {
+        use crate::native_predictor::{run_pool, Pool, TaskStep};
+        // Wired as the work loop wires it: the pool's claims and settled tasks are counted,
+        // and when the pool ends with the runtime's failure the count decides what follows.
+        let crash = |slots: u32, tasks: u32, accelerated: bool| async move {
+            let server = FakeServer::start();
+            server.offer_concurrent_leases(slots.max(2));
+            let device = server.enrol();
+            let worker = server.session(&device).await.unwrap();
+            let qualification = server.qualification(&worker).await;
+            server.queue(&device, tasks);
+            let (_keep, mut cancel) = tokio::sync::watch::channel(false);
+            let (in_hand, started) = (InHand::default(), AtomicUsize::new(0));
+            let all_in_hand = tokio::sync::Notify::new();
+            let room = || Some(slots);
+            let pool = Pool {
+                slots: &room,
+                keep_claiming: &|| true,
+                abandon: &|| {},
+            };
+            // The process ends once every task is in hand: each prediction fails the same way.
+            let predict = |_, _, _| async {
+                if started.fetch_add(1, Ordering::AcqRel) as u32 + 1 == tasks {
+                    all_in_hand.notify_waiters();
+                } else {
+                    all_in_hand.notified().await;
+                }
+                Err("runtime_process_stopped".to_string())
+            };
+            let on_step = |task: TaskStep| {
+                in_hand.settled(&task);
+                Some(Duration::ZERO)
+            };
+            let quals = [&qualification];
+            let ended = run_pool(
+                &worker,
+                &quals,
+                &mut cancel,
+                &pool,
+                |_| in_hand.claimed(),
+                on_step,
+                predict,
+            )
+            .await;
+            assert_eq!(ended, Err("runtime_process_stopped".into()));
+            assert!(runtime_crash("runtime_process_stopped"));
+            let progress = quiet();
+            progress.running_at_once(slots);
+            let mut trouble = RuntimeTrouble::default();
+            let after = after_crash(&mut trouble, &progress, in_hand.count(), accelerated);
+            (in_hand.count(), after, progress.capacity_ceiling())
+        };
+        // Four allowed, three in hand when it ended: one at once from here on, same runtime.
+        assert_eq!(crash(4, 3, true).await, (3, AfterCrash::Fewer(1), Some(1)));
+        // One in hand on a graphics card: nothing lowered, the same runtime again.
+        assert_eq!(crash(4, 1, true).await, (1, AfterCrash::Again(1), None));
+        // One in hand on the processor: a failing runtime, nothing lowered.
+        assert_eq!(crash(1, 1, false).await, (1, AfterCrash::Failing, None));
+    }
+
+    #[tokio::test]
+    async fn claims_for_more_room_back_off_and_a_finished_task_asks_at_once() {
+        use crate::native_predictor::pool_with;
+        let server = FakeServer::start();
+        server.offer_concurrent_leases(2);
+        let device = server.enrol();
+        let worker = server.session(&device).await.unwrap();
+        let qualification = server.qualification(&worker).await;
+        server.queue(&device, 1);
+        let (_keep, mut cancel) = tokio::sync::watch::channel(false);
+        let finished = std::sync::Mutex::new(None);
+        let quals = [&qualification];
+        // One task in hand for a little over three seconds, with room for a second and
+        // nothing more to give: claims at once, then after 1 and 2 seconds (the next would
+        // be 4 seconds on), and one more as soon as the task is done.
+        let steps = pool_with(&worker, &quals, &mut cancel, Some(2), |_| async {
+            tokio::time::sleep(Duration::from_millis(3600)).await;
+            *finished.lock().unwrap() = Some(std::time::Instant::now());
+            Ok(serde_json::json!({}))
+        })
+        .await
+        .unwrap();
+        assert_eq!(steps, [Step::Completed]);
+        let finished = finished.lock().unwrap().unwrap();
+        let times = server.claim_times();
+        // The claim that waited for work, three for more room, the one after the task.
+        assert!(times.len() >= 5, "{times:?}");
+        let gap = |a: usize, b: usize| times[b].duration_since(times[a]).as_millis();
+        assert!((900..1900).contains(&gap(1, 2)), "{}", gap(1, 2));
+        assert!((1900..3400).contains(&gap(2, 3)), "{}", gap(2, 3));
+        // Not four seconds after the last, as the back-off alone would have it.
+        let after = times[4].saturating_duration_since(finished).as_millis();
+        assert!(after < 900, "{after}");
+        assert!(gap(3, 4) < 3900, "{}", gap(3, 4));
     }
 
     #[tokio::test]
