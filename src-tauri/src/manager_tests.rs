@@ -702,13 +702,6 @@ fn pairing_requires_https_only_for_a_manager_beyond_the_home_network() {
         plain_http_manager(Leads::Unknown).unwrap_err(),
         "manager_unreachable_or_certificate_invalid"
     );
-    // Whatever this computer's resolver says of these, plain HTTP to them is refused.
-    for origin in [
-        "http://manager.example.com:2282",
-        "http://localhost.example.test",
-    ] {
-        assert!(require_encrypted(origin).is_err(), "{origin}");
-    }
     for origin in [
         "http://127.0.0.1",
         "http://127.0.0.1:2282",

@@ -44,9 +44,11 @@ pub(crate) fn server_proxy() -> reqwest::Proxy {
         }
         let via = system.intercept(&url.as_str().parse::<http::Uri>().ok()?)?;
         let mut proxy = reqwest::Url::parse(&via.uri().to_string()).ok()?;
-        if let Some((user, password)) = via.raw_auth() {
-            let _ = proxy.set_username(user);
-            let _ = proxy.set_password(Some(password));
+        // The matcher takes the proxy's own user and password out of its address: put them
+        // back, so a proxy that asks for them still gets them.
+        if let Some((user, password)) = via.raw_auth().map(owned).or_else(|| basic(&via)) {
+            let _ = proxy.set_username(&user);
+            let _ = proxy.set_password(Some(&password));
         }
         Some(proxy)
     })
@@ -64,6 +66,17 @@ pub(crate) fn public_client_builder() -> ClientBuilder {
         // Retry only through our durable coordinators, so payload attempts cannot evade admission.
         .retry(reqwest::retry::never())
         .user_agent(concat!("FrameleafDesktop/", env!("CARGO_PKG_VERSION")))
+}
+fn owned((user, password): (&str, &str)) -> (String, String) {
+    (user.to_owned(), password.to_owned())
+}
+/// The user and password of an HTTP proxy, which the matcher keeps as a ready
+/// `Proxy-Authorization: Basic …` value.
+fn basic(via: &hyper_util::client::proxy::matcher::Intercept) -> Option<(String, String)> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let encoded = via.basic_auth()?.to_str().ok()?.strip_prefix("Basic ")?;
+    let pair = String::from_utf8(STANDARD.decode(encoded).ok()?).ok()?;
+    pair.split_once(':').map(owned)
 }
 /// Clocks closer than this are treated as equal: the server accepts requests timed within two
 /// minutes of its own clock, and `Date` only counts whole seconds.
@@ -362,10 +375,10 @@ mod tests {
     }
     #[test]
     fn a_plain_http_home_name_is_never_sent_through_a_configured_proxy() {
-        let child = |case: &str| {
-            // The "proxy": anything that connects to it was sent through the proxy.
+        // What the "proxy" was sent by a child process, if anything connected to it.
+        let child = |case: &str, credentials: &str| -> Option<String> {
             let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
-            let address = format!("http://{}", proxy.local_addr().unwrap());
+            let address = format!("http://{credentials}{}", proxy.local_addr().unwrap());
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "transport::tests::proxy_child", "--ignored"])
                 .env("FRAMELEAF_PROXY_CASE", case)
@@ -380,17 +393,29 @@ mod tests {
                 .unwrap();
             assert!(status.success(), "{case}");
             proxy.set_nonblocking(true).unwrap();
-            proxy.accept().is_ok()
+            let (mut stream, _) = proxy.accept().ok()?;
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let read = stream.read(&mut request).unwrap_or(0);
+            Some(String::from_utf8_lossy(&request[..read]).to_lowercase())
         };
         // The check can see a proxied request: the same client sends plain HTTP to an address
         // through the configured proxy.
+        let control = child("control", "").expect("the control request did not reach the proxy");
+        assert!(!control.contains("proxy-authorization"), "{control}");
+        // A proxy that asks for a user and password still gets them.
+        let signed = child("control", "alice:opensesame@").expect("not sent to the proxy");
         assert!(
-            child("control"),
-            "the control request did not reach the proxy"
+            // base64("alice:opensesame")
+            signed.contains("proxy-authorization: basic ywxpy2u6b3blbnnlc2ftzq=="),
+            "{signed}"
         );
         // A plain-HTTP home name, in a fresh process, with its credential: never the proxy.
         assert!(
-            !child("home"),
+            child("home", "").is_none(),
             "the home server's request went to the proxy"
         );
     }
