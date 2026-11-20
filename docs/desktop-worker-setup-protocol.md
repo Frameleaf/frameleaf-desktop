@@ -309,13 +309,15 @@ revision's key. `task.qualificationId` is the desktop's current qualification fo
     leased to the computer at the last counted failure. There is no time window: a task leased
     after a counted failure and then failed is a new failure, however soon it comes.
   - **Handing work back.** `cancelled` is not a failure, up to five hand-backs of one model in
-    ten minutes. Tasks that were in hand together are one hand-back, so a stop or pause with
-    any number of leases counts once. From the sixth hand-back in the window each one counts
+    ten minutes. Tasks that were in hand together are one hand-back, so a stop with any
+    number of leases counts once. From the sixth hand-back in the window each one counts
     as a failure, so a computer that only ever hands work back loses the model at the eighth.
     An accepted result, or ten minutes, starts that count again. The desktop hands work back
-    on a stop, a pause, a wait for power or network, a crash (all but one of the tasks in
-    hand) and a lease that arrives after it stopped claiming: each is one hand-back, and
-    none of them comes five times in ten minutes in normal use.
+    on Stop, sign-out, a library switch, quitting, a pause for power or network, waking from
+    sleep, a crash (all but one of the tasks in hand), and for a lease that arrives after it
+    stopped claiming. Each is one hand-back, and none of them comes five times in ten minutes
+    in normal use. The person's own Pause hands nothing back: the tasks in hand are finished
+    and reported, and only a lease that arrives after the pause goes back.
 
   When a model is withdrawn: its
   qualification is deleted, `claim` returns nothing for it and
