@@ -483,7 +483,7 @@ struct Ack {
     accepted: bool,
     expires_at: Option<String>,
 }
-#[derive(Serialize)]
+#[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkerFailure {
     InferenceFailed,

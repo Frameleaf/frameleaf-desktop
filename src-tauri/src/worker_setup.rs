@@ -134,6 +134,12 @@ impl Progress {
             status.concurrent_tasks = status.concurrent_tasks.min(ceiling);
         });
     }
+    /// One more at once than it last ran short at, after a long run of tasks without trouble.
+    fn raise_capacity(&self) {
+        self.update(|status| {
+            status.capacity_ceiling = status.capacity_ceiling.map(|ceiling| ceiling + 1);
+        });
+    }
     fn running_at_once(&self, tasks: u32) {
         self.update(|status| status.concurrent_tasks = tasks);
     }
@@ -456,6 +462,62 @@ fn concurrent_tasks(
         .sum();
     allowed.min(local).min(ceiling.unwrap_or(u32::MAX)).max(1)
 }
+/// What a runtime that ended or stopped answering means for how the work goes on.
+#[derive(Debug, PartialEq)]
+enum AfterCrash {
+    /// Several tasks were in hand: most likely memory. This many at once, on the same runtime.
+    Fewer(u32),
+    /// One task in hand, after running fewer for memory: the same runtime once more.
+    Again,
+    /// The runtime itself is failing: the processor takes its work, or the crash is counted.
+    Failing,
+}
+/// At one task at a time after stepping down, the runtime must end this many times in a row,
+/// with no task finished in between, before it is treated as failing.
+const CRASHES_AT_ONE: u32 = 2;
+/// This many tasks finished in a row, with none refused and no crash, lets one more run at
+/// once again after a step down.
+const CLEAN_RUN: u32 = 50;
+/// How the runtime has fared since AI processing started, for how many tasks to run at once
+/// and whether a graphics card keeps the work.
+#[derive(Default)]
+struct RuntimeTrouble {
+    at_one: u32,
+    clean: u32,
+}
+impl RuntimeTrouble {
+    /// `in_hand`: the tasks the runtime was working on when it ended. None is a runtime that
+    /// did not start, which says nothing about memory. `stepped_down`: fewer tasks are
+    /// already being run at once than this computer was first taken to manage.
+    fn crashed(&mut self, in_hand: u32, stepped_down: bool) -> AfterCrash {
+        self.clean = 0;
+        match in_hand {
+            0 => AfterCrash::Failing,
+            1 if stepped_down => {
+                self.at_one += 1;
+                match self.at_one < CRASHES_AT_ONE {
+                    true => AfterCrash::Again,
+                    false => AfterCrash::Failing,
+                }
+            }
+            1 => AfterCrash::Failing,
+            several => AfterCrash::Fewer(several / 2),
+        }
+    }
+    fn refused(&mut self) {
+        self.clean = 0;
+    }
+    /// A task finished. `true` when one more may run at once.
+    fn completed(&mut self) -> bool {
+        self.at_one = 0;
+        self.clean += 1;
+        let raise = self.clean >= CLEAN_RUN;
+        if raise {
+            self.clean = 0;
+        }
+        raise
+    }
+}
 /// The server withdraws a model from this computer after this many failed tasks in a row
 /// (`native_predictor::counts_against_grant`) and then leases it nothing for that model.
 const GRANT_STRIKES: u32 = 3;
@@ -636,6 +698,18 @@ async fn cancellable<T>(
         result = future => result,
         _ = async { loop { if cancel.load(Ordering::Acquire) { break; } tokio::time::sleep(Duration::from_millis(50)).await; } } => Err("worker_setup_cancelled".into())
     }
+}
+/// Wait out what is left of a pause before the next claim; a stop ends the wait.
+async fn hold_off(until: Option<tokio::time::Instant>, cancel: &AtomicBool) -> Result<(), String> {
+    let Some(until) = until else { return Ok(()) };
+    cancellable(
+        async {
+            tokio::time::sleep_until(until).await;
+            Ok(())
+        },
+        cancel,
+    )
+    .await
 }
 async fn wait_for_user<F: Future<Output = Result<(), String>>>(
     progress: &Progress,
@@ -1513,6 +1587,7 @@ async fn prepare_on(
     let mut failures = TaskFailures::default();
     let mut refusals = 0u32;
     let mut strikes = GrantStrikes::default();
+    let mut trouble = RuntimeTrouble::default();
     // When the server refused each task, for offering it again that long after the refusal
     // (not that long after this setup began, which the downloads and checks may outlast).
     let mut refused_at = std::collections::BTreeMap::<String, tokio::time::Instant>::new();
@@ -2018,16 +2093,38 @@ async fn prepare_on(
                 let mut requalify = false;
                 let mut refused_in_a_row = 0u32;
                 let mut dropped: Option<String> = None;
+                // Until when the next claim is held off after a dropped task. The pool waits
+                // it out itself, except where it ends first because the runtime was stopped.
+                let mut held_off: Option<tokio::time::Instant> = None;
                 let mut unclaimed: Option<Step> = None;
-                let on_step = |task: crate::native_predictor::TaskStep| match task.step {
+                // The tasks in hand. One that ends the pool with its failure stays counted:
+                // after a crash this is how many the runtime was working on.
+                let in_hand = std::sync::atomic::AtomicU32::new(0);
+                let (limits_now, ready_now) = (&limits, &ready);
+                let mut on_task = |task: crate::native_predictor::TaskStep| match task.step {
                     Step::Completed => {
                         failures.completed();
+                        held_off = None;
                         strikes.completed(task.model.as_deref());
                         progress.completed();
                         refused_in_a_row = 0;
+                        // A long run without trouble: one more at once than it last ran
+                        // short at, up to what the server allows and this computer can take.
+                        if trouble.completed() && progress.capacity_ceiling().is_some() {
+                            progress.raise_capacity();
+                            let more = concurrent_tasks(
+                                limits_now,
+                                ready_now,
+                                local,
+                                progress.capacity_ceiling(),
+                            );
+                            at_once_now.store(more, Ordering::Release);
+                            progress.running_at_once(more);
+                        }
                         Some(Duration::ZERO)
                     }
                     Step::Dropped(code) => {
+                        trouble.refused();
                         // The model refused two tasks running with others: most likely too
                         // many for this computer's memory. Half as many from here on.
                         let running = at_once_now.load(Ordering::Acquire);
@@ -2046,12 +2143,20 @@ async fn prepare_on(
                         // Only a failure the server acknowledged was counted there.
                         requalify |= task.reported && strikes.failed(task.model.as_deref(), &code);
                         dropped = Some(code);
-                        (!requalify).then(|| failures.dropped().0)
+                        let pause = failures.dropped().0;
+                        held_off = Some(tokio::time::Instant::now() + pause);
+                        (!requalify).then_some(pause)
                     }
                     step @ (Step::Idle | Step::Busy(_)) => {
                         unclaimed = Some(step);
                         None
                     }
+                };
+                let on_step = |task: crate::native_predictor::TaskStep| {
+                    if task.model.is_some() {
+                        in_hand.fetch_sub(1, Ordering::AcqRel);
+                    }
+                    on_task(task)
                 };
                 // A stop waits for every lease in hand to be handed back, one request each.
                 let grace = LEASE_RETURN + Duration::from_secs(u64::from(at_once.min(8)) - 1);
@@ -2061,7 +2166,10 @@ async fn prepare_on(
                         &accepted,
                         &mut cancel,
                         &pool,
-                        |workload| progress.active(Some(workload)),
+                        |workload| {
+                            in_hand.fetch_add(1, Ordering::AcqRel);
+                            progress.active(Some(workload))
+                        },
                         on_step,
                     ),
                     lease_interruption(&progress, &clock),
@@ -2072,6 +2180,15 @@ async fn prepare_on(
                 progress.active(None);
                 let running = at_once_now.load(Ordering::Acquire);
                 at_once = running;
+                // A runtime that ended or stopped answering: what it means depends on how
+                // many tasks it was working on, not on how many it was allowed.
+                let crash = match &completed {
+                    Err(reason) if runtime_crash(reason) => Some(trouble.crashed(
+                        in_hand.load(Ordering::Acquire),
+                        progress.capacity_ceiling().is_some(),
+                    )),
+                    _ => None,
+                };
                 match completed {
                     Ok(()) => {
                         if requalify {
@@ -2088,7 +2205,9 @@ async fn prepare_on(
                                 continue 'qualification;
                             }
                             if !predictor.is_running()? {
-                                // Inference was cut short: load the models again before the next claim.
+                                // Inference was cut short: load the models again before the
+                                // next claim, which is still held off as after any dropped task.
+                                hold_off(held_off, &progress.cancelled).await?;
                                 break;
                             }
                         }
@@ -2118,14 +2237,17 @@ async fn prepare_on(
                             .await?;
                         }
                     }
-                    // The runtime ended or stopped answering while working on several tasks
-                    // at once: the likeliest cause is memory, not the device. Half as many on
-                    // the same runtime, then one; only a runtime that fails with one task in
-                    // hand is treated as failing (FD-52 below, then the crash count).
-                    Err(reason) if running > 1 && runtime_crash(&reason) => {
+                    // With several tasks in hand the likeliest cause is memory, not the
+                    // device: half as many on the same runtime, halved again each time down
+                    // to one. At one, after such a step down, the same runtime is given one
+                    // more go. Otherwise the runtime is failing (FD-52 below, then the crash
+                    // count): one that did not start, or one that ends again at one task.
+                    Err(_) if matches!(crash, Some(AfterCrash::Fewer(_) | AfterCrash::Again)) => {
                         check_cancel(&progress.cancelled)?;
                         progress.crashed(predictor.exit_report());
-                        progress.lower_capacity((running / 2).max(1));
+                        if let Some(AfterCrash::Fewer(fewer)) = crash {
+                            progress.lower_capacity(fewer);
+                        }
                         predictor.stop()?;
                         break;
                     }
@@ -3896,6 +4018,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_claim_held_off_stays_held_off_when_the_runtime_must_be_loaded_again() {
+        // The pool ended early (the runtime was stopped under the dropped task): what is left
+        // of the pause is waited before the models are loaded and the next claim is made.
+        let cancel = AtomicBool::new(false);
+        let (start, pause) = (tokio::time::Instant::now(), Duration::from_millis(200));
+        hold_off(Some(start + pause), &cancel).await.unwrap();
+        assert!(start.elapsed() >= pause);
+        // Nothing held off, or the pause already over: no wait.
+        let again = tokio::time::Instant::now();
+        hold_off(None, &cancel).await.unwrap();
+        hold_off(Some(start), &cancel).await.unwrap();
+        assert!(again.elapsed() < pause);
+        // A stop ends the wait.
+        cancel.store(true, Ordering::Release);
+        let far = tokio::time::Instant::now() + Duration::from_secs(60);
+        assert_eq!(
+            hold_off(Some(far), &cancel).await,
+            Err("worker_setup_cancelled".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lease_that_arrives_after_claiming_stopped_is_handed_straight_back() {
+        use crate::native_predictor::{run_pool, Pool, TaskStep};
+        let server = FakeServer::start();
+        server.offer_concurrent_leases(2);
+        // A slow link: a claim for more room is still on its way when the first task ends.
+        server.slow_claims(Duration::from_millis(400));
+        let device = server.enrol();
+        let worker = server.session(&device).await.unwrap();
+        let qualification = server.qualification(&worker).await;
+        server.queue(&device, 1);
+        let (_keep, mut cancel) = tokio::sync::watch::channel(false);
+        let pool = Pool {
+            slots: &|| Some(2),
+            keep_claiming: &|| true,
+            abandon: &|| {},
+        };
+        let predictions = AtomicUsize::new(0);
+        let predict = |_, _, _| async {
+            predictions.fetch_add(1, Ordering::AcqRel);
+            // The claim that waited for work, a claim for more room (nothing there), and now
+            // a second one: it has reached the server, which is about to lease it a new task.
+            while server.claims_received() < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            server.queue(&device, 1);
+            // Ends without a word to the server, as a lease the server took back does.
+            Err("worker_lease_lost".to_string())
+        };
+        // As the owner that must qualify again: no more claims.
+        let on_step = |task: TaskStep| match task.step {
+            Step::Dropped(_) => None,
+            _ => Some(Duration::ZERO),
+        };
+        let quals = [&qualification];
+        let work = run_pool(
+            &worker,
+            &quals,
+            &mut cancel,
+            &pool,
+            |_| {},
+            on_step,
+            predict,
+        );
+        tokio::time::timeout(Duration::from_secs(20), work)
+            .await
+            .expect("the pool did not end")
+            .unwrap();
+        // The second task was leased by the claim already sent, and went straight back.
+        assert_eq!(predictions.load(Ordering::Acquire), 1);
+        assert_eq!(server.failures(), ["cancelled"]);
+    }
+
+    #[tokio::test]
     async fn a_lease_that_arrives_after_a_pause_is_handed_straight_back() {
         use crate::native_predictor::{run_pool, Pool};
         let server = FakeServer::start();
@@ -4053,7 +4250,7 @@ mod tests {
             1
         );
 
-        // Running short lowers the number for as long as AI processing runs, never raises it.
+        // Running short lowers the number; it is not raised by being told a higher one.
         let progress = quiet();
         progress.running_at_once(6);
         progress.lower_capacity(3);
@@ -4062,6 +4259,69 @@ mod tests {
         progress.set("working", None);
         assert_eq!(progress.capacity_ceiling(), Some(3));
         assert_eq!(progress.status.lock().unwrap().concurrent_tasks, 3);
+    }
+
+    #[test]
+    fn a_runtime_that_ends_is_judged_by_the_tasks_it_had_in_hand() {
+        // It did not start (nothing in hand): never a matter of memory, whatever the allowance.
+        let mut trouble = RuntimeTrouble::default();
+        assert_eq!(trouble.crashed(0, false), AfterCrash::Failing);
+        assert_eq!(trouble.crashed(0, true), AfterCrash::Failing);
+        // Several in hand: half as many each time, on the same runtime, down to one.
+        assert_eq!(trouble.crashed(8, false), AfterCrash::Fewer(4));
+        assert_eq!(trouble.crashed(4, true), AfterCrash::Fewer(2));
+        assert_eq!(trouble.crashed(3, true), AfterCrash::Fewer(1));
+        assert_eq!(trouble.crashed(2, true), AfterCrash::Fewer(1));
+        // At one after stepping down: the same runtime once more, then it is failing.
+        assert_eq!(trouble.crashed(1, true), AfterCrash::Again);
+        assert_eq!(trouble.crashed(1, true), AfterCrash::Failing);
+        // A task finished in between starts that count again.
+        let mut trouble = RuntimeTrouble::default();
+        assert_eq!(trouble.crashed(1, true), AfterCrash::Again);
+        assert!(!trouble.completed());
+        assert_eq!(trouble.crashed(1, true), AfterCrash::Again);
+        // One task at a time from the start: failing at the first crash, as it always was.
+        assert_eq!(
+            RuntimeTrouble::default().crashed(1, false),
+            AfterCrash::Failing
+        );
+
+        // A long run of finished tasks lets one more run at once; trouble starts the run again.
+        let mut trouble = RuntimeTrouble::default();
+        for _ in 1..CLEAN_RUN {
+            assert!(!trouble.completed());
+        }
+        trouble.refused();
+        for _ in 1..CLEAN_RUN {
+            assert!(!trouble.completed());
+        }
+        assert!(trouble.completed());
+        assert!(!trouble.completed());
+        let progress = quiet();
+        progress.raise_capacity();
+        assert_eq!(progress.capacity_ceiling(), None);
+        progress.lower_capacity(2);
+        progress.raise_capacity();
+        assert_eq!(progress.capacity_ceiling(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn the_one_report_of_a_crash_is_sent_again_when_it_does_not_arrive() {
+        use crate::native_predictor::pool_with;
+        let server = FakeServer::start();
+        let device = server.enrol();
+        let worker = server.session(&device).await.unwrap();
+        let qualification = server.qualification(&worker).await;
+        server.queue(&device, 1);
+        server.respond_next(&device, "/fail", 503, serde_json::json!({}));
+        let (_keep, mut cancel) = tokio::sync::watch::channel(false);
+        let quals = [&qualification];
+        let result = pool_with(&worker, &quals, &mut cancel, None, |_| async {
+            Err("runtime_process_stopped".into())
+        })
+        .await;
+        assert_eq!(result, Err("runtime_process_stopped".into()));
+        assert_eq!(server.failures(), ["model-unavailable"]);
     }
 
     #[test]

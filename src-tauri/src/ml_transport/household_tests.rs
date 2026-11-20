@@ -68,6 +68,10 @@ struct State {
     slots: Vec<u64>,
     /// The `waitMs` of every claim, in order.
     waits: Vec<u64>,
+    /// Claims that have arrived, counted before they are answered, and how long each is
+    /// kept waiting for its answer (a slow link).
+    claims_received: u32,
+    claim_delay: std::time::Duration,
     /// Every authenticated request's path, in the order the server handled it.
     handled: Vec<String>,
 }
@@ -314,6 +318,14 @@ fn serve(mut stream: TcpStream, state: &StdMutex<State>) -> Option<()> {
                 .then(|| value.trim().to_owned())
         })
     };
+    if path.ends_with("/worker/claim") {
+        let delay = {
+            let mut state = state.lock().unwrap();
+            state.claims_received += 1;
+            state.claim_delay
+        };
+        std::thread::sleep(delay);
+    }
     let (status, body, date) = {
         let mut state = state.lock().unwrap();
         let (status, body) = state.respond(
@@ -482,6 +494,14 @@ impl FakeServer {
     /// Let a desktop hold up to this many leases at once, and advertise it, from now on.
     pub(crate) fn offer_concurrent_leases(&self, concurrency: u32) {
         self.state.lock().unwrap().concurrency = Some(concurrency);
+    }
+    /// Keep every claim waiting this long for its answer.
+    pub(crate) fn slow_claims(&self, delay: std::time::Duration) {
+        self.state.lock().unwrap().claim_delay = delay;
+    }
+    /// How many claims have arrived, answered or not.
+    pub(crate) fn claims_received(&self) -> u32 {
+        self.state.lock().unwrap().claims_received
     }
     /// The `slots` and the `waitMs` of the claims so far.
     pub(crate) fn claims(&self) -> (Vec<u64>, Vec<u64>) {

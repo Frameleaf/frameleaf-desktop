@@ -202,23 +202,33 @@ lease".
     when memory runs short while working, on the same device:
     - the model refuses two tasks in a row while several are in hand: half as many from then
       on;
-    - the runtime process ends or stops answering with several tasks in hand: half as many,
-      then one. The graphics card keeps the work. Only a runtime that fails with one task in
-      hand is treated as failing (the work then moves to the processor, as before).
-    It does not stop, and it does not go back up until AI processing is stopped and started
-    again. Pauses for memory, power and network are unchanged.
+    - the runtime process ends or stops answering with several tasks in hand: half as many
+      as it had in hand, and half again each time it happens, down to one. The graphics card
+      keeps the work. What counts is the tasks actually in hand, not the number allowed.
+    - at one task at a time after such a step down, the runtime is started once more on the
+      same device; only when it ends again, with no task finished in between, is it treated
+      as failing (the work then moves to the processor, as before).
+    - a runtime that does not start at all, or one that ends with its only task on a
+      computer that never stepped down, is treated as failing at once, as before.
+    It does not stop. After 50 tasks in a row with none refused and no crash, one more runs
+    at once again, up to what the server allows and this computer can take; until then, and
+    after stopping and starting AI processing, the number starts from the estimate again.
+    Pauses for memory, power and network are unchanged.
   - Nothing to set on the desktop.
 - **Claims.** `"slots": <1..64>` on every claim says how many more tasks the desktop can take
   right now. A claim still returns at most one task; with `slots` it is always a new lease,
   never one already held. With nothing in hand the desktop waits for work as before (`waitMs`
   20000). With tasks in hand it asks without waiting (`waitMs` 0), as soon as a task is done
-  and there is room, and again a second later when the server had nothing. A slow task does
-  not hold up the others' places.
+  and there is room. When the server had nothing, it asks again after 1, 2, 4 and then every
+  8 seconds, and at once when a task finishes. A slow task does not hold up the others'
+  places.
 - **Each task is reported as soon as it is done**, its result or its failure, without waiting
   for the others in hand.
 - **A runtime that ends under several tasks is one failure.** One of the tasks in hand is
   reported `model-unavailable` and the others are handed back `cancelled`, so the server's
-  count toward withdrawing the model goes up by one, not by the number of tasks. The server
+  count toward withdrawing the model goes up by one, not by the number of tasks. If that one
+  report does not arrive it is sent once more, and failing that the next task still in hand
+  carries it, so the crash is not counted as nothing. The server
   protects itself as well: failures of one model from one desktop within 10 seconds of the
   first count as one.
 - **The heartbeat starts at the claim**, and runs while the task's input is fetched as well as
@@ -246,8 +256,9 @@ lease".
 - A `slots` outside 1 to 64 is refused with `400 desktop_worker_payload_invalid`.
 - **Limits that add no message.** One desktop never holds more than 64 leases, whatever the
   Jobs setting says. The broker holds at most 256 open tasks and at most 512 MB of their
-  inputs together; one task always fits. Beyond a limit a claim simply returns
-  `{"task": null}`.
+  inputs together; one task always fits. At the 64-lease limit a claim simply returns
+  `{"task": null}`. The other two apply when the server makes a task, not when a desktop
+  claims one: beyond them the job waits in its queue.
 
 ### Several desktops at once
 
@@ -297,9 +308,12 @@ revision's key. `task.qualificationId` is the desktop's current qualification fo
   desktop takes as those tasks being gone and says nothing more about them. Leases of other
   models are untouched. The `fail` reply is
   still `{"accepted": true}`, and `/models` still lists the model, so a new challenge and report
-  grant it again. The desktop keeps the same count the same way (for each model, the failures it
-  reported as `inference-failed` or `model-unavailable` since that model's last result, counting
-  only reports the server acknowledged) and, at the third, qualifies again without being told. The server keeps its count per device and model
+  grant it again. The desktop keeps a count of its own to notice this without being told: for
+  each model, the failures it reported as `inference-failed` or `model-unavailable` since that
+  model's last result, counting only reports the server acknowledged. At the third it qualifies
+  again. The two counts can differ (the server counts failures within 10 seconds as one, the
+  desktop counts each); when the desktop is early, qualifying again is harmless, and when it is
+  late the withdrawal notice below tells it. The server keeps its count per device and model
   (a new session does not reset it) and answers that qualification with
   `409 desktop_qualification_hold` for 5 minutes, which the desktop waits out for that model.
 - **Withdrawal notice.** The server's count outlives a desktop's restart, so it can withdraw a

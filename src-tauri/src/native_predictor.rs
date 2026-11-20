@@ -421,6 +421,10 @@ where
     let mut more = None;
     let mut claiming = true;
     let mut next_claim = tokio::time::Instant::now();
+    // Claims for more room the server answered with nothing, in a row: each waits twice as
+    // long as the one before, up to `REFILL_WAIT_MOST` seconds. A task that finishes asks
+    // again at once, since that is when the server's answer is likeliest to change.
+    let mut empty = 0u32;
     let mut fatal: Option<String> = None;
     loop {
         let slots = (pool.slots)();
@@ -494,7 +498,8 @@ where
                     // No longer wanted (a stop, a pause, a failure, the runtime stopped):
                     // straight back to the server, its input never fetched.
                     Some((index, task))
-                        if fatal.is_some()
+                        if !claiming
+                            || fatal.is_some()
                             || *cancel.borrow()
                             || stopped.load(Ordering::Acquire)
                             || !(pool.keep_claiming)() =>
@@ -504,18 +509,32 @@ where
                             .await;
                     }
                     Some((index, task)) => {
+                        empty = 0;
                         on_claim(&task);
                         in_hand.fetch_add(1, Ordering::AcqRel);
                         running.push(work(index, task, cancel.clone()));
                     }
-                    None => next_claim = tokio::time::Instant::now() + Duration::from_secs(1),
+                    None => {
+                        let wait = (1u64 << empty.min(3)).min(REFILL_WAIT_MOST);
+                        empty += 1;
+                        next_claim = tokio::time::Instant::now() + Duration::from_secs(wait);
+                    }
                 }
             }
             Some((model, step)) = running.next(), if !running.is_empty() => match step {
-                Ok((step, reported)) => match on_step(TaskStep { model: Some(model), step, reported }) {
-                    Some(pause) => next_claim = next_claim.max(tokio::time::Instant::now() + pause),
-                    None => claiming = false,
-                },
+                Ok((step, reported)) => {
+                    let done = step == Step::Completed;
+                    let now = tokio::time::Instant::now();
+                    match on_step(TaskStep { model: Some(model), step, reported }) {
+                        // A place came free: ask for more now, whatever was being waited out.
+                        Some(pause) if done => {
+                            empty = 0;
+                            next_claim = now + pause;
+                        }
+                        Some(pause) => next_claim = next_claim.max(now + pause),
+                        None => claiming = false,
+                    }
+                }
                 Err(code) => {
                     fatal.get_or_insert(code);
                 }
@@ -594,6 +613,9 @@ where
     }
     Ok(())
 }
+const CRASH_REPORT_RETRY: Duration = Duration::from_secs(1);
+/// How long a claim for more room is held off, at most, while the server has nothing to give.
+const REFILL_WAIT_MOST: u64 = 8;
 /// `crash_reported`: shared by the tasks in hand together. When the runtime process ends
 /// under several of them, one is reported as `model-unavailable` and the rest are handed back
 /// as `cancelled`: it was one failure of the runtime, and the server, which withdraws a model
@@ -610,13 +632,24 @@ async fn settle(
     };
     let mut reported = false;
     if !lease_gone(&failure.code) {
+        use std::sync::atomic::Ordering;
         let mut report = failure_report(&failure.code);
-        if matches!(report, WorkerFailure::ModelUnavailable)
-            && crash_reported.swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
+        let crash = matches!(report, WorkerFailure::ModelUnavailable);
+        if crash && crash_reported.swap(true, Ordering::AcqRel) {
             report = WorkerFailure::Cancelled;
         }
-        reported = transport.fail(task, report, qualification).await == Ok(true);
+        let mut sent = transport.fail(task, report, qualification).await;
+        // The one report that stands for the whole crash must arrive, or the server counts
+        // the crash as nothing: it is sent once more, and if that fails too, the next task
+        // still in hand carries it instead.
+        if crash && matches!(report, WorkerFailure::ModelUnavailable) && sent.is_err() {
+            tokio::time::sleep(CRASH_REPORT_RETRY).await;
+            sent = transport.fail(task, report, qualification).await;
+            if sent.is_err() {
+                crash_reported.store(false, Ordering::Release);
+            }
+        }
+        reported = sent == Ok(true);
     }
     if task_scoped(&failure.code) {
         Ok((Step::Dropped(failure.code), reported))

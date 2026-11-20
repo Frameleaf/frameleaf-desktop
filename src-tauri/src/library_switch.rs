@@ -541,7 +541,7 @@ async fn activate(
             }
             crate::resume_approved_watch(app, old).await;
             if photos_open {
-                let _ = crate::open_photos_window(app, old);
+                let _ = crate::open_photos_checked(app, old).await;
             }
         }
         return Err(error);
