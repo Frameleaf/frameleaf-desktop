@@ -323,9 +323,9 @@ struct Rest {
 }
 /// Keyed by where the remembered results of that data folder are kept.
 static RESTS: std::sync::Mutex<BTreeMap<PathBuf, Rest>> = std::sync::Mutex::new(BTreeMap::new());
-/// The crashes in a row of an accelerated runtime (its manifest, its device, how many), kept
-/// while this app runs so that a setup starting again does not start the count again.
-type Streak = (String, String, u32);
+/// An accelerated runtime's crash record (its manifest, its device, `Plan::crash_record`),
+/// kept while this app runs so that a setup starting again does not start the counts again.
+type Streak = (String, String, (u32, u32));
 static STREAKS: std::sync::Mutex<BTreeMap<PathBuf, Streak>> =
     std::sync::Mutex::new(BTreeMap::new());
 
@@ -622,10 +622,13 @@ impl Plan {
             rests.remove(&self.remembered);
         }
     }
-    /// How many times in a row this accelerated runtime has crashed with no task of its own
-    /// finished in between, as last recorded while this app runs.
-    pub(crate) fn crash_streak(&self) -> u32 {
-        let Some(offer) = &self.offer else { return 0 };
+    /// This accelerated runtime's record while this app runs: its crashes in a row with no
+    /// task of its own finished in between, and its own tasks finished in a row since its
+    /// last crash or dropped task (`CLEAN_RUN` of them and it has recovered).
+    pub(crate) fn crash_record(&self) -> (u32, u32) {
+        let Some(offer) = &self.offer else {
+            return (0, 0);
+        };
         STREAKS
             .lock()
             .unwrap()
@@ -633,31 +636,26 @@ impl Plan {
             .filter(|(runtime, device, _)| {
                 *runtime == offer.manifest_sha256 && *device == offer.device
             })
-            .map_or(0, |streak| streak.2)
+            .map_or((0, 0), |streak| streak.2)
     }
-    pub(crate) fn set_crash_streak(&self, crashes: u32) {
+    pub(crate) fn set_crash_record(&self, record: (u32, u32)) {
         let Some(offer) = &self.offer else { return };
         let mut streaks = STREAKS.lock().unwrap();
-        match crashes {
-            0 => {
-                if self.crash_streak_is_ours(&streaks) {
-                    streaks.remove(&self.remembered);
-                }
+        let ours = streaks
+            .get(&self.remembered)
+            .is_some_and(|(runtime, device, _)| {
+                *runtime == offer.manifest_sha256 && *device == offer.device
+            });
+        match record {
+            (0, 0) if ours => {
+                streaks.remove(&self.remembered);
             }
+            (0, 0) => {}
             _ => {
-                let streak = (offer.manifest_sha256.clone(), offer.device.clone(), crashes);
+                let streak = (offer.manifest_sha256.clone(), offer.device.clone(), record);
                 streaks.insert(self.remembered.clone(), streak);
             }
         }
-    }
-    fn crash_streak_is_ours(&self, streaks: &BTreeMap<PathBuf, Streak>) -> bool {
-        self.offer.as_ref().is_some_and(|offer| {
-            streaks
-                .get(&self.remembered)
-                .is_some_and(|(runtime, device, _)| {
-                    *runtime == offer.manifest_sha256 && *device == offer.device
-                })
-        })
     }
     /// Whether work is running on this accelerated runtime right now.
     pub(crate) fn accelerates(&self, manifest_sha256: &str) -> bool {
@@ -1496,14 +1494,20 @@ pub(crate) mod tests {
         assert_eq!(rest(&root), Some(FIRST_REST));
         // Its crashes in a row are kept for it while the app runs, across plans, and are
         // not another device's; Retry Setup forgets them (below).
-        resting.set_crash_streak(2);
-        assert_eq!(plan_on(&root, &manifest, "driver-2").crash_streak(), 2);
-        assert_eq!(plan_on(&root, &manifest, "driver-3").crash_streak(), 0);
-        plan_on(&root, &manifest, "driver-3").set_crash_streak(0);
-        assert_eq!(resting.crash_streak(), 2);
-        resting.set_crash_streak(0);
-        assert_eq!(resting.crash_streak(), 0);
-        resting.set_crash_streak(1);
+        resting.set_crash_record((2, 0));
+        assert_eq!(plan_on(&root, &manifest, "driver-2").crash_record(), (2, 0));
+        assert_eq!(plan_on(&root, &manifest, "driver-3").crash_record(), (0, 0));
+        plan_on(&root, &manifest, "driver-3").set_crash_record((0, 0));
+        assert_eq!(resting.crash_record(), (2, 0));
+        // Its own tasks finished in a row are kept just the same.
+        resting.set_crash_record((0, 49));
+        assert_eq!(
+            plan_on(&root, &manifest, "driver-2").crash_record(),
+            (0, 49)
+        );
+        resting.set_crash_record((0, 0));
+        assert_eq!(resting.crash_record(), (0, 0));
+        resting.set_crash_record((1, 0));
         // The rest is over: the provider is chosen again, by itself.
         end_rest(&root);
         let mut again = plan_on(&root, &manifest, "driver-2");
@@ -1530,7 +1534,7 @@ pub(crate) mod tests {
         forget(&root);
         assert!(!record.exists());
         let retried = plan_on(&root, &manifest, "driver-2");
-        assert_eq!(retried.crash_streak(), 0);
+        assert_eq!(retried.crash_record(), (0, 0));
         assert_eq!(fallen(&retried), row("face", COREML, None));
         assert!(retried.unmeasured("face") && retried.unmeasured("clip"));
         // Nothing to forget is not an error.

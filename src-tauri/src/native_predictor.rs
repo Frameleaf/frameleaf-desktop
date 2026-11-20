@@ -129,11 +129,17 @@ impl BoundClient {
             .client
             .post(format!("{}/predict", self.base))
             .bearer_auth(self.token.as_str())
-            .timeout(duration)
+            // A backstop only: the task's own deadline (`race_prediction`) ends a slow
+            // prediction first, so a healthy runtime that runs late is never taken for one
+            // whose answer broke off.
+            .timeout(duration + PREDICTION_TIMEOUT_SLACK)
             .multipart(form)
             .send()
             .await
-            .map_err(|_| "runtime_prediction_interrupted")?;
+            .map_err(|error| match error.is_timeout() {
+                true => "worker_execution_deadline",
+                false => "runtime_prediction_interrupted",
+            })?;
         let value: Value = transport::json_limit(response, 4 * 1024 * 1024).await?;
         if !value.is_object() {
             return Err("runtime_prediction_invalid".into());
@@ -725,6 +731,9 @@ where
     run_pool(transport, qualifications, cancel, &pool, |_| {}, heard, run).await?;
     Ok(steps)
 }
+
+/// How much longer than the task's deadline a prediction request itself may run.
+const PREDICTION_TIMEOUT_SLACK: Duration = Duration::from_secs(5);
 
 /// How long every runtime process may take to answer its first health check.
 const READY_DEADLINE: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 15 });

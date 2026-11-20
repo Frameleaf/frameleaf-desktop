@@ -687,7 +687,10 @@ fn judge(
             ))
         }
         // Its process died under a task that was dropped for a reason of its own.
-        Ok(()) if dropped.is_some() && accelerated => Some(after_crash(trouble, progress, 1, true)),
+        // Judged by the tasks it was working on, as any crash.
+        Ok(()) if dropped.is_some() && accelerated => {
+            Some(after_crash(trouble, progress, in_hand.max(1), true))
+        }
         _ => None,
     }
 }
@@ -877,6 +880,13 @@ async fn cancellable<T>(
 async fn restart_wait(crashes: u32, cancel: &AtomicBool) -> Result<(), String> {
     let wait = reconnect_delay(crashes, rand::random());
     hold_off(Some(tokio::time::Instant::now() + wait), cancel).await
+}
+/// With nothing qualified while the accelerated runtime rests: how long to wait before setting
+/// up again. The rest's end, or sooner when the server offers the refused work again before
+/// it (a hold of five minutes, say). `None`: not resting, which is handled as it always was.
+fn empty_wait(rest: Option<Duration>, failure: &str) -> Option<Duration> {
+    let refused = server_task_refusal(failure).then(|| refused_task_retry(failure));
+    rest.map(|rest| refused.map_or(rest, |refused| refused.min(rest)))
 }
 /// How long the accelerated runtime's rest still has to run, if it is resting.
 fn rest_left(ends: Option<std::time::Instant>) -> Option<Duration> {
@@ -1770,10 +1780,13 @@ async fn prepare_on(
     let mut failures = TaskFailures::default();
     let mut refusals = 0u32;
     let mut strikes = GrantStrikes::default();
-    // The graphics card's crashes in a row are kept with the plan's records, so a setup that
-    // starts again in between (a lost session, say) does not start the count again.
+    // The graphics card's crashes in a row, and its own tasks finished in a row, are kept
+    // with the plan's records, so a setup that starts again in between (a lost session, say)
+    // does not start those counts again.
+    let (at_one, clean_accelerated) = plan.crash_record();
     let mut trouble = RuntimeTrouble {
-        at_one: plan.crash_streak(),
+        at_one,
+        clean_accelerated,
         ..Default::default()
     };
     // When the server refused each task, for offering it again that long after the refusal
@@ -2059,7 +2072,7 @@ async fn prepare_on(
             let failure = first_failure(&progress.status.lock().unwrap().workloads);
             // A graphics card resting after crashes is still owed its next try: wait for
             // it with the reason shown, then set up again, instead of stopping for good.
-            if let Some(wait) = rest_left(plan.rest_ends()) {
+            if let Some(wait) = empty_wait(rest_left(plan.rest_ends()), &failure) {
                 progress.set("reconnecting", Some(failure));
                 hold_off(
                     Some(tokio::time::Instant::now() + wait),
@@ -2416,7 +2429,7 @@ async fn prepare_on(
                     in_hand.count(),
                     predictor.failed_lane(),
                 );
-                plan.set_crash_streak(trouble.at_one);
+                plan.set_crash_record((trouble.at_one, trouble.clean_accelerated));
                 match completed {
                     Ok(()) => {
                         // The accelerated runtime crashed out. Decided before qualifying
@@ -4638,6 +4651,18 @@ mod tests {
             rest_left(Some(std::time::Instant::now())),
             Some(Duration::ZERO)
         );
+        // Work the server holds back comes back after its hold, not after the whole rest.
+        let hour = Some(Duration::from_secs(3600));
+        assert_eq!(
+            empty_wait(hour, "desktop_qualification_hold"),
+            Some(refused_task_retry("desktop_qualification_hold"))
+        );
+        assert_eq!(
+            empty_wait(Some(Duration::from_secs(60)), "desktop_qualification_hold"),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(empty_wait(hour, "runtime_output_mismatch"), hour);
+        assert_eq!(empty_wait(None, "desktop_qualification_hold"), None);
         // The processor's own runtime has nowhere to fall back to. One task at a time from
         // the start: failing at the first crash, counted by the restarts, as it always was.
         let mut trouble = RuntimeTrouble::default();

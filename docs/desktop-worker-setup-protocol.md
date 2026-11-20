@@ -222,11 +222,18 @@ lease".
       to qualify again, the move to the processor comes first, and a restart keeps its wait.
       The tray then says "on the processor (acceleration stopped, retried later)" and the AI
       page says the process stopped three times in a row and is tried again later.
-    - The server counts each of those crashes as a failure, so at the third it withdraws the
-      model from this computer and holds it for 300 seconds before it may qualify again
-      (`desktop_qualification_hold`, for that model on this computer whatever the device).
-      The processor therefore takes that model's work after the hold; the computer's other
-      models carry on meanwhile.
+    - The server counts those crashes toward withdrawing the model from this computer. From
+      server PR 1370 on it counts each one that is reported: a crash under a task of that
+      model is reported as one `model-unavailable`, while a process found gone between tasks
+      reports nothing. So only when all three crashes came under tasks of the same model
+      does the third withdraw it there; server
+      `frameleaf-v1.2.25` and earlier count failures within 10 seconds of the first as one,
+      so crashes that come close together there count once and the withdrawal can come
+      later. A withdrawn model is held for 300 seconds before it may qualify again
+      (`desktop_qualification_hold`, for that model on this computer whatever the device):
+      the processor then takes that model's work after the hold, and the desktop waits out
+      only that hold, or the graphics card's rest if it ends sooner, before setting up
+      again. The computer's other models carry on meanwhile.
     - That move is not lasting. Nothing is written to disk, so the next start of the app
       tries the graphics card at once. While the app runs it is tried again by itself after
       30 minutes; if it crashes out again without 50 of its own tasks finished in a row in
