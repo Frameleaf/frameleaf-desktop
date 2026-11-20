@@ -375,7 +375,10 @@ fn server_task_refusal(code: &str) -> bool {
 /// index is another model's): the task waits where it is, on the provider it had.
 fn provider_independent(code: &str) -> bool {
     let code = code.strip_prefix("workload_").unwrap_or(code);
-    code == "desktop_qualification_hold" || code.starts_with("desktop_clip_")
+    // Not a profile the server lacks for this provider: the processor's may exist.
+    code == "desktop_qualification_hold"
+        || code.starts_with("desktop_clip_index_")
+        || code == "desktop_clip_space_unavailable"
 }
 /// The server withdraws a model from this computer after this many failed tasks in a row
 /// (`native_predictor::counts_against_grant`) and then leases it nothing for that model.
@@ -1012,9 +1015,12 @@ fn first_failure(workloads: &[WorkloadStatus]) -> String {
         .filter_map(|item| item.code.as_deref())
         .map(|code| code.strip_prefix("workload_").unwrap_or(code))
         .collect();
+    // Of several such refusals, the one offered again soonest: each task is tried when its own
+    // wait is over, not when the longest one is.
     codes
         .iter()
-        .find(|code| server_task_refusal(code))
+        .filter(|code| server_task_refusal(code))
+        .min_by_key(|code| refused_task_retry(code))
         .or(codes.first())
         .map_or_else(
             || "worker_no_qualified_workloads".into(),
@@ -3514,6 +3520,21 @@ mod tests {
             "desktop_qualification_hold"
         );
         assert!(server_task_refusal("desktop_qualification_hold"));
+        // Smart search is refused for 30 minutes and text recognition held for 5½: the wait
+        // is the shorter one, whatever order the tasks come in.
+        for order in [["clip", "ocr"], ["ocr", "clip"]] {
+            let code = |task: &str| match task {
+                "clip" => "workload_desktop_clip_index_incompatible",
+                _ => "workload_desktop_qualification_hold",
+            };
+            assert_eq!(
+                first_failure(&[
+                    status(order[0], code(order[0])),
+                    status(order[1], code(order[1]))
+                ]),
+                "desktop_qualification_hold"
+            );
+        }
     }
 
     #[test]
@@ -3692,6 +3713,12 @@ mod tests {
                 "workload_desktop_model_profile_unavailable"
             ));
             assert!(!provider_independent("worker_runtime_unsigned"));
+            assert!(provider_independent(
+                "workload_desktop_clip_space_unavailable"
+            ));
+            assert!(!provider_independent(
+                "workload_desktop_clip_profile_unavailable"
+            ));
             // Nothing a different provider would change.
             for code in ["worker_policy_required", "worker_device_refused"] {
                 assert_eq!(refusal(code, provider), Refusal::Stop, "{code}");

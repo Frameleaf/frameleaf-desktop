@@ -219,7 +219,9 @@ fn provider_page_allowed(url: &Url) -> bool {
         && url.password().is_none()
         && match url.scheme() {
             "https" => url.host().is_some(),
-            "http" => crate::connection::is_home_server(url),
+            // The page opens in a web view, which looks names up itself and can't be held to
+            // home addresses: plain HTTP only for what is local by its shape.
+            "http" => url.host().is_some_and(crate::connection::is_local_network),
             _ => false,
         }
 }

@@ -32,7 +32,7 @@ pub fn normalize_server(value: &str) -> Result<Url, String> {
 
 /// `normalize_server` without taking the origin into use: nothing is held to the home network
 /// yet. For an address that may not be used at all (the plain-HTTP fallback of a typed name).
-fn server_origin(value: &str) -> Result<Url, String> {
+pub(crate) fn server_origin(value: &str) -> Result<Url, String> {
     if value.contains('\\') {
         return Err("server_address_invalid".into());
     }
@@ -123,6 +123,12 @@ pub fn is_home_server(url: &Url) -> bool {
         PLAIN_HTTP_NAMES.lock().unwrap().insert(name);
     }
     home
+}
+
+/// A plain-HTTP origin by a name that is held to the home network when connecting. Its
+/// clients connect directly (`plain_http_names_in_use`).
+pub(crate) fn plain_http_name(url: &Url) -> bool {
+    url.scheme() == "http" && looked_up_name(url).is_some()
 }
 
 /// For what this app does not connect itself (the Photos window is a web view with its own

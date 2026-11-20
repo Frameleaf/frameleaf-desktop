@@ -44,7 +44,6 @@ struct ChallengeAuthority {
     device_id: String,
     session_id: String,
     authorization_epoch: u32,
-    credential_sha256: String,
 }
 impl ChallengeAuthority {
     fn from_worker(worker: &SavedWorker) -> Self {
@@ -54,7 +53,6 @@ impl ChallengeAuthority {
             device_id: worker.device_id.clone(),
             session_id: worker.session_id.clone(),
             authorization_epoch: worker.authorization_epoch,
-            credential_sha256: hash(worker.worker_token.as_bytes()),
         }
     }
     fn matches_association(&self, worker: &SavedWorker) -> bool {
@@ -63,10 +61,6 @@ impl ChallengeAuthority {
             && self.device_id == worker.device_id
             && self.session_id == worker.session_id
             && self.authorization_epoch == worker.authorization_epoch
-    }
-    fn matches(&self, worker: &SavedWorker) -> bool {
-        self.matches_association(worker)
-            && self.credential_sha256 == hash(worker.worker_token.as_bytes())
     }
 }
 
@@ -144,7 +138,9 @@ impl QualificationChallenge {
         self.report_sha256.as_deref()
     }
     pub fn validate_authority(&self, worker: &SavedWorker) -> Result<(), String> {
-        if !self.authority.matches(worker) {
+        // As the server binds it: to the session and its authorization epoch, not to the
+        // session's token, which a renewal in the middle of a check replaces.
+        if !self.authority.matches_association(worker) {
             return Err("worker_challenge_association_changed".into());
         }
         Ok(())
@@ -1130,6 +1126,7 @@ impl WorkerTransport {
         qualified: &QualifiedRuntime,
     ) -> Result<bool, String> {
         let mut connection = self.0.lock().await;
+        connection.resync().await?;
         challenge.validate_submission(&connection.worker, qualified, connection.now()?)?;
         let payload = serde_json::json!({"report":qualified.report()}).to_string();
         if payload.len() > 4 * 1024 * 1024 {

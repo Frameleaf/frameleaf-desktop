@@ -60,6 +60,8 @@ struct State {
     withdrawn: HashSet<String>,
     /// Answer without a `Date` header (a proxy's page, a broken server).
     dateless: bool,
+    /// The server understands `reportWithdrawn` on a claim and advertises it.
+    withdrawal_notice: bool,
     /// Every authenticated request's path, in the order the server handled it.
     handled: Vec<String>,
 }
@@ -98,6 +100,7 @@ impl State {
             return reply(
                 json!({"protocolVersion":1,"serverId":"fixture-server","features":{
                 "enrollment":true,"worker":true,"workerSession":true,"workerAutoSetup":true,
+                "workerWithdrawalNotice":self.withdrawal_notice,
                 "sources":false,"nativeHost":false}}),
             );
         }
@@ -184,8 +187,12 @@ impl State {
         };
         match (method, path, task) {
             ("POST", "/api/desktop/worker/claim", _) => {
-                // As the server: a field it does not know is refused; the notice is opt-in.
-                let known = ["modelKeys", "waitMs", "reportWithdrawn"];
+                // As the server: a field it does not know is refused, whatever its value. A
+                // server from before the notice does not know `reportWithdrawn`.
+                let known: &[&str] = match self.withdrawal_notice {
+                    true => &["modelKeys", "waitMs", "reportWithdrawn"],
+                    false => &["modelKeys", "waitMs"],
+                };
                 if payload
                     .as_object()
                     .is_some_and(|fields| fields.keys().any(|key| !known.contains(&key.as_str())))
@@ -357,10 +364,11 @@ impl FakeServer {
         let saved = &device.saved;
         let client = transport::client()?;
         // As `worker_setup::refresh_session`: the capabilities reply shows the server's clock.
-        let skew = transport::capabilities(&client, saved)
+        let capabilities = transport::capabilities(&client, saved)
             .await?
-            .ok_or("desktop_protocol_unsupported")?
-            .clock_skew_ms;
+            .ok_or("desktop_protocol_unsupported")?;
+        let skew = capabilities.clock_skew_ms;
+        let notice = capabilities.features.worker_withdrawal_notice;
         let worker =
             transport::issue_worker_session_as(&client, saved, &device.identity, skew).await?;
         Ok(WorkerTransport::over(Connection {
@@ -373,7 +381,9 @@ impl FakeServer {
             clock: Arc::default(),
             report_withdrawn: false,
         })
-        .with_clock_skew(skew))
+        .with_clock_skew(skew)
+        // As `worker_setup::prepare_on`: only a server that advertises the notice is asked.
+        .with_withdrawal_notice(notice))
     }
     /// The qualification the server holds for this worker's session, as `prepare` would obtain it.
     pub(crate) async fn qualification(&self, worker: &WorkerTransport) -> AcceptedQualification {
@@ -439,6 +449,10 @@ impl FakeServer {
     /// Put the server's clock this many seconds ahead of this computer's (negative: behind).
     pub(crate) fn set_clock_offset(&self, seconds: i64) {
         self.state.lock().unwrap().clock_offset = seconds;
+    }
+    /// Understand and advertise the withdrawal notice from now on.
+    pub(crate) fn offer_withdrawal_notice(&self) {
+        self.state.lock().unwrap().withdrawal_notice = true;
     }
     /// Answer without a `Date` header from now on.
     pub(crate) fn without_date(&self, dateless: bool) {
@@ -752,6 +766,8 @@ async fn a_refused_timestamp_is_a_clock_problem_and_the_next_request_is_timed_ri
         .model_inventory(&source, "CPUExecutionProvider")
         .await;
     assert_ne!(again.err().as_deref(), Some("clock_invalid"));
+    // It passed the server's credential and timestamp checks: only then is a request recorded.
+    assert_eq!(server.handled(), ["models"]);
     let _ = qualification;
     // At session issue a refused timestamp is the clock too, never "this device is refused".
     let stale = transport::issue_worker_session_as(
@@ -781,11 +797,8 @@ async fn a_claim_learns_of_a_withdrawn_model_only_from_a_server_that_offers_the_
         .is_some());
     // One that advertises it is asked, and says at once that a model was withdrawn.
     server.queue(&device, 1);
-    let worker = server
-        .session(&device)
-        .await
-        .unwrap()
-        .with_withdrawal_notice(true);
+    server.offer_withdrawal_notice();
+    let worker = server.session(&device).await.unwrap();
     let qualification = server.qualification(&worker).await;
     assert_eq!(
         worker.claim_many(&[&qualification]).await.err().as_deref(),

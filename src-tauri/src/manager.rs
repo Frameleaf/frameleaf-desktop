@@ -388,7 +388,14 @@ pub fn manager_client(
     if normalize_manager(origin)?.scheme() == "http" && (pem.is_some() || approved.is_some()) {
         return Err("manager_http_certificate_invalid".into());
     }
-    let mut builder = Client::builder()
+    let builder = Client::builder();
+    // A Manager reached over plain HTTP by a home name is connected to directly: a proxy would
+    // look the name up itself and be handed the pairing password.
+    let builder = match crate::connection::plain_http_name(&normalize_manager(origin)?) {
+        true => builder.no_proxy(),
+        false => builder,
+    };
+    let mut builder = builder
         .redirect(reqwest::redirect::Policy::none())
         // A Manager reached over plain HTTP by name is connected to at home addresses only.
         .dns_resolver(std::sync::Arc::new(crate::connection::HomeResolver))

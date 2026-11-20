@@ -425,7 +425,14 @@ fn keep_stderr_tail(mut stream: impl std::io::Read + Send + 'static) -> StderrTa
         // Read in small pieces and keep only the start of each line: a line of any length
         // (a diagnostic with no newline) costs no more memory than a short one.
         let (mut piece, mut line) = ([0u8; 4096], Vec::with_capacity(STDERR_LINE_LENGTH * 4));
-        while let Ok(count @ 1..) = stream.read(&mut piece) {
+        loop {
+            let count = match stream.read(&mut piece) {
+                Ok(0) => break,
+                Ok(count) => count,
+                // Interrupted by a signal, not ended: read again.
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
             for &byte in &piece[..count] {
                 if byte == b'\n' {
                     keep(&line);

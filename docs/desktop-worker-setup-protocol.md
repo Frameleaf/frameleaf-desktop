@@ -221,7 +221,7 @@ under different statuses (policy-off was 401 at session issue and 409 on report 
 | 400 | `desktop_qualification_report_invalid` | Report does not match profile or runtime | `worker_qualification_report_refused` | Same |
 | 200 | `{"accepted": false}` on report | Report not accepted | `worker_qualification_refused` | GPU: falls back to the processor. Processor: that task is off |
 | 200 | `{"accepted": false}` on heartbeat / result / fail | Lease gone | `worker_lease_lost` / `worker_result_refused` | Drops that task, claims the next |
-| 5xx, 408, 429 | any or none | Server failing or busy (500 is treated like 503) | `server_http_<status>` | Retries with backoff; never stops |
+| 5xx, 408, 429 | unknown or absent | Server failing or busy (500 is treated like 503) | `server_http_<status>` | Retries with backoff; never stops |
 | other 4xx | unknown, on `tasks/{id}/input`, `/result`, `/fail`, `heartbeat` | — | `server_http_<status>` | Drops that task only (a bare 401 or 403 stops the worker) |
 | other 4xx | unknown, elsewhere | — | `server_http_<status>` | GPU runtime while qualifying: falls back to the processor. Otherwise stops and shows it |
 

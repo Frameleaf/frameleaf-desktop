@@ -276,7 +276,7 @@ fn actual_factory_runtime_qualifies_the_bound_challenge_and_refuses_nonce_replay
 }
 
 #[test]
-fn refuses_a_challenge_on_another_connection_or_credential_generation() {
+fn refuses_a_challenge_on_another_connection_and_keeps_it_across_a_token_renewal() {
     let f = fixture();
     let p = profile();
     let attestation = f.store.attestation(&f.installed).unwrap();
@@ -297,13 +297,18 @@ fn refuses_a_challenge_on_another_connection_or_credential_generation() {
         ("deviceId", json!("other")),
         ("sessionId", json!("other")),
         ("authorizationEpoch", json!(3)),
-        ("workerToken", json!("b".repeat(64))),
     ] {
         let mut changed = serde_json::to_value(&original).unwrap();
         changed[field] = value;
         let changed = serde_json::from_value(changed).unwrap();
         assert!(challenge.validate_authority(&changed).is_err(), "{field}");
     }
+    // A renewal in the middle of a check gives the same session a new token: the server binds
+    // a challenge to the session and its authorization epoch, and so does this side.
+    let mut renewed = serde_json::to_value(&original).unwrap();
+    renewed["workerToken"] = json!("b".repeat(64));
+    let renewed = serde_json::from_value(renewed).unwrap();
+    assert!(challenge.validate_authority(&renewed).is_ok());
 }
 
 #[test]
