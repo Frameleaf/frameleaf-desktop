@@ -318,6 +318,62 @@ mod tests {
             server.join().unwrap();
         }
     }
+    /// Run in a child process (`a_plain_http_home_name_is_never_sent_through_a_configured_proxy`),
+    /// where the proxy variables can be set without touching the tests running beside this one.
+    #[test]
+    #[ignore = "run by its parent test, in a process of its own"]
+    fn proxy_child() {
+        let Ok(case) = std::env::var("FRAMELEAF_PROXY_CASE") else {
+            return;
+        };
+        let url = if case == "home" {
+            // As restoring a saved sign-in and adding a library do: the server is taken into
+            // use first, then the client that will carry the credential is built.
+            let base = normalize_server("http://nas.proxied.test:2283").unwrap();
+            base.join("api/users/me").unwrap()
+        } else {
+            reqwest::Url::parse("http://control.proxied.test/api/users/me").unwrap()
+        };
+        let client = client().unwrap();
+        tauri::async_runtime::block_on(async {
+            let request = client.get(url).bearer_auth("secret").send();
+            let _ = tokio::time::timeout(Duration::from_secs(3), request).await;
+        });
+    }
+    #[test]
+    fn a_plain_http_home_name_is_never_sent_through_a_configured_proxy() {
+        let child = |case: &str| {
+            // The "proxy": anything that connects to it was sent through the proxy.
+            let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = format!("http://{}", proxy.local_addr().unwrap());
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "transport::tests::proxy_child", "--ignored"])
+                .env("FRAMELEAF_PROXY_CASE", case)
+                .env("HTTP_PROXY", &address)
+                .env("http_proxy", &address)
+                .env("ALL_PROXY", &address)
+                .env_remove("NO_PROXY")
+                .env_remove("no_proxy")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "{case}");
+            proxy.set_nonblocking(true).unwrap();
+            proxy.accept().is_ok()
+        };
+        // The check can see a proxied request: plain HTTP built without taking a home name
+        // into use goes to the configured proxy.
+        assert!(
+            child("control"),
+            "the control request did not reach the proxy"
+        );
+        // A plain-HTTP home name, in a fresh process, with its credential: never the proxy.
+        assert!(
+            !child("home"),
+            "the home server's request went to the proxy"
+        );
+    }
     #[test]
     fn keeps_photo_json_small_and_accepts_only_explicit_bounded_worker_replies() {
         tauri::async_runtime::block_on(async {
