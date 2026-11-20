@@ -298,7 +298,9 @@ revision's key. `task.qualificationId` is the desktop's current qualification fo
   `inference-failed` otherwise. Pause (the person's own) lets the task in hand finish first.
 - `cancelled` puts the task straight back in line and does not count toward the three failures
   after which the task itself fails, for the first five times one task is handed back (by any
-  computers). A further `cancelled` for that task is a failed attempt. The other three codes
+  computers). A task the server takes back itself when it withdraws a model is recorded as
+  handed back too, and counts toward those five. A further `cancelled` for that task is a
+  failed attempt. The other three codes
   each count.
 - **Grant withdrawal.** The server counts, per computer and model, failures in a row
   (`inference-failed`, `model-unavailable`); a result it accepts starts the count again, and
@@ -328,10 +330,14 @@ revision's key. `task.qualificationId` is the desktop's current qualification fo
   model's last result, counting only reports the server acknowledged. At the third it qualifies
   again. The two counts can differ (the server counts hand-backs past the fifth, and does
   not count a failure of a task already leased at the last counted one; the desktop counts
-  each failure it reported); when the desktop is early, qualifying again is harmless, and when it is
-  late the withdrawal notice below tells it. The server keeps its count per device and model
-  (a new session does not reset it) and answers that qualification with
-  `409 desktop_qualification_hold` for 5 minutes, which the desktop waits out for that model.
+  each failure it reported); when the desktop is early, the model was not withdrawn and the
+  qualification is simply granted; when it is late the withdrawal notice below tells it. A
+  granted qualification starts the server's count for that model again, failures and
+  hand-backs alike, whether or not the model had been withdrawn: after two counted failures
+  and an early qualification, the next failure is the first, not the third. The server keeps
+  its count per device and model (a new session does not reset it) and, after a withdrawal,
+  answers that qualification with `409 desktop_qualification_hold` for 5 minutes, which the
+  desktop waits out for that model.
 - **Withdrawal notice.** The server's count outlives a desktop's restart, so it can withdraw a
   model the desktop still believes it holds. When the server advertises
   `features.workerWithdrawalNotice`, the desktop adds `"reportWithdrawn": true` to its claim
