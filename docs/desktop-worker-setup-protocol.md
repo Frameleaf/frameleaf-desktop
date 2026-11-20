@@ -311,11 +311,10 @@ revision's key. `task.qualificationId` is the desktop's current qualification fo
     with several tasks in hand, the desktop reports `model-unavailable` for one of them and
     `cancelled` for the rest. The server does not group failures by time or by lease: three
     tasks each reported as failed are three failures and withdraw the model. The tasks handed
-    back after a `model-unavailable`, with no new lease of that model in between, are part of
-    that failure and are not counted as a hand-back. The order of the reports does not
-    change the failures: reported the other way round, the first `cancelled` is a hand-back,
-    and if it is past the five and so a failure, the `model-unavailable` after it adds
-    nothing.
+    back by a crash, with no new lease of that model in between, are part of its one failure
+    and are not counted as a hand-back. The order of the reports does not matter: a crash is
+    one failure and no hand-back either way. A second `model-unavailable` is a second
+    failure.
   - **Handing work back.** `cancelled` puts the task straight back in line and is not a
     failure. Hand-backs with no new lease of that model taken in between are one hand-back,
     below the five and above them, so a stop, pause or crash with any number of leases counts
