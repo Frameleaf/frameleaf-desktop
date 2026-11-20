@@ -198,25 +198,38 @@ lease".
     computer with eight cores or more (each task already gets four threads).
   - Memory: beside the loaded models, each task in hand is taken to need a quarter of the
     models' memory, at least 256 MB; what is free now, less the models, says how many fit.
-  - A graphics card's own memory can't be read, so the number is a starting point. When the
-    model refuses half or more of the tasks it was given at once, the desktop runs half as
-    many from then on; when the runtime process ends or stops answering while working on
-    several, it goes to one. It does not stop, and it does not go back up until AI processing
-    is stopped and started again. Pauses for memory, power and network are unchanged.
+  - A graphics card's own memory can't be read, so the number is a starting point, lowered
+    when memory runs short while working, on the same device:
+    - the model refuses two tasks in a row while several are in hand: half as many from then
+      on;
+    - the runtime process ends or stops answering with several tasks in hand: half as many,
+      then one. The graphics card keeps the work. Only a runtime that fails with one task in
+      hand is treated as failing (the work then moves to the processor, as before).
+    It does not stop, and it does not go back up until AI processing is stopped and started
+    again. Pauses for memory, power and network are unchanged.
   - Nothing to set on the desktop.
 - **Claims.** `"slots": <1..64>` on every claim says how many more tasks the desktop can take
   right now. A claim still returns at most one task; with `slots` it is always a new lease,
-  never one already held. The desktop waits for the first task as before (`waitMs` 20000), then
-  asks for more without waiting (`waitMs` 0) until it has no room or the server has nothing,
-  and runs what it was given side by side. It claims again when those are done.
+  never one already held. With nothing in hand the desktop waits for work as before (`waitMs`
+  20000). With tasks in hand it asks without waiting (`waitMs` 0), as soon as a task is done
+  and there is room, and again a second later when the server had nothing. A slow task does
+  not hold up the others' places.
+- **Each task is reported as soon as it is done**, its result or its failure, without waiting
+  for the others in hand.
+- **A runtime that ends under several tasks is one failure.** One of the tasks in hand is
+  reported `model-unavailable` and the others are handed back `cancelled`, so the server's
+  count toward withdrawing the model goes up by one, not by the number of tasks.
+- **The heartbeat starts at the claim**, and runs while the task's input is fetched as well as
+  while the model works. Inputs of several tasks are downloaded side by side.
 - **Each lease is its own.** Its own input, heartbeat, result and failure. A failure, a refused
   input, a lost lease, a hold or a withdrawal touches only its own task or model; the others
   finish and report. Stop, sign-out, library switch, quit and a pause for power or network
-  hand back every lease held, each with `fail` `cancelled`.
+  hand back every lease held, each with `fail` `cancelled`; a stop waits three seconds for
+  that, and a second more for each further task in hand.
 - **One request at a time.** Signed requests still go one at a time in sequence order, which
   is why the claims for more room do not wait.
-- The runtime process is started to serve as many requests at once as the desktop will run
-  tasks. The signed runtime takes one input per inference call, so several tasks are several
+- The runtime process is started able to serve as many requests at once as this computer
+  could take, so a higher Jobs setting takes effect with the next claim, without a restart. The signed runtime takes one input per inference call, so several tasks are several
   calls served side by side, not one batched call.
 - **A lease whose claim reply was lost** is not returned again under `slots`. It runs out
   after 120 seconds; the server hands back at once a lease it made while the connection was
