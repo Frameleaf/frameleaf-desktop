@@ -218,7 +218,9 @@ lease".
   for the others in hand.
 - **A runtime that ends under several tasks is one failure.** One of the tasks in hand is
   reported `model-unavailable` and the others are handed back `cancelled`, so the server's
-  count toward withdrawing the model goes up by one, not by the number of tasks.
+  count toward withdrawing the model goes up by one, not by the number of tasks. The server
+  protects itself as well: failures of one model from one desktop within 10 seconds of the
+  first count as one.
 - **The heartbeat starts at the claim**, and runs while the task's input is fetched as well as
   while the model works. Inputs of several tasks are downloaded side by side.
 - **Each lease is its own.** Its own input, heartbeat, result and failure. A failure, a refused
@@ -242,6 +244,10 @@ lease".
   next jobs is for a photo it may take. Free slots are counted for smart search first, then
   faces, then text.
 - A `slots` outside 1 to 64 is refused with `400 desktop_worker_payload_invalid`.
+- **Limits that add no message.** One desktop never holds more than 64 leases, whatever the
+  Jobs setting says. The broker holds at most 256 open tasks and at most 512 MB of their
+  inputs together; one task always fits. Beyond a limit a claim simply returns
+  `{"task": null}`.
 
 ### Several desktops at once
 
@@ -285,7 +291,11 @@ revision's key. `task.qualificationId` is the desktop's current qualification fo
   worker session for one model (a result in between resets the count; `cancelled` and
   `input-invalid` do not count), the server withdraws that model from the desktop: its
   qualification is deleted, `claim` returns nothing for it and
-  `GET /worker/qualifications/{id}` answers `401 desktop_qualification_invalid`. The `fail` reply is
+  `GET /worker/qualifications/{id}` answers `401 desktop_qualification_invalid`. The desktop's
+  other tasks of that model in hand go back to the queue at once: their leases end (heartbeat
+  and result answer `accepted: false`, input answers `401 desktop_lease_invalid`), which the
+  desktop takes as those tasks being gone and says nothing more about them. Leases of other
+  models are untouched. The `fail` reply is
   still `{"accepted": true}`, and `/models` still lists the model, so a new challenge and report
   grant it again. The desktop keeps the same count the same way (for each model, the failures it
   reported as `inference-failed` or `model-unavailable` since that model's last result) and, at
