@@ -389,9 +389,10 @@ pub fn manager_client(
         return Err("manager_http_certificate_invalid".into());
     }
     let builder = Client::builder();
-    // A Manager reached over plain HTTP by a home name is connected to directly: a proxy would
-    // look the name up itself and be handed the pairing password.
-    let builder = match crate::connection::plain_http_name(&normalize_manager(origin)?) {
+    // A Manager reached over plain HTTP by a name (one just paired, or a saved one after a
+    // restart) is held to home addresses from here on, and connected to directly: a proxy
+    // would look the name up itself and be handed the password or the grant's proof.
+    let builder = match crate::connection::hold_plain_http_name(&normalize_manager(origin)?) {
         true => builder.no_proxy(),
         false => builder,
     };

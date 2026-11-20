@@ -125,10 +125,18 @@ pub fn is_home_server(url: &Url) -> bool {
     home
 }
 
-/// A plain-HTTP origin by a name that is held to the home network when connecting. Its
-/// clients connect directly (`plain_http_names_in_use`).
-pub(crate) fn plain_http_name(url: &Url) -> bool {
-    url.scheme() == "http" && looked_up_name(url).is_some()
+/// Take a plain-HTTP origin by name into use, whoever reaches it (a server, a Manager): from
+/// now on connections to the name are held to home addresses. `true` when it is such an
+/// origin, whose clients must also connect directly, never through a proxy.
+pub(crate) fn hold_plain_http_name(url: &Url) -> bool {
+    if url.scheme() != "http" {
+        return false;
+    }
+    let Some(name) = looked_up_name(url) else {
+        return false;
+    };
+    PLAIN_HTTP_NAMES.lock().unwrap().insert(name);
+    true
 }
 
 /// For what this app does not connect itself (the Photos window is a web view with its own
@@ -617,6 +625,15 @@ mod local_http_tests {
         // (the AI worker) may be using the plain-HTTP one.
         normalize_server("https://nas.split.test").unwrap();
         assert!(home_addresses("nas.split.test", addresses(&["203.0.113.7"])).is_err());
+        // A saved Manager after a restart: building its client is what takes the name into use.
+        let public = addresses(&["203.0.113.7"]);
+        assert_eq!(
+            home_addresses("mgr.saved.test", public.clone()),
+            Ok(public.clone())
+        );
+        assert!(crate::manager::manager_client("http://mgr.saved.test:9443", None, None).is_ok());
+        assert!(home_addresses("mgr.saved.test", public).is_err());
+        assert!(home_addresses("mgr.saved.test", addresses(&["192.168.178.30"])).is_ok());
         // Sign-in and Manager: a name already reached over plain HTTP is a home server without
         // another lookup; one that resolves nowhere, or an HTTPS name, is not.
         assert!(is_home_server(
