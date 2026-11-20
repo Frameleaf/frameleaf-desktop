@@ -502,7 +502,10 @@ impl RuntimeTrouble {
     /// of the setup (`CRASH_LIMIT`), as they always were.
     fn crashed(&mut self, in_hand: u32, accelerated: bool, stepped_down: bool) -> AfterCrash {
         self.clean = 0;
-        self.clean_accelerated = 0;
+        // The processor's runtime crashing says nothing about the graphics card's recovery.
+        if accelerated {
+            self.clean_accelerated = 0;
+        }
         match in_hand {
             // With its one task, or found gone between tasks: the graphics card keeps the
             // work until the third in a row.
@@ -1744,7 +1747,12 @@ async fn prepare_on(
     let mut failures = TaskFailures::default();
     let mut refusals = 0u32;
     let mut strikes = GrantStrikes::default();
-    let mut trouble = RuntimeTrouble::default();
+    // The graphics card's crashes in a row are kept with the plan's records, so a setup that
+    // starts again in between (a lost session, say) does not start the count again.
+    let mut trouble = RuntimeTrouble {
+        at_one: plan.crash_streak(),
+        ..Default::default()
+    };
     // When the server refused each task, for offering it again that long after the refusal
     // (not that long after this setup began, which the downloads and checks may outlast).
     let mut refused_at = std::collections::BTreeMap::<String, tokio::time::Instant>::new();
@@ -2373,6 +2381,7 @@ async fn prepare_on(
                     in_hand.count(),
                     predictor.failed_lane(),
                 );
+                plan.set_crash_streak(trouble.at_one);
                 match completed {
                     Ok(()) => {
                         // The accelerated runtime crashed out. Decided before qualifying
@@ -4384,9 +4393,11 @@ mod tests {
         assert_eq!(result, Err("runtime_process_stopped".into()));
         // The server, which withdraws a model after three failed tasks in a row, hears of one
         // failure; the other two tasks go straight back in line.
-        let mut failures = server.failures();
-        failures.sort();
-        assert_eq!(failures, ["cancelled", "cancelled", "model-unavailable"]);
+        // The failure is told first: the server takes the hand-backs after it as part of it.
+        assert_eq!(
+            server.failures(),
+            ["model-unavailable", "cancelled", "cancelled"]
+        );
     }
 
     #[tokio::test]
@@ -4515,6 +4526,19 @@ mod tests {
         assert_eq!(trouble.crashed(1, true, false), AfterCrash::Again(1));
         assert_eq!(trouble.completed(true), (false, false));
         assert_eq!(trouble.crashed(1, true, false), AfterCrash::Again(1));
+        // The processor's runtime crashing does not undo the graphics card's run of
+        // finished tasks; a crash of its own does.
+        let mut trouble = RuntimeTrouble::default();
+        for _ in 1..CLEAN_RUN {
+            assert!(!trouble.completed(true).1);
+        }
+        assert_eq!(trouble.crashed(2, false, false), AfterCrash::Fewer(1));
+        assert!(trouble.completed(true).1);
+        for _ in 1..CLEAN_RUN {
+            assert!(!trouble.completed(true).1);
+        }
+        assert_eq!(trouble.crashed(2, true, false), AfterCrash::Fewer(1));
+        assert!(!trouble.completed(true).1);
         // The third crash under a task dropped for its own reason is still the runtime
         // crashing out; a hand-back and a crash code are kept as they are.
         let out = |crash, code: &str| crashed_out(crash, code.to_owned());

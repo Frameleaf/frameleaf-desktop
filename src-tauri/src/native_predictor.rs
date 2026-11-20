@@ -390,7 +390,7 @@ where
 {
     use futures_util::{stream::FuturesUnordered, StreamExt};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    let (in_hand, crash_reported) = (AtomicUsize::new(0), AtomicBool::new(false));
+    let (in_hand, crash_reported) = (AtomicUsize::new(0), tokio::sync::Mutex::new(false));
     // The runtime was stopped under an abandoned prediction: nothing more is started on it.
     let stopped = AtomicBool::new(false);
     let (in_hand, crash_reported, stopped, predict) =
@@ -629,28 +629,39 @@ async fn settle(
     task: &ClaimedTask,
     qualification: &AcceptedQualification,
     outcome: Result<(), TaskFailure>,
-    crash_reported: &std::sync::atomic::AtomicBool,
+    crash_reported: &tokio::sync::Mutex<bool>,
 ) -> Result<(Step, bool), String> {
     let Err(failure) = outcome else {
         return Ok((Step::Completed, false));
     };
     let mut reported = false;
     if !lease_gone(&failure.code) {
-        use std::sync::atomic::Ordering;
         let mut report = failure_report(&failure.code);
-        let crash = matches!(report, WorkerFailure::ModelUnavailable);
-        if crash && crash_reported.swap(true, Ordering::AcqRel) {
-            report = WorkerFailure::Cancelled;
+        // The one report that stands for the whole crash goes first: the server takes the
+        // hand-backs that follow a `model-unavailable` as part of that failure, and would
+        // count one that came before it as a hand-back of its own. The others wait here
+        // until it has been sent.
+        let mut first = None;
+        if matches!(report, WorkerFailure::ModelUnavailable) {
+            let mut told = crash_reported.lock().await;
+            match *told {
+                true => report = WorkerFailure::Cancelled,
+                false => {
+                    *told = true;
+                    first = Some(told);
+                }
+            }
         }
         let mut sent = transport.fail(task, report, qualification).await;
-        // The one report that stands for the whole crash must arrive, or the server counts
-        // the crash as nothing: it is sent once more, and if that fails too, the next task
-        // still in hand carries it instead.
-        if crash && matches!(report, WorkerFailure::ModelUnavailable) && sent.is_err() {
-            tokio::time::sleep(CRASH_REPORT_RETRY).await;
-            sent = transport.fail(task, report, qualification).await;
+        // It must arrive, or the server counts the crash as nothing: it is sent once more,
+        // and if that fails too, the next task still in hand carries it instead.
+        if let Some(mut told) = first {
             if sent.is_err() {
-                crash_reported.store(false, Ordering::Release);
+                tokio::time::sleep(CRASH_REPORT_RETRY).await;
+                sent = transport.fail(task, report, qualification).await;
+                if sent.is_err() {
+                    *told = false;
+                }
             }
         }
         reported = sent == Ok(true);
@@ -679,7 +690,7 @@ where
     };
     let run = |_, input| predict(input);
     let outcome = run_claimed(transport, &task, qualifications[index], cancel, run).await;
-    let alone = std::sync::atomic::AtomicBool::new(false);
+    let alone = tokio::sync::Mutex::new(false);
     let settled = settle(transport, &task, qualifications[index], outcome, &alone).await;
     settled.map(|(step, _)| step)
 }
@@ -1080,7 +1091,13 @@ impl NativePredictor {
         let exited = &exited;
         let abandon = || {
             stopped_here.store(true, Ordering::Release);
-            for lane in children.lock().unwrap().iter_mut() {
+            for (index, lane) in children.lock().unwrap().iter_mut().enumerate() {
+                // Already gone before this owner stops it (a deadline can win the race with
+                // the broken connection, and then nothing else has looked): it ended by itself.
+                if !lane.child.is_running().unwrap_or(true) {
+                    let _ =
+                        exited.compare_exchange(NONE, index, Ordering::AcqRel, Ordering::Acquire);
+                }
                 let _ = lane.child.stop();
             }
         };
@@ -1115,14 +1132,21 @@ impl NativePredictor {
                             // The connection broke off. A process that is ending is gone a
                             // moment later: wait that moment, so its end is told apart from
                             // a healthy process this owner stops.
-                            if code == "runtime_prediction_interrupted" {
-                                for _ in 0..EXIT_CHECKS {
-                                    if !running().unwrap_or(true) {
-                                        exited.store(role.lane, Ordering::Release);
-                                        break;
-                                    }
-                                    tokio::time::sleep(EXIT_CHECK_EVERY).await;
+                            // (The answer breaking off after its first line is the same end.)
+                            let broke_off = matches!(
+                                code.as_str(),
+                                "runtime_prediction_interrupted" | "server_response_interrupted"
+                            );
+                            for _ in 0..if broke_off { EXIT_CHECKS } else { 0 } {
+                                if !running().unwrap_or(true) {
+                                    exited.store(role.lane, Ordering::Release);
+                                    // Reported as the runtime being gone, like any crash.
+                                    return Err(match code.as_str() {
+                                        "runtime_prediction_interrupted" => code,
+                                        _ => "runtime_process_stopped".into(),
+                                    });
                                 }
+                                tokio::time::sleep(EXIT_CHECK_EVERY).await;
                             }
                             return Err(code);
                         }

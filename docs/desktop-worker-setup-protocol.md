@@ -214,7 +214,9 @@ lease".
       row). What counts as one of the three: its process ending or its answer breaking off
       under its one task; its process found gone between tasks; and its process dying under
       a task that was dropped for a reason of its own, such as its deadline (the third is
-      then shown as the process having stopped). When the same failures also ask the desktop
+      then shown as the process having stopped). The count is kept while the app runs: a
+      setup that starts again in between (a lost session, say) does not start it again, and
+      Retry Setup does. When the same failures also ask the desktop
       to qualify again, the move to the processor comes first, and a restart keeps its wait.
       The tray then says "on the processor (acceleration stopped, retried later)" and the AI
       page says the process stopped three times in a row and is tried again later.
@@ -247,7 +249,7 @@ lease".
 - **Each task is reported as soon as it is done**, its result or its failure, without waiting
   for the others in hand.
 - **A runtime that ends under several tasks is one failure.** One of the tasks in hand is
-  reported `model-unavailable` and the others are handed back `cancelled`, so the server's
+  reported `model-unavailable` first, and only then are the others handed back `cancelled`, so the server's
   count toward withdrawing the model goes up by one, not by the number of tasks. If that one
   report does not arrive it is sent once more, and failing that the next task still in hand
   carries it, so the crash is not counted as nothing. The server
