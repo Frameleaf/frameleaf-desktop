@@ -115,11 +115,19 @@ pub(crate) fn home_addresses(
         .into_iter()
         .filter(|address| local_address(address.ip()))
         .collect();
+    // What this app's own connections last saw of the name, for `leads_home_now`.
+    LAST_SEEN
+        .lock()
+        .unwrap()
+        .insert(name, (std::time::Instant::now(), !home.is_empty()));
     if home.is_empty() {
         return Err("plain HTTP is only for the home network");
     }
     Ok(home)
 }
+/// Where each plain-HTTP name led when this app last connected to it.
+static LAST_SEEN: std::sync::Mutex<std::collections::BTreeMap<String, (std::time::Instant, bool)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// A server or Manager on this computer or the home network, where plain HTTP is allowed:
 /// local by its shape (`is_local_network`), or a plain-HTTP name that leads home. A name
@@ -166,6 +174,10 @@ pub(crate) fn hold_plain_http_name(url: &Url) -> bool {
 
 /// For what this app does not connect itself (the Photos window is a web view with its own
 /// name lookup): whether a plain-HTTP name leads home right now. Any other server is `true`.
+///
+/// Nothing is looked up here, so nothing waits: the answer is what this app's own connections
+/// to the server saw in the last ten minutes (the connection check that comes before Photos is
+/// one of them). A name not seen since, or last seen leading elsewhere, does not lead home.
 pub(crate) fn leads_home_now(base: &Url) -> bool {
     if base.scheme() != "http" {
         return true;
@@ -173,7 +185,12 @@ pub(crate) fn leads_home_now(base: &Url) -> bool {
     let Some(name) = looked_up_name(base) else {
         return true;
     };
-    look_up(&name) == Leads::Home
+    const RECENT: std::time::Duration = std::time::Duration::from_secs(600);
+    LAST_SEEN
+        .lock()
+        .unwrap()
+        .get(&name)
+        .is_some_and(|(at, home)| *home && at.elapsed() < RECENT)
 }
 
 /// The resolver of every client that talks to a server (`transport::streaming_client_builder`).
@@ -681,7 +698,14 @@ mod local_http_tests {
         assert!(!is_home_server(
             &Url::parse("https://photos.example.invalid").unwrap()
         ));
-        // A plain-HTTP name that does not resolve does not lead home; other servers are not asked.
+        // The Photos window is opened by what this app's own connections last saw of the name,
+        // with no lookup of its own: home just now, then elsewhere.
+        let photos = Url::parse("http://nas.split.test:2283").unwrap();
+        assert!(home_addresses("nas.split.test", addresses(&["192.168.178.20"])).is_ok());
+        assert!(leads_home_now(&photos));
+        assert!(home_addresses("nas.split.test", addresses(&["203.0.113.7"])).is_err());
+        assert!(!leads_home_now(&photos));
+        // A plain-HTTP name never connected to does not lead home; other servers are not asked.
         assert!(!leads_home_now(
             &Url::parse("http://nas.fritz.invalid:2283").unwrap()
         ));

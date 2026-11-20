@@ -1247,22 +1247,26 @@ impl WorkerTransport {
         task: &ClaimedTask,
         qualification: &AcceptedQualification,
     ) -> Result<Vec<u8>, String> {
-        let mut connection = self.0.lock().await;
-        connection.resync().await?;
-        qualification.validate_task(&connection.worker, task, connection.now()?)?;
-        task.validate_at(
-            &connection.worker,
-            std::slice::from_ref(&task.model_key),
-            connection.now()?,
-        )?;
-        let mut response = connection
-            .request(
-                Method::GET,
-                &format!("api/desktop/tasks/{}/input", task.id),
-                &format!("input:{}", task.id),
-                "",
-            )
-            .await?;
+        // The request goes in its turn; the body is then read without holding the line, so
+        // the inputs of several tasks arrive side by side and heartbeats are not kept waiting.
+        let mut response = {
+            let mut connection = self.0.lock().await;
+            connection.resync().await?;
+            qualification.validate_task(&connection.worker, task, connection.now()?)?;
+            task.validate_at(
+                &connection.worker,
+                std::slice::from_ref(&task.model_key),
+                connection.now()?,
+            )?;
+            connection
+                .request(
+                    Method::GET,
+                    &format!("api/desktop/tasks/{}/input", task.id),
+                    &format!("input:{}", task.id),
+                    "",
+                )
+                .await?
+        };
         if !response.status().is_success() {
             let (status, message) = refused(response).await;
             return Err(worker_refusal(status, &message));

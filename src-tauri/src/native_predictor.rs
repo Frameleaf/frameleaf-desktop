@@ -341,89 +341,152 @@ async fn next_task(
         Err(code) => Err(code),
     }
 }
-/// The tasks to run at once: the first is waited for, as one always was; while there is room
-/// (`slots`, from a server that lets a desktop hold several leases) more are asked for without
-/// waiting, and what the server hands over is what runs. A refused or failed extra claim just
-/// ends the asking: the tasks in hand are run.
-async fn claim_batch(
-    transport: &WorkerTransport,
-    qualifications: &[&AcceptedQualification],
-    cancel: &mut watch::Receiver<bool>,
-    slots: Option<u32>,
-) -> Result<Result<Vec<(usize, ClaimedTask)>, Step>, String> {
-    let first = match next_task(transport, qualifications, cancel, slots).await? {
-        Ok(claimed) => claimed,
-        Err(step) => return Ok(Err(step)),
-    };
-    let mut claimed = vec![first];
-    while let Some(room) = slots
-        .map(|slots| slots.saturating_sub(claimed.len() as u32))
-        .filter(|room| *room > 0 && !*cancel.borrow())
-    {
-        match transport.claim_with(qualifications, Some(room), 0).await {
-            Ok(Some(next)) => claimed.push(next),
-            _ => break,
-        }
-    }
-    Ok(Ok(claimed))
-}
 /// What became of one claimed task, and which model it was for.
 #[derive(Debug, PartialEq)]
 pub(crate) struct TaskStep {
-    /// The model key of the task; `None` when the step claimed nothing.
+    /// The model key of the task; `None` when nothing was claimed.
     pub model: Option<String>,
     pub step: Step,
 }
-impl TaskStep {
-    fn unclaimed(step: Step) -> Vec<Self> {
-        vec![Self { model: None, step }]
-    }
+/// How the worker steers the pool of tasks in hand.
+pub(crate) struct Pool<'a> {
+    /// How many tasks may be in hand right now, where the server lets a desktop hold several
+    /// leases. `None` is one task, claimed the way it always was.
+    pub slots: &'a (dyn Fn() -> Option<u32> + Sync),
+    /// Whether to go on claiming. When it says no, the tasks in hand are finished and the pool
+    /// ends, so its owner can do what it must between tasks.
+    pub keep_claiming: &'a (dyn Fn() -> bool + Sync),
+    /// Stop the runtime process: the only task in hand was given up in the middle of its
+    /// prediction, which is still running there.
+    pub abandon: &'a (dyn Fn() + Sync),
 }
-/// Run the claimed tasks side by side, each under its own lease with its own heartbeat. One
-/// task failing, being refused or losing its lease is that task's outcome only.
-async fn run_batch<'a, F, P>(
+/// Work on tasks side by side, each under its own lease with its own heartbeat, input, result
+/// and failure, and ask for another as soon as one is done.
+///
+/// - With nothing in hand the claim waits for work, as one always did. With tasks in hand it
+///   does not wait: signed requests go one at a time, and a held-open claim would keep their
+///   heartbeats and results waiting. When the server has nothing more, it is asked again in a
+///   second.
+/// - `on_step` hears of each task as soon as it is settled, and answers how long to hold off
+///   the next claim; `None` is "stop claiming".
+/// - A failure that is not one task's alone ends the claiming; the other tasks in hand are
+///   still settled, and the failure is returned when they are.
+/// - The pool ends when nothing was there to claim, or nothing is in hand and claiming stopped.
+async fn run_pool<F, P>(
     transport: &WorkerTransport,
     qualifications: &[&AcceptedQualification],
-    cancel: &watch::Receiver<bool>,
-    claimed: &'a [(usize, ClaimedTask)],
+    cancel: &mut watch::Receiver<bool>,
+    pool: &Pool<'_>,
+    mut on_claim: impl FnMut(&ClaimedTask),
+    mut on_step: impl FnMut(TaskStep) -> Option<Duration>,
     predict: F,
-) -> Vec<Result<(), TaskFailure>>
+) -> Result<(), String>
 where
-    F: Fn(usize, &'a ClaimedTask, Vec<u8>) -> P,
+    F: Fn(usize, ClaimedTask, Vec<u8>) -> P,
     P: Future<Output = Result<Value, String>>,
 {
-    let predict = &predict;
-    futures_util::future::join_all(claimed.iter().map(|(index, task)| {
-        let mut cancel = cancel.clone();
-        async move {
-            let run = |input| predict(*index, task, input);
-            run_claimed(transport, task, qualifications[*index], &mut cancel, run).await
+    use futures_util::{stream::FuturesUnordered, StreamExt};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let (in_hand, crash_reported) = (AtomicUsize::new(0), AtomicBool::new(false));
+    let (in_hand, crash_reported, predict) = (&in_hand, &crash_reported, &predict);
+    // One task in hand, from its input to the server hearing what became of it.
+    let work = |index: usize, task: ClaimedTask, mut cancel: watch::Receiver<bool>| async move {
+        let qualification = qualifications[index];
+        let run = |input| predict(index, task.clone(), input);
+        let outcome = run_claimed(transport, &task, qualification, &mut cancel, run).await;
+        // A prediction given up on is still running in the process. With this the only task
+        // in hand, the process is stopped before the server is told, as it always was; one
+        // task's late deadline must not end the others' work.
+        let abandoned = outcome.as_ref().is_err_and(|failure| failure.inferring);
+        if abandoned && in_hand.load(Ordering::Acquire) == 1 {
+            (pool.abandon)();
         }
-    }))
-    .await
-}
-/// Tell the server what became of each task. The first failure that is not confined to one
-/// task is returned after every task has been settled.
-async fn settle_batch(
-    transport: &WorkerTransport,
-    qualifications: &[&AcceptedQualification],
-    claimed: &[(usize, ClaimedTask)],
-    outcomes: Vec<Result<(), TaskFailure>>,
-) -> Result<Vec<TaskStep>, String> {
-    let mut steps = Vec::new();
-    let mut fatal = None;
-    for ((index, task), outcome) in claimed.iter().zip(outcomes) {
-        match settle(transport, task, qualifications[*index], outcome).await {
-            Ok(step) => steps.push(TaskStep {
-                model: Some(task.model_key.clone()),
-                step,
-            }),
-            Err(code) => fatal = fatal.or(Some(code)),
+        let step = settle(transport, &task, qualification, outcome, crash_reported).await;
+        in_hand.fetch_sub(1, Ordering::AcqRel);
+        (task.model_key, step)
+    };
+    let mut running = FuturesUnordered::new();
+    // A claim for more room, made while tasks are in hand. It is waited for alongside them:
+    // it takes its turn among their requests, and they must go on being served meanwhile.
+    let mut more = None;
+    let mut claiming = true;
+    let mut next_claim = tokio::time::Instant::now();
+    let mut fatal: Option<String> = None;
+    loop {
+        let slots = (pool.slots)();
+        let room = slots.unwrap_or(1).saturating_sub(running.len() as u32);
+        claiming &= fatal.is_none() && (pool.keep_claiming)() && !*cancel.borrow();
+        let due = claiming && room > 0 && more.is_none();
+        if due && tokio::time::Instant::now() >= next_claim {
+            if running.is_empty() {
+                // Nothing in hand: wait for work, as one always did.
+                let room = slots.map(|_| room);
+                match next_task(transport, qualifications, cancel, room).await? {
+                    Ok((index, task)) => {
+                        on_claim(&task);
+                        in_hand.fetch_add(1, Ordering::AcqRel);
+                        running.push(work(index, task, cancel.clone()));
+                    }
+                    Err(step) => {
+                        on_step(TaskStep { model: None, step });
+                        return Ok(());
+                    }
+                }
+                continue;
+            }
+            more = Some(Box::pin(transport.claim_with(
+                qualifications,
+                Some(room),
+                0,
+            )));
         }
-    }
-    match fatal {
-        Some(code) => Err(code),
-        None => Ok(steps),
+        if running.is_empty() && more.is_none() {
+            return fatal.map_or(Ok(()), Err);
+        }
+        let asked = more.is_some();
+        let answer = async {
+            match more.as_mut() {
+                Some(claim) => claim.await,
+                None => std::future::pending().await,
+            }
+        };
+        let wait = async {
+            match due {
+                true => tokio::time::sleep_until(next_claim).await,
+                false => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            claimed = answer, if asked => {
+                more = None;
+                // A refused or failed claim for more just waits a second: the tasks in hand
+                // say soon enough if something is wrong.
+                match claimed.ok().flatten() {
+                    // No longer wanted (a stop, a failure): straight back to the server.
+                    Some((index, task)) if fatal.is_some() || *cancel.borrow() => {
+                        let _ = transport
+                            .fail(&task, WorkerFailure::Cancelled, qualifications[index])
+                            .await;
+                    }
+                    Some((index, task)) => {
+                        on_claim(&task);
+                        in_hand.fetch_add(1, Ordering::AcqRel);
+                        running.push(work(index, task, cancel.clone()));
+                    }
+                    None => next_claim = tokio::time::Instant::now() + Duration::from_secs(1),
+                }
+            }
+            Some((model, step)) = running.next(), if !running.is_empty() => match step {
+                Ok(step) => match on_step(TaskStep { model: Some(model), step }) {
+                    Some(pause) => next_claim = next_claim.max(tokio::time::Instant::now() + pause),
+                    None => claiming = false,
+                },
+                Err(code) => {
+                    fatal.get_or_insert(code);
+                }
+            },
+            _ = wait => {}
+        }
     }
 }
 /// One claimed task, from its input to an acknowledged result.
@@ -443,18 +506,20 @@ where
         inferring: false,
     };
     let now = || transport.now();
-    let input = race_prediction(
-        transport.input(task, qualification),
-        std::future::pending(),
-        cancel,
-        execution_duration(task, now().map_err(idle)?).map_err(idle)?,
-    )
-    .await
-    .map_err(idle)?;
     let duration = execution_duration(task, now().map_err(idle)?).map_err(idle)?;
     let lease = std::sync::Mutex::new(task.clone());
+    // Whether the model has been given the input: only then is something still running in the
+    // process when the task is given up.
+    let predicting = std::sync::atomic::AtomicBool::new(false);
+    // The lease is kept alive from the claim on, while the input is fetched as well: with
+    // several tasks in hand on a slow link, an input can take longer than a lease lasts.
     let value = race_prediction(
-        predict(input),
+        async {
+            let held = lease.lock().unwrap().clone();
+            let input = transport.input(&held, qualification).await?;
+            predicting.store(true, std::sync::atomic::Ordering::Release);
+            predict(input).await
+        },
         hold_lease(
             || async {
                 let mut next = lease.lock().unwrap().clone();
@@ -474,7 +539,7 @@ where
     .await
     .map_err(|code| TaskFailure {
         code,
-        inferring: true,
+        inferring: predicting.load(std::sync::atomic::Ordering::Acquire),
     })?;
     // Report under the last lease the server granted; `complete` refuses one that has run out.
     let held = lease.lock().unwrap().clone();
@@ -491,19 +556,28 @@ where
     }
     Ok(())
 }
+/// `crash_reported`: shared by the tasks in hand together. When the runtime process ends
+/// under several of them, one is reported as `model-unavailable` and the rest are handed back
+/// as `cancelled`: it was one failure of the runtime, and the server, which withdraws a model
+/// after three failed tasks in a row, must count it as one.
 async fn settle(
     transport: &WorkerTransport,
     task: &ClaimedTask,
     qualification: &AcceptedQualification,
     outcome: Result<(), TaskFailure>,
+    crash_reported: &std::sync::atomic::AtomicBool,
 ) -> Result<Step, String> {
     let Err(failure) = outcome else {
         return Ok(Step::Completed);
     };
     if !lease_gone(&failure.code) {
-        let _ = transport
-            .fail(task, failure_report(&failure.code), qualification)
-            .await;
+        let mut report = failure_report(&failure.code);
+        if matches!(report, WorkerFailure::ModelUnavailable)
+            && crash_reported.swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            report = WorkerFailure::Cancelled;
+        }
+        let _ = transport.fail(task, report, qualification).await;
     }
     if task_scoped(&failure.code) {
         Ok(Step::Dropped(failure.code))
@@ -528,11 +602,14 @@ where
         Err(step) => return Ok(step),
     };
     let outcome = run_claimed(transport, &task, qualifications[index], cancel, predict).await;
-    settle(transport, &task, qualifications[index], outcome).await
+    let alone = std::sync::atomic::AtomicBool::new(false);
+    settle(transport, &task, qualifications[index], outcome, &alone).await
 }
-/// As the worker with room for `slots` tasks at once, with the local model replaced.
+/// As the worker with room for `slots` tasks at once, with the local model replaced: works
+/// until the server has nothing more, and returns what became of each task in the order they
+/// were settled.
 #[cfg(test)]
-pub(crate) async fn steps_with<F, P>(
+pub(crate) async fn pool_with<F, P>(
     transport: &WorkerTransport,
     qualifications: &[&AcceptedQualification],
     cancel: &mut watch::Receiver<bool>,
@@ -543,14 +620,21 @@ where
     F: Fn(Vec<u8>) -> P,
     P: Future<Output = Result<Value, String>>,
 {
-    let claimed = match claim_batch(transport, qualifications, cancel, slots).await? {
-        Ok(claimed) => claimed,
-        Err(step) => return Ok(vec![step]),
+    let mut steps = Vec::new();
+    let pool = Pool {
+        slots: &|| slots,
+        keep_claiming: &|| true,
+        abandon: &|| {},
+    };
+    let heard = |task: TaskStep| {
+        if task.model.is_some() {
+            steps.push(task.step);
+        }
+        Some(Duration::ZERO)
     };
     let run = |_, _, input| predict(input);
-    let outcomes = run_batch(transport, qualifications, cancel, &claimed, run).await;
-    let steps = settle_batch(transport, qualifications, &claimed, outcomes).await?;
-    Ok(steps.into_iter().map(|task| task.step).collect())
+    run_pool(transport, qualifications, cancel, &pool, |_| {}, heard, run).await?;
+    Ok(steps)
 }
 
 /// How long every runtime process may take to answer its first health check.
@@ -832,11 +916,22 @@ impl NativePredictor {
         qualifications: &[&AcceptedQualification],
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<bool, String> {
-        let mut steps = self
-            .execute_next_with_activity(transport, qualifications, cancel, None, |_| {})
+        // One task, then back to this owner.
+        let claimed = std::sync::atomic::AtomicBool::new(false);
+        let mut done = None;
+        let pool = Pool {
+            slots: &|| None,
+            keep_claiming: &|| !claimed.load(std::sync::atomic::Ordering::Acquire),
+            abandon: &|| {},
+        };
+        let on_claim = |_: &str| claimed.store(true, std::sync::atomic::Ordering::Release);
+        let on_step = |task: TaskStep| {
+            done = Some(task.step);
+            None
+        };
+        self.work(transport, qualifications, cancel, &pool, on_claim, on_step)
             .await?;
-        // One task at a time here: one step.
-        match steps.pop().map(|task| task.step) {
+        match done {
             Some(Step::Completed) => Ok(true),
             Some(Step::Idle) | None => Ok(false),
             // This owner has no way to carry on after a dropped task: it ends with the error.
@@ -846,21 +941,23 @@ impl NativePredictor {
             }
         }
     }
-    pub(crate) async fn execute_next_with_activity(
+    /// Work on tasks until the pool ends (`run_pool`). An error stops the runtime processes.
+    pub(crate) async fn work(
         &mut self,
         transport: &WorkerTransport,
         qualifications: &[&AcceptedQualification],
         cancel: &mut watch::Receiver<bool>,
-        slots: Option<u32>,
+        pool: &Pool<'_>,
         on_claim: impl FnMut(&str),
-    ) -> Result<Vec<TaskStep>, String> {
+        on_step: impl FnMut(TaskStep) -> Option<Duration>,
+    ) -> Result<(), String> {
         let mut active = ActiveExecution {
             predictor: self,
             retain: false,
         };
         let outcome = active
             .predictor
-            .execute(transport, qualifications, cancel, slots, on_claim)
+            .execute(transport, qualifications, cancel, pool, on_claim, on_step)
             .await;
         if outcome.is_err() {
             active.predictor.stop()?;
@@ -868,16 +965,15 @@ impl NativePredictor {
         active.retain = true;
         outcome
     }
-    /// Claim what there is room for (`slots`; `None` is one task, as before a server offered
-    /// several leases) and run it side by side.
     async fn execute(
         &mut self,
         transport: &WorkerTransport,
         qualifications: &[&AcceptedQualification],
         cancel: &mut watch::Receiver<bool>,
-        slots: Option<u32>,
+        pool: &Pool<'_>,
         mut on_claim: impl FnMut(&str),
-    ) -> Result<Vec<TaskStep>, String> {
+        on_step: impl FnMut(TaskStep) -> Option<Duration>,
+    ) -> Result<(), String> {
         if self.roles.len() != qualifications.len()
             || self
                 .roles
@@ -888,29 +984,39 @@ impl NativePredictor {
             return Err("worker_predictor_qualification_changed".into());
         }
         self.ready(cancel).await?;
-        let claimed = match claim_batch(transport, qualifications, cancel, slots).await? {
-            Ok(claimed) => claimed,
-            Err(step) => return Ok(TaskStep::unclaimed(step)),
-        };
-        for (_, task) in &claimed {
-            if let Some((workload, _)) = task.model_key.split_once(':') {
-                on_claim(workload);
-            }
-        }
         let roles = &self.roles;
         // Shared by the tasks in hand: each checks its own process after its prediction.
         let children = std::sync::Mutex::new(&mut self.children);
-        let outcomes = run_batch(
+        // Set when this owner stops the processes itself: that is not a process to blame.
+        let stopped_here = std::sync::atomic::AtomicBool::new(false);
+        let abandon = || {
+            stopped_here.store(true, std::sync::atomic::Ordering::Release);
+            for lane in children.lock().unwrap().iter_mut() {
+                let _ = lane.child.stop();
+            }
+        };
+        let pool = Pool {
+            slots: pool.slots,
+            keep_claiming: pool.keep_claiming,
+            abandon: &abandon,
+        };
+        let outcome = run_pool(
             transport,
             qualifications,
             cancel,
-            &claimed,
+            &pool,
+            |task| {
+                if let Some((workload, _)) = task.model_key.split_once(':') {
+                    on_claim(workload);
+                }
+            },
+            on_step,
             |index, task, input| {
                 let (role, children) = (&roles[index], &children);
                 async move {
                     let value = role
                         .client
-                        .predict(task, &input, transport.now()?)
+                        .predict(&task, &input, transport.now()?)
                         .await
                         // The local model refused this one input; the process itself is still serving.
                         .map_err(|code| match code.starts_with("server_http_") {
@@ -926,23 +1032,13 @@ impl NativePredictor {
         )
         .await;
         drop(children);
-        for ((index, _), outcome) in claimed.iter().zip(&outcomes) {
-            if outcome.is_err() {
-                // Before this owner stops anything itself.
-                self.blame_exited(self.roles[*index].lane);
+        // A process that is gone without this owner having stopped it ended by itself.
+        if !stopped_here.load(std::sync::atomic::Ordering::Acquire) {
+            for lane in 0..self.children.len() {
+                self.blame_exited(lane);
             }
         }
-        // A prediction given up on is still running in the process. With one task in hand the
-        // process is stopped before the server is told, as it always was. With several, it is
-        // stopped only when every one of them was given up (a stop, a pause): one task's late
-        // deadline or lost lease must not end the others' work.
-        let abandoned = |outcome: &Result<(), TaskFailure>| {
-            outcome.as_ref().is_err_and(|failure| failure.inferring)
-        };
-        if outcomes.iter().all(abandoned) {
-            self.stop()?;
-        }
-        settle_batch(transport, qualifications, &claimed, outcomes).await
+        outcome
     }
 }
 
