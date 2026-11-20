@@ -227,6 +227,9 @@ lease".
       to 8 hours. **Retry Setup** tries it at once. Earlier versions remembered such a crash
       on disk as lastingly as a failed check: that record is ignored from now on, so a
       computer moved to the processor by it tries its graphics card again.
+    - When the graphics card is resting and nothing else qualifies either (the processor
+      fails its own check for the only task), AI processing does not stop for good: the
+      reason is shown while it waits, and at the end of the rest it sets up again.
     - Unchanged: a provider that fails its check (a different answer on the test picture, a
       signature or runtime the server does not accept, slower than the processor) is
       remembered for that runtime and device until a newer runtime or Retry Setup. A runtime

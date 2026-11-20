@@ -611,18 +611,35 @@ fn crashed_out(crash: Option<AfterCrash>, code: String) -> String {
 /// with its failure is never settled and stays counted: after a crash this is how many the
 /// runtime was working on.
 #[derive(Default)]
-struct InHand(std::sync::atomic::AtomicU32);
+struct InHand {
+    now: std::sync::atomic::AtomicU32,
+    /// How many were in hand when a task was last dropped, until a task is claimed or
+    /// finished again. While a crash is being reported another task in hand can be dropped
+    /// for a reason of its own (its deadline): it was still one of the tasks the runtime
+    /// was working on when it ended.
+    at_drop: std::sync::atomic::AtomicU32,
+}
 impl InHand {
     fn claimed(&self) {
-        self.0.fetch_add(1, Ordering::AcqRel);
+        self.now.fetch_add(1, Ordering::AcqRel);
+        self.at_drop.store(0, Ordering::Release);
     }
     fn settled(&self, task: &crate::native_predictor::TaskStep) {
-        if task.model.is_some() {
-            self.0.fetch_sub(1, Ordering::AcqRel);
+        if task.model.is_none() {
+            return;
+        }
+        let before = self.now.fetch_sub(1, Ordering::AcqRel);
+        match task.step {
+            crate::native_predictor::Step::Dropped(_) => {
+                self.at_drop.fetch_max(before, Ordering::AcqRel);
+            }
+            _ => self.at_drop.store(0, Ordering::Release),
         }
     }
     fn count(&self) -> u32 {
-        self.0.load(Ordering::Acquire)
+        self.now
+            .load(Ordering::Acquire)
+            .max(self.at_drop.load(Ordering::Acquire))
     }
 }
 /// The pool ended because the runtime ended or stopped answering: what comes next, with the
@@ -858,6 +875,10 @@ async fn cancellable<T>(
 async fn restart_wait(crashes: u32, cancel: &AtomicBool) -> Result<(), String> {
     let wait = reconnect_delay(crashes, rand::random());
     hold_off(Some(tokio::time::Instant::now() + wait), cancel).await
+}
+/// How long the accelerated runtime's rest still has to run, if it is resting.
+fn rest_left(ends: Option<std::time::Instant>) -> Option<Duration> {
+    ends.map(|due| due.saturating_duration_since(std::time::Instant::now()))
 }
 /// Wait out what is left of a pause before the next claim; a stop ends the wait.
 async fn hold_off(until: Option<tokio::time::Instant>, cancel: &AtomicBool) -> Result<(), String> {
@@ -2033,7 +2054,19 @@ async fn prepare_on(
         if prepared.is_empty() {
             // The server offered work but none qualified here: say why (wrong answer, out of
             // memory, server refusal…), a fault Retry Setup can clear, not a server setting.
-            return Err(first_failure(&progress.status.lock().unwrap().workloads));
+            let failure = first_failure(&progress.status.lock().unwrap().workloads);
+            // A graphics card resting after crashes is still owed its next try: wait for
+            // it with the reason shown, then set up again, instead of stopping for good.
+            if let Some(wait) = rest_left(plan.rest_ends()) {
+                progress.set("reconnecting", Some(failure));
+                hold_off(
+                    Some(tokio::time::Instant::now() + wait),
+                    &progress.cancelled,
+                )
+                .await?;
+                return Err("worker_models_changed".into());
+            }
+            return Err(failure);
         }
         let mut memory_by_cache = std::collections::BTreeMap::new();
         for (profile, cache) in accepted_profiles.iter().zip(&accepted_caches) {
@@ -4570,6 +4603,35 @@ mod tests {
         assert_eq!(
             out(last.0, "worker_execution_deadline"),
             "runtime_process_stopped"
+        );
+        // Two in hand when the runtime ended; while the crash was being reported the other
+        // task was dropped for its own deadline. Still judged as two, until work goes on.
+        let (in_hand, step) = (InHand::default(), |step| {
+            crate::native_predictor::TaskStep {
+                model: Some("clip".into()),
+                step,
+                reported: true,
+            }
+        });
+        in_hand.claimed();
+        in_hand.claimed();
+        in_hand.settled(&step(Step::Dropped("worker_execution_deadline".into())));
+        assert_eq!(in_hand.count(), 2);
+        in_hand.claimed();
+        assert_eq!(in_hand.count(), 2);
+        in_hand.settled(&step(Step::Completed));
+        in_hand.settled(&step(Step::Dropped("worker_execution_deadline".into())));
+        assert_eq!(in_hand.count(), 1);
+        in_hand.claimed();
+        in_hand.settled(&step(Step::Completed));
+        assert_eq!(in_hand.count(), 0);
+        // A resting graphics card is owed its next try even when nothing else can run.
+        assert_eq!(rest_left(None), None);
+        let soon = std::time::Instant::now() + Duration::from_secs(60);
+        assert!(rest_left(Some(soon)).is_some_and(|left| left <= Duration::from_secs(60)));
+        assert_eq!(
+            rest_left(Some(std::time::Instant::now())),
+            Some(Duration::ZERO)
         );
         // The processor's own runtime has nowhere to fall back to. One task at a time from
         // the start: failing at the first crash, counted by the restarts, as it always was.
