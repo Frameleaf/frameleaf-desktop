@@ -24,14 +24,18 @@ pub(crate) fn client_builder() -> ClientBuilder {
 }
 
 pub(crate) fn streaming_client_builder() -> ClientBuilder {
-    let builder = Client::builder();
     // A proxy would look a plain-HTTP home name up itself, and be handed the request, without
     // this app checking where it leads. A home server is reached directly.
-    let builder = match crate::connection::plain_http_names_in_use() {
-        true => builder.no_proxy(),
-        false => builder,
-    };
-    builder
+    match crate::connection::plain_http_names_in_use() {
+        true => public_client_builder().no_proxy(),
+        false => public_client_builder(),
+    }
+}
+
+/// For Frameleaf's own download hosts (the model mirror, the release host), never a person's
+/// server: always through the system's proxy settings, whatever server is in use.
+pub(crate) fn public_client_builder() -> ClientBuilder {
+    Client::builder()
         // Operating-system roots are loaded only for Manager's system-trust option.
         .tls_built_in_native_certs(false)
         .redirect(reqwest::redirect::Policy::none())

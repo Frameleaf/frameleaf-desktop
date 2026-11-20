@@ -611,9 +611,15 @@ impl Connection {
         let Ok(Ok(response)) = asked.await else {
             return Err("worker_request_interrupted".into());
         };
-        // A server that sends no `Date` gives nothing better to go by: keep the difference.
-        let skew = transport::clock_skew(&response).unwrap_or(self.clock.skew_ms());
-        self.clock.set(skew);
+        match transport::clock_skew(&response) {
+            Some(skew) => self.clock.set(skew),
+            // No usable `Date`, and no correction was in use: this computer's clock is all
+            // there is to go by, as it was before.
+            None if self.clock.skew_ms() == 0 => self.clock.set(0),
+            // A correction was in use and can't be confirmed (a proxy's page, a broken
+            // header): judge nothing by it; ask again on the next call.
+            None => return Err("worker_request_interrupted".into()),
+        }
         Ok(())
     }
     async fn ensure_current(&mut self) -> Result<(), String> {

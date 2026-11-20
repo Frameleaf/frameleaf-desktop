@@ -58,6 +58,8 @@ struct State {
     failures: Vec<String>,
     /// Devices the server has withdrawn the model from.
     withdrawn: HashSet<String>,
+    /// Answer without a `Date` header (a proxy's page, a broken server).
+    dateless: bool,
     /// Every authenticated request's path, in the order the server handled it.
     handled: Vec<String>,
 }
@@ -293,11 +295,15 @@ fn serve(mut stream: TcpStream, state: &StdMutex<State>) -> Option<()> {
             .now()
             .format(&time::format_description::well_known::Rfc2822)
             .unwrap();
+        let date = match state.dateless {
+            true => String::new(),
+            false => format!("Date: {date}\r\n"),
+        };
         (status, body, date)
     };
     // As every real server: the response says what time the server thinks it is.
     let head = format!(
-        "HTTP/1.1 {status} Fixture\r\nDate: {date}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} Fixture\r\n{date}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes()).ok()?;
@@ -433,6 +439,10 @@ impl FakeServer {
     /// Put the server's clock this many seconds ahead of this computer's (negative: behind).
     pub(crate) fn set_clock_offset(&self, seconds: i64) {
         self.state.lock().unwrap().clock_offset = seconds;
+    }
+    /// Answer without a `Date` header from now on.
+    pub(crate) fn without_date(&self, dateless: bool) {
+        self.state.lock().unwrap().dateless = dateless;
     }
     /// As the server after three failed tasks in a row: withdraw the model from this device.
     pub(crate) fn withdraw_model(&self, device: &Device) {
@@ -802,6 +812,34 @@ async fn after_this_computers_clock_moves_the_server_time_is_read_again_before_a
     assert_eq!(result, Ok(true));
     assert!(!worker.1.suspect());
     assert_eq!(worker.1.skew_ms(), 0);
+
+    // An answer with no `Date` can't confirm a correction that was in use: nothing is judged
+    // by it, and the next call asks again.
+    server.queue(&device, 1);
+    worker.1.set(3_600_000);
+    worker.1.set_back_an_hour_ago();
+    server.without_date(true);
+    assert_eq!(
+        worker.claim_many(&[&qualification]).await.err().as_deref(),
+        Some("worker_request_interrupted")
+    );
+    assert!(worker.1.suspect());
+    server.without_date(false);
+    assert!(worker
+        .claim_many(&[&qualification])
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(worker.1.skew_ms(), 0);
+    // With no correction in use, a server that never sends `Date` is worked with as before.
+    worker.1.set_back_an_hour_ago();
+    server.without_date(true);
+    assert!(worker
+        .claim_many(&[&qualification])
+        .await
+        .unwrap()
+        .is_none());
+    server.without_date(false);
 
     // When the server can't be asked, nothing is judged by a difference that may not hold: the
     // call fails like any request that did not get through, not as an expired qualification.

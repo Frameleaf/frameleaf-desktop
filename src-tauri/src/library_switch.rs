@@ -391,6 +391,9 @@ pub(crate) async fn add_approved_library(
     }
     let previous = current_connection(&active, &window)?;
     let mut approved = index()?;
+    // Taken into use before its client is built: a plain-HTTP home name is held to the home
+    // network, and reached directly, from the first request (which carries the password).
+    let _ = crate::connection::normalize_server(&server);
     let client = crate::transport::client()?;
     let (base, login) =
         crate::request_login(&client, &server, &email, password, &device_name, || {

@@ -1373,6 +1373,11 @@ async fn prepare_on(
         })
     });
     progress.set("preparing-models", None);
+    // The model mirror is Frameleaf's host, not the person's server: its own client.
+    let mirror = transport::public_client_builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|_| "network_client_unavailable")?;
     // Complete acquisition before requesting short-lived nonces.
     let mut caches = Vec::new();
     for profile in &profiles {
@@ -1384,7 +1389,7 @@ async fn prepare_on(
             let result = acquisition(
                 profile.prepare_cache(
                     &paths.data.join("models"),
-                    &client,
+                    &mirror,
                     &progress.cancelled,
                     allow_download,
                     |event| {
