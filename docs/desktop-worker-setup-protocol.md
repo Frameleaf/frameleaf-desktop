@@ -225,7 +225,7 @@ lease".
 - **Each task is reported as soon as it is done**, its result or its failure, without waiting
   for the others in hand.
 - **A runtime that ends under several tasks is one failure.** One of the tasks in hand is
-  reported `model-unavailable` first, and only then are the others handed back `cancelled`, so the server's
+  reported `model-unavailable` and the others are handed back `cancelled`, so the server's
   count toward withdrawing the model goes up by one, not by the number of tasks. If that one
   report does not arrive it is sent once more, and failing that the next task still in hand
   carries it, so the crash is not counted as nothing. This is a
@@ -312,9 +312,10 @@ revision's key. `task.qualificationId` is the desktop's current qualification fo
     `cancelled` for the rest. The server does not group failures by time or by lease: three
     tasks each reported as failed are three failures and withdraw the model. The tasks handed
     back after a `model-unavailable`, with no new lease of that model in between, are part of
-    that failure and are not counted as a hand-back. The desktop therefore reports
-    `model-unavailable` first and the `cancelled` ones after it has been sent: in the other
-    order the first `cancelled` is counted as a hand-back.
+    that failure and are not counted as a hand-back. The order of the reports does not
+    change the failures: reported the other way round, the first `cancelled` is a hand-back,
+    and if it is past the five and so a failure, the `model-unavailable` after it adds
+    nothing.
   - **Handing work back.** `cancelled` puts the task straight back in line and is not a
     failure. Hand-backs with no new lease of that model taken in between are one hand-back,
     below the five and above them, so a stop, pause or crash with any number of leases counts
