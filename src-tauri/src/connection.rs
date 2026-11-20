@@ -193,6 +193,29 @@ pub(crate) fn leads_home_now(base: &Url) -> bool {
         .is_some_and(|(at, home)| *home && at.elapsed() < RECENT)
 }
 
+/// Before Photos is opened: when this app's own connections have not seen a plain-HTTP name
+/// lead home lately (a computer that only shows photos sends nothing for hours), look it up
+/// now, off the thread that asked, so `leads_home_now` answers from what is true now.
+pub(crate) async fn refresh_home(base: &Url) {
+    if leads_home_now(base) {
+        return;
+    }
+    let Some(name) = looked_up_name(base) else {
+        return;
+    };
+    let asked = name.clone();
+    if let Ok(found) = tokio::task::spawn_blocking(move || look_up(&asked)).await {
+        looked_up_now(name, found);
+    }
+}
+/// A name that can't be found right now says nothing new: what was last seen stands.
+fn looked_up_now(name: String, found: Leads) {
+    if found != Leads::Unknown {
+        let seen = (std::time::Instant::now(), found == Leads::Home);
+        LAST_SEEN.lock().unwrap().insert(name, seen);
+    }
+}
+
 /// The resolver of every client that talks to a server (`transport::streaming_client_builder`).
 pub(crate) struct HomeResolver;
 impl reqwest::dns::Resolve for HomeResolver {
@@ -705,6 +728,26 @@ mod local_http_tests {
         assert!(leads_home_now(&photos));
         assert!(home_addresses("nas.split.test", addresses(&["203.0.113.7"])).is_err());
         assert!(!leads_home_now(&photos));
+        // Idle for longer than ten minutes: what was seen no longer counts, a name that can't
+        // be found changes nothing, and a fresh look that leads home opens Photos again.
+        let long_ago = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(601));
+        if let Some(long_ago) = long_ago {
+            let idle = Url::parse("http://nas.idle.test:2283").unwrap();
+            let seen = |at, home| {
+                LAST_SEEN
+                    .lock()
+                    .unwrap()
+                    .insert("nas.idle.test".into(), (at, home))
+            };
+            seen(long_ago, true);
+            assert!(!leads_home_now(&idle));
+            looked_up_now("nas.idle.test".into(), Leads::Unknown);
+            assert!(!leads_home_now(&idle));
+            looked_up_now("nas.idle.test".into(), Leads::Home);
+            assert!(leads_home_now(&idle));
+            looked_up_now("nas.idle.test".into(), Leads::Elsewhere);
+            assert!(!leads_home_now(&idle));
+        }
         // A plain-HTTP name never connected to does not lead home; other servers are not asked.
         assert!(!leads_home_now(
             &Url::parse("http://nas.fritz.invalid:2283").unwrap()

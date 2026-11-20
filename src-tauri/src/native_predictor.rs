@@ -347,6 +347,9 @@ pub(crate) struct TaskStep {
     /// The model key of the task; `None` when nothing was claimed.
     pub model: Option<String>,
     pub step: Step,
+    /// The server acknowledged the failure report of a dropped task: only then has it counted
+    /// the failure toward withdrawing the model.
+    pub reported: bool,
 }
 /// How the worker steers the pool of tasks in hand.
 pub(crate) struct Pool<'a> {
@@ -372,7 +375,7 @@ pub(crate) struct Pool<'a> {
 /// - A failure that is not one task's alone ends the claiming; the other tasks in hand are
 ///   still settled, and the failure is returned when they are.
 /// - The pool ends when nothing was there to claim, or nothing is in hand and claiming stopped.
-async fn run_pool<F, P>(
+pub(crate) async fn run_pool<F, P>(
     transport: &WorkerTransport,
     qualifications: &[&AcceptedQualification],
     cancel: &mut watch::Receiver<bool>,
@@ -388,17 +391,24 @@ where
     use futures_util::{stream::FuturesUnordered, StreamExt};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let (in_hand, crash_reported) = (AtomicUsize::new(0), AtomicBool::new(false));
-    let (in_hand, crash_reported, predict) = (&in_hand, &crash_reported, &predict);
+    // The runtime was stopped under an abandoned prediction: nothing more is started on it.
+    let stopped = AtomicBool::new(false);
+    let (in_hand, crash_reported, stopped, predict) =
+        (&in_hand, &crash_reported, &stopped, &predict);
     // One task in hand, from its input to the server hearing what became of it.
     let work = |index: usize, task: ClaimedTask, mut cancel: watch::Receiver<bool>| async move {
         let qualification = qualifications[index];
-        let run = |input| predict(index, task.clone(), input);
+        let run = |held, input| predict(index, held, input);
         let outcome = run_claimed(transport, &task, qualification, &mut cancel, run).await;
         // A prediction given up on is still running in the process. With this the only task
         // in hand, the process is stopped before the server is told, as it always was; one
         // task's late deadline must not end the others' work.
-        let abandoned = outcome.as_ref().is_err_and(|failure| failure.inferring);
+        // A refusal is the model's answer: nothing is left running, and the process serves on.
+        let abandoned = outcome.as_ref().is_err_and(|failure| {
+            failure.inferring && failure.code != "runtime_prediction_refused"
+        });
         if abandoned && in_hand.load(Ordering::Acquire) == 1 {
+            stopped.store(true, Ordering::Release);
             (pool.abandon)();
         }
         let step = settle(transport, &task, qualification, outcome, crash_reported).await;
@@ -415,20 +425,33 @@ where
     loop {
         let slots = (pool.slots)();
         let room = slots.unwrap_or(1).saturating_sub(running.len() as u32);
-        claiming &= fatal.is_none() && (pool.keep_claiming)() && !*cancel.borrow();
+        claiming &= fatal.is_none()
+            && (pool.keep_claiming)()
+            && !*cancel.borrow()
+            && !stopped.load(Ordering::Acquire);
         let due = claiming && room > 0 && more.is_none();
         if due && tokio::time::Instant::now() >= next_claim {
             if running.is_empty() {
                 // Nothing in hand: wait for work, as one always did.
                 let room = slots.map(|_| room);
                 match next_task(transport, qualifications, cancel, room).await? {
+                    // The owner stopped wanting tasks while the claim waited (a pause).
+                    Ok((index, task)) if !(pool.keep_claiming)() => {
+                        let _ = transport
+                            .fail(&task, WorkerFailure::Cancelled, qualifications[index])
+                            .await;
+                    }
                     Ok((index, task)) => {
                         on_claim(&task);
                         in_hand.fetch_add(1, Ordering::AcqRel);
                         running.push(work(index, task, cancel.clone()));
                     }
                     Err(step) => {
-                        on_step(TaskStep { model: None, step });
+                        on_step(TaskStep {
+                            model: None,
+                            step,
+                            reported: false,
+                        });
                         return Ok(());
                     }
                 }
@@ -440,7 +463,9 @@ where
                 0,
             )));
         }
-        if running.is_empty() && more.is_none() {
+        // Nothing in hand and nothing asked for: done, unless the next claim is only being
+        // held off after a dropped task, which is waited out here.
+        if running.is_empty() && more.is_none() && !due {
             return fatal.map_or(Ok(()), Err);
         }
         let asked = more.is_some();
@@ -452,7 +477,11 @@ where
         };
         let wait = async {
             match due {
-                true => tokio::time::sleep_until(next_claim).await,
+                // In steps of a second, so a pause or a stop is seen while holding off.
+                true => {
+                    let step = tokio::time::Instant::now() + Duration::from_secs(1);
+                    tokio::time::sleep_until(next_claim.min(step)).await
+                }
                 false => std::future::pending().await,
             }
         };
@@ -462,8 +491,14 @@ where
                 // A refused or failed claim for more just waits a second: the tasks in hand
                 // say soon enough if something is wrong.
                 match claimed.ok().flatten() {
-                    // No longer wanted (a stop, a failure): straight back to the server.
-                    Some((index, task)) if fatal.is_some() || *cancel.borrow() => {
+                    // No longer wanted (a stop, a pause, a failure, the runtime stopped):
+                    // straight back to the server, its input never fetched.
+                    Some((index, task))
+                        if fatal.is_some()
+                            || *cancel.borrow()
+                            || stopped.load(Ordering::Acquire)
+                            || !(pool.keep_claiming)() =>
+                    {
                         let _ = transport
                             .fail(&task, WorkerFailure::Cancelled, qualifications[index])
                             .await;
@@ -477,7 +512,7 @@ where
                 }
             }
             Some((model, step)) = running.next(), if !running.is_empty() => match step {
-                Ok(step) => match on_step(TaskStep { model: Some(model), step }) {
+                Ok((step, reported)) => match on_step(TaskStep { model: Some(model), step, reported }) {
                     Some(pause) => next_claim = next_claim.max(tokio::time::Instant::now() + pause),
                     None => claiming = false,
                 },
@@ -498,7 +533,7 @@ async fn run_claimed<F, P>(
     predict: F,
 ) -> Result<(), TaskFailure>
 where
-    F: FnOnce(Vec<u8>) -> P,
+    F: FnOnce(ClaimedTask, Vec<u8>) -> P,
     P: Future<Output = Result<Value, String>>,
 {
     let idle = |code: String| TaskFailure {
@@ -518,7 +553,10 @@ where
             let held = lease.lock().unwrap().clone();
             let input = transport.input(&held, qualification).await?;
             predicting.store(true, std::sync::atomic::Ordering::Release);
-            predict(input).await
+            // Under the lease as the heartbeat last renewed it: a slow input can outlast
+            // the expiry the claim came with.
+            let held = lease.lock().unwrap().clone();
+            predict(held, input).await
         },
         hold_lease(
             || async {
@@ -566,10 +604,11 @@ async fn settle(
     qualification: &AcceptedQualification,
     outcome: Result<(), TaskFailure>,
     crash_reported: &std::sync::atomic::AtomicBool,
-) -> Result<Step, String> {
+) -> Result<(Step, bool), String> {
     let Err(failure) = outcome else {
-        return Ok(Step::Completed);
+        return Ok((Step::Completed, false));
     };
+    let mut reported = false;
     if !lease_gone(&failure.code) {
         let mut report = failure_report(&failure.code);
         if matches!(report, WorkerFailure::ModelUnavailable)
@@ -577,10 +616,10 @@ async fn settle(
         {
             report = WorkerFailure::Cancelled;
         }
-        let _ = transport.fail(task, report, qualification).await;
+        reported = transport.fail(task, report, qualification).await == Ok(true);
     }
     if task_scoped(&failure.code) {
-        Ok(Step::Dropped(failure.code))
+        Ok((Step::Dropped(failure.code), reported))
     } else {
         Err(failure.code)
     }
@@ -601,9 +640,11 @@ where
         Ok(claimed) => claimed,
         Err(step) => return Ok(step),
     };
-    let outcome = run_claimed(transport, &task, qualifications[index], cancel, predict).await;
+    let run = |_, input| predict(input);
+    let outcome = run_claimed(transport, &task, qualifications[index], cancel, run).await;
     let alone = std::sync::atomic::AtomicBool::new(false);
-    settle(transport, &task, qualifications[index], outcome, &alone).await
+    let settled = settle(transport, &task, qualifications[index], outcome, &alone).await;
+    settled.map(|(step, _)| step)
 }
 /// As the worker with room for `slots` tasks at once, with the local model replaced: works
 /// until the server has nothing more, and returns what became of each task in the order they

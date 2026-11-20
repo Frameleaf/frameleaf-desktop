@@ -434,8 +434,7 @@ fn local_capacity(
     model_memory: u64,
 ) -> u32 {
     let per_task = (model_memory / 4).max(256 * 1024 * 1024);
-    let by_memory =
-        available_memory.map_or(1, |free| 1 + free.saturating_sub(model_memory) / per_task);
+    let by_memory = available_memory.map_or(1, |free| free.saturating_sub(model_memory) / per_task);
     let by_device = if accelerated {
         8
     } else {
@@ -2044,7 +2043,8 @@ async fn prepare_on(
                         }
                         // By now the server has withdrawn the model and will lease nothing
                         // for it: stop claiming and qualify again, which grants it again.
-                        requalify |= strikes.failed(task.model.as_deref(), &code);
+                        // Only a failure the server acknowledged was counted there.
+                        requalify |= task.reported && strikes.failed(task.model.as_deref(), &code);
                         dropped = Some(code);
                         (!requalify).then(|| failures.dropped().0)
                     }
@@ -3758,33 +3758,45 @@ mod tests {
             AtomicUsize::new(0),
         );
         let (slow_running, refilled) = (AtomicBool::new(false), AtomicBool::new(false));
-        let steps = pool_with(
-            &worker,
-            &[&qualification],
-            &mut cancel,
-            Some(3),
-            |_| async {
-                let now = running.fetch_add(1, Ordering::AcqRel) + 1;
-                most.fetch_max(now, Ordering::AcqRel);
-                // The first task is slow; the others are quick.
-                let order = started.fetch_add(1, Ordering::AcqRel);
-                if order == 0 {
+        // The first task is held until both replacements have started; the second and third
+        // are held until all three are at work.
+        let (slow, quick) = (
+            tokio::sync::Semaphore::new(0),
+            tokio::sync::Semaphore::new(0),
+        );
+        let quals = [&qualification];
+        let work = pool_with(&worker, &quals, &mut cancel, Some(3), |_| async {
+            let now = running.fetch_add(1, Ordering::AcqRel) + 1;
+            most.fetch_max(now, Ordering::AcqRel);
+            match started.fetch_add(1, Ordering::AcqRel) {
+                0 => {
                     slow_running.store(true, Ordering::Release);
-                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    slow.acquire().await.unwrap().forget();
                     slow_running.store(false, Ordering::Release);
-                } else {
-                    // A fourth or fifth task started while the slow one was still at work.
-                    if order >= 3 && slow_running.load(Ordering::Acquire) {
+                }
+                order @ 1..=2 => {
+                    if order == 2 {
+                        quick.add_permits(2);
+                    }
+                    quick.acquire().await.unwrap().forget();
+                }
+                // A fourth and fifth task started while the slow one was still at work.
+                order => {
+                    if slow_running.load(Ordering::Acquire) {
                         refilled.store(true, Ordering::Release);
                     }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if order == 4 {
+                        slow.add_permits(1);
+                    }
                 }
-                running.fetch_sub(1, Ordering::AcqRel);
-                Ok(serde_json::json!({}))
-            },
-        )
-        .await
-        .unwrap();
+            }
+            running.fetch_sub(1, Ordering::AcqRel);
+            Ok(serde_json::json!({}))
+        });
+        let steps = tokio::time::timeout(Duration::from_secs(20), work)
+            .await
+            .expect("a free place was not refilled")
+            .unwrap();
         // Room for three: never more than three at once, and all five done.
         assert_eq!(steps, [const { Step::Completed }; 5]);
         assert_eq!(most.load(Ordering::Acquire), 3);
@@ -3825,6 +3837,101 @@ mod tests {
         );
         assert_eq!(server.failures(), ["input-invalid"]);
         assert_eq!(server.completed(&device), 6);
+    }
+
+    #[tokio::test]
+    async fn a_refused_input_keeps_the_runtime_and_the_next_claim_waits_out_the_backoff() {
+        use crate::native_predictor::{run_pool, Pool, TaskStep};
+        let server = FakeServer::start();
+        let device = server.enrol();
+        let worker = server.session(&device).await.unwrap();
+        let qualification = server.qualification(&worker).await;
+        server.queue(&device, 2);
+        let (_keep, mut cancel) = tokio::sync::watch::channel(false);
+        let (stopped, predictions) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let dropped_at = std::sync::Mutex::new(None);
+        let waited = std::sync::Mutex::new(None);
+        let pool = Pool {
+            slots: &|| None,
+            keep_claiming: &|| true,
+            abandon: &|| {
+                stopped.fetch_add(1, Ordering::AcqRel);
+            },
+        };
+        let mut reported = Vec::new();
+        let on_step = |task: TaskStep| {
+            if let Step::Dropped(_) = task.step {
+                reported.push(task.reported);
+                *dropped_at.lock().unwrap() = Some(std::time::Instant::now());
+                return Some(Duration::from_millis(300));
+            }
+            Some(Duration::ZERO)
+        };
+        let predict = |_, _, _| async {
+            if predictions.fetch_add(1, Ordering::AcqRel) == 0 {
+                return Err("runtime_prediction_refused".to_string());
+            }
+            *waited.lock().unwrap() = dropped_at.lock().unwrap().map(|at| at.elapsed());
+            Ok(serde_json::json!({}))
+        };
+        let quals = [&qualification];
+        run_pool(
+            &worker,
+            &quals,
+            &mut cancel,
+            &pool,
+            |_| {},
+            on_step,
+            predict,
+        )
+        .await
+        .unwrap();
+        // The model answered: its process is left serving, and the server acknowledged the report.
+        assert_eq!(stopped.load(Ordering::Acquire), 0);
+        assert_eq!(server.failures(), ["input-invalid"]);
+        assert_eq!(reported, [true]);
+        // The only task in hand was dropped: the pool held the next claim off itself.
+        assert!(waited.lock().unwrap().unwrap() >= Duration::from_millis(300));
+        assert_eq!(server.completed(&device), 1);
+    }
+
+    #[tokio::test]
+    async fn a_lease_that_arrives_after_a_pause_is_handed_straight_back() {
+        use crate::native_predictor::{run_pool, Pool};
+        let server = FakeServer::start();
+        let device = server.enrol();
+        let worker = server.session(&device).await.unwrap();
+        let qualification = server.qualification(&worker).await;
+        server.queue(&device, 1);
+        let (_keep, mut cancel) = tokio::sync::watch::channel(false);
+        // Wanted when the claim is sent, paused by the time it is answered.
+        let asked = AtomicUsize::new(0);
+        let pool = Pool {
+            slots: &|| None,
+            keep_claiming: &|| asked.fetch_add(1, Ordering::AcqRel) == 0,
+            abandon: &|| {},
+        };
+        let predictions = AtomicUsize::new(0);
+        let predict = |_, _, _| async {
+            predictions.fetch_add(1, Ordering::AcqRel);
+            Ok(serde_json::json!({}))
+        };
+        let quals = [&qualification];
+        let on_step = |_| Some(Duration::ZERO);
+        run_pool(
+            &worker,
+            &quals,
+            &mut cancel,
+            &pool,
+            |_| {},
+            on_step,
+            predict,
+        )
+        .await
+        .unwrap();
+        assert_eq!(predictions.load(Ordering::Acquire), 0);
+        assert_eq!(server.failures(), ["cancelled"]);
+        assert!(!server.handled().contains(&"input".to_string()));
     }
 
     #[tokio::test]
@@ -3914,7 +4021,7 @@ mod tests {
         // A graphics card or neural engine: up to eight, by the memory that is free beside
         // the models (2 GB of models: half a gigabyte of working memory for each task).
         assert_eq!(local_capacity(true, 8, Some(32 * GB), 2 * GB), 8);
-        assert_eq!(local_capacity(true, 8, Some(3 * GB), 2 * GB), 3);
+        assert_eq!(local_capacity(true, 8, Some(3 * GB), 2 * GB), 2);
         assert_eq!(local_capacity(true, 8, Some(GB), 2 * GB), 1);
         // Free memory that can't be read is one task.
         assert_eq!(local_capacity(true, 8, None, 2 * GB), 1);

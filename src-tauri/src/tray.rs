@@ -354,10 +354,11 @@ fn on_menu(app: &AppHandle, id: &str) {
             tauri::async_runtime::spawn(async move {
                 let state = app.state::<crate::DesktopState>();
                 let current = state.0.lock().await;
-                if let Some(Err(code)) = current
-                    .as_ref()
-                    .map(|saved| crate::open_photos_window(&app, saved))
-                {
+                let opened = match current.as_ref() {
+                    Some(saved) => crate::open_photos_checked(&app, saved).await,
+                    None => Ok(()),
+                };
+                if let Err(code) = opened {
                     let _ = app.emit_to("main", "tray-action-failed", code);
                     show_main(&app);
                 }

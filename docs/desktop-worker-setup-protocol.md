@@ -298,8 +298,8 @@ revision's key. `task.qualificationId` is the desktop's current qualification fo
   models are untouched. The `fail` reply is
   still `{"accepted": true}`, and `/models` still lists the model, so a new challenge and report
   grant it again. The desktop keeps the same count the same way (for each model, the failures it
-  reported as `inference-failed` or `model-unavailable` since that model's last result) and, at
-  the third, qualifies again without being told. The server keeps its count per device and model
+  reported as `inference-failed` or `model-unavailable` since that model's last result, counting
+  only reports the server acknowledged) and, at the third, qualifies again without being told. The server keeps its count per device and model
   (a new session does not reset it) and answers that qualification with
   `409 desktop_qualification_hold` for 5 minutes, which the desktop waits out for that model.
 - **Withdrawal notice.** The server's count outlives a desktop's restart, so it can withdraw a

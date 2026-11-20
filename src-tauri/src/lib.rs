@@ -853,7 +853,17 @@ async fn open_photos(
     require_local(&window)?;
     let current = state.0.lock().await;
     let saved = current.as_ref().ok_or("sign_in_required")?;
-    open_photos_window(&app, saved)
+    open_photos_checked(&app, saved).await
+}
+
+/// `open_photos_window` after a fresh look at where a plain-HTTP home name leads, when this
+/// app has not connected to it lately.
+pub(crate) async fn open_photos_checked(
+    app: &AppHandle,
+    saved: &SavedConnection,
+) -> Result<(), String> {
+    connection::refresh_home(&normalize_server(&saved.server)?).await;
+    open_photos_window(app, saved)
 }
 
 /// Shows the photo window for the signed-in connection, from the window or the tray alike.
