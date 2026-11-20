@@ -567,10 +567,6 @@ impl RuntimeTrouble {
         (raise, recovered)
     }
 }
-/// The reason work leaves the accelerated runtime. Its process died under a task that was
-/// dropped for a reason of its own (a deadline, say), for the third time in a row: that is
-/// the runtime crashing out, so it rests and is tried again later, and the tray and the AI
-/// page say so. A task handed back or short of memory keeps its own reason.
 /// What follows a pool that ended by itself.
 #[derive(Debug, PartialEq)]
 pub(crate) enum AfterPool {
@@ -600,6 +596,10 @@ pub(crate) fn after_pool(
         false => AfterPool::Carry,
     }
 }
+/// The reason work leaves the accelerated runtime. Its process died under a task that was
+/// dropped for a reason of its own (a deadline, say), for the third time in a row: that is
+/// the runtime crashing out, so it rests and is tried again later, and the tray and the AI
+/// page say so. A task handed back or short of memory keeps its own reason.
 fn crashed_out(crash: Option<AfterCrash>, code: String) -> String {
     let own = code.ends_with("_cancelled")
         || code.starts_with("resource_")
@@ -658,6 +658,13 @@ fn after_crash(
         progress.lower_capacity(fewer);
     }
     after
+}
+/// Whether a long run of the accelerated runtime's own tasks, finished in this pool, still
+/// counts as its recovery. Not when that runtime crashed in the same pool: the pool finishes
+/// the tasks still in hand before it ends, so a task can be counted after the crash it
+/// followed, and the crash must win.
+fn keeps_recovery(recovered: bool, crash: Option<AfterCrash>, accelerated: bool) -> bool {
+    recovered && !(accelerated && crash.is_some())
 }
 /// What a pool that has ended says about the runtime, if it was the runtime that ended.
 /// `completed`: how the pool ended. `dropped`: the code of a task dropped in it. `in_hand`:
@@ -2417,9 +2424,9 @@ async fn prepare_on(
                 at_once = running;
                 // A runtime that ended or stopped answering: what it means depends on how
                 // many tasks it was working on, not on how many it was allowed.
-                if recovered {
-                    plan.recovered();
-                }
+                let accelerated_ended = predictor
+                    .failed_lane()
+                    .is_some_and(|lane| plan.accelerates(lane));
                 let crash = judge(
                     &mut trouble,
                     &progress,
@@ -2429,6 +2436,9 @@ async fn prepare_on(
                     in_hand.count(),
                     predictor.failed_lane(),
                 );
+                if keeps_recovery(recovered, crash, accelerated_ended) {
+                    plan.recovered();
+                }
                 plan.set_crash_record((trouble.at_one, trouble.clean_accelerated));
                 match completed {
                     Ok(()) => {
@@ -2467,12 +2477,15 @@ async fn prepare_on(
                             // workloads move to the processor instead of crashing on every restart.
                             let lane = predictor.failed_lane().map(str::to_owned);
                             let code = crashed_out(crash, code);
-                            if let Some(AfterCrash::Again(crashes)) = crash {
+                            if let Some(AfterCrash::Again(_) | AfterCrash::Fewer(_)) = crash {
                                 // The graphics card keeps the work: its runtime is started
-                                // again after a wait.
+                                // again, after a wait with one task in hand, or at once
+                                // with fewer at a time. Only a failing runtime moves.
                                 progress.crashed(predictor.exit_report());
                                 predictor.stop()?;
-                                restart_wait(crashes, &progress.cancelled).await?;
+                                if let Some(AfterCrash::Again(crashes)) = crash {
+                                    restart_wait(crashes, &progress.cancelled).await?;
+                                }
                                 break;
                             }
                             if lane.is_some_and(|lane| plan.demote_runtime(&lane, &code)) {
@@ -4622,6 +4635,13 @@ mod tests {
             out(last.0, "worker_execution_deadline"),
             "runtime_process_stopped"
         );
+        // A run of the card's own tasks finished in the same pool as its crash is not its
+        // recovery; a crash of the processor's runtime beside it does not undo it.
+        assert!(keeps_recovery(true, None, false));
+        assert!(keeps_recovery(true, None, true));
+        assert!(!keeps_recovery(true, Some(AfterCrash::Again(1)), true));
+        assert!(keeps_recovery(true, Some(AfterCrash::Fewer(1)), false));
+        assert!(!keeps_recovery(false, None, false));
         // Two in hand when the runtime ended; while the crash was being reported the other
         // task was dropped for its own deadline. Still judged as two, until work goes on.
         let (in_hand, step) = (InHand::default(), |step| {

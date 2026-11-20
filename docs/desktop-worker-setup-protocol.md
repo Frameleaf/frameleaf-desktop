@@ -222,18 +222,20 @@ lease".
       to qualify again, the move to the processor comes first, and a restart keeps its wait.
       The tray then says "on the processor (acceleration stopped, retried later)" and the AI
       page says the process stopped three times in a row and is tried again later.
-    - The server counts those crashes toward withdrawing the model from this computer. From
-      server PR 1370 on it counts each one that is reported: a crash under a task of that
-      model is reported as one `model-unavailable`, while a process found gone between tasks
-      reports nothing. So only when all three crashes came under tasks of the same model
-      does the third withdraw it there; server
-      `frameleaf-v1.2.25` and earlier count failures within 10 seconds of the first as one,
-      so crashes that come close together there count once and the withdrawal can come
-      later. A withdrawn model is held for 300 seconds before it may qualify again
-      (`desktop_qualification_hold`, for that model on this computer whatever the device):
-      the processor then takes that model's work after the hold, and the desktop waits out
-      only that hold, or the graphics card's rest if it ends sooner, before setting up
-      again. The computer's other models carry on meanwhile.
+    - The server keeps its own count of failures per computer and model, apart from this
+      count of crashes, and withdraws the model at its third failure (see Grant
+      withdrawal); failures reported before a crash count toward that too, so one crash can
+      be the third. A crash under a task is reported as one `model-unavailable` for that
+      task's model, unless the task failed for its own reason first (its deadline, say:
+      then it is reported as that failure, `inference-failed`). A process found gone
+      between tasks reports nothing. From server PR 1370 on, each reported failure counts;
+      server `frameleaf-v1.2.25` and earlier count failures within 10 seconds of the first
+      as one, so crashes close together count once there. A withdrawn model is held for 300
+      seconds before it may qualify again (`desktop_qualification_hold`, for that model on
+      this computer whatever the device): the processor takes that model's work after the
+      hold. While nothing else qualifies and the graphics card rests, the desktop sets up
+      again after 5½ minutes, or sooner when the rest ends first. The computer's other
+      models carry on meanwhile.
     - That move is not lasting. Nothing is written to disk, so the next start of the app
       tries the graphics card at once. While the app runs it is tried again by itself after
       30 minutes; if it crashes out again without 50 of its own tasks finished in a row in
