@@ -24,12 +24,32 @@ pub(crate) fn client_builder() -> ClientBuilder {
 }
 
 pub(crate) fn streaming_client_builder() -> ClientBuilder {
-    // A proxy would look a plain-HTTP home name up itself, and be handed the request, without
-    // this app checking where it leads. A home server is reached directly.
-    match crate::connection::plain_http_names_in_use() {
-        true => public_client_builder().no_proxy(),
-        false => public_client_builder(),
-    }
+    public_client_builder().proxy(server_proxy())
+}
+
+/// The proxy for one request of a client that talks to a person's server or Manager, decided
+/// when the request connects, so it does not matter when the client was built or which other
+/// server is in use.
+///
+/// A plain-HTTP request to a name is never proxied: a proxy would look the name up itself and
+/// be handed the request (and its credential) without this app checking where it leads. The
+/// name is taken into use here too, so the connection that follows is held to home addresses
+/// (`connection::HomeResolver`). Every other request follows the system's proxy settings,
+/// exactly as a client with no rule of its own would.
+pub(crate) fn server_proxy() -> reqwest::Proxy {
+    let system = hyper_util::client::proxy::matcher::Matcher::from_system();
+    reqwest::Proxy::custom(move |url| {
+        if crate::connection::hold_plain_http_name(url) {
+            return None;
+        }
+        let via = system.intercept(&url.as_str().parse::<http::Uri>().ok()?)?;
+        let mut proxy = reqwest::Url::parse(&via.uri().to_string()).ok()?;
+        if let Some((user, password)) = via.raw_auth() {
+            let _ = proxy.set_username(user);
+            let _ = proxy.set_password(Some(password));
+        }
+        Some(proxy)
+    })
 }
 
 /// For Frameleaf's own download hosts (the model mirror, the release host), never a person's
@@ -326,15 +346,15 @@ mod tests {
         let Ok(case) = std::env::var("FRAMELEAF_PROXY_CASE") else {
             return;
         };
-        let url = if case == "home" {
-            // As restoring a saved sign-in and adding a library do: the server is taken into
-            // use first, then the client that will carry the credential is built.
-            let base = normalize_server("http://nas.proxied.test:2283").unwrap();
-            base.join("api/users/me").unwrap()
-        } else {
-            reqwest::Url::parse("http://control.proxied.test/api/users/me").unwrap()
-        };
+        // The client is built first, before anything knows which server it will talk to: the
+        // rule is applied to each request, not when a client is built.
         let client = client().unwrap();
+        let url = if case == "home" {
+            reqwest::Url::parse("http://nas.proxied.test:2283/api/users/me").unwrap()
+        } else {
+            // Plain HTTP to an address follows the system's proxy settings, as before.
+            reqwest::Url::parse("http://203.0.113.9/api/users/me").unwrap()
+        };
         tauri::async_runtime::block_on(async {
             let request = client.get(url).bearer_auth("secret").send();
             let _ = tokio::time::timeout(Duration::from_secs(3), request).await;
@@ -362,8 +382,8 @@ mod tests {
             proxy.set_nonblocking(true).unwrap();
             proxy.accept().is_ok()
         };
-        // The check can see a proxied request: plain HTTP built without taking a home name
-        // into use goes to the configured proxy.
+        // The check can see a proxied request: the same client sends plain HTTP to an address
+        // through the configured proxy.
         assert!(
             child("control"),
             "the control request did not reach the proxy"

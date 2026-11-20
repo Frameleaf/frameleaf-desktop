@@ -682,8 +682,6 @@ fn pairing_requires_https_only_for_a_manager_beyond_the_home_network() {
     for origin in [
         "http://203.0.113.10",
         "http://203.0.113.10:2282",
-        "http://manager.example.com:2282",
-        "http://localhost.example.test",
         "http://[2001:db8::1]:2282",
     ] {
         assert_eq!(
@@ -691,6 +689,25 @@ fn pairing_requires_https_only_for_a_manager_beyond_the_home_network() {
             "manager_https_required",
             "{origin}"
         );
+    }
+    // A name is judged by where it leads: beyond the home network it needs HTTPS; one that
+    // can't be found right now is a network problem, and is never told to use HTTPS.
+    use crate::connection::Leads;
+    assert_eq!(plain_http_manager(Leads::Home), Ok(()));
+    assert_eq!(
+        plain_http_manager(Leads::Elsewhere).unwrap_err(),
+        "manager_https_required"
+    );
+    assert_eq!(
+        plain_http_manager(Leads::Unknown).unwrap_err(),
+        "manager_unreachable_or_certificate_invalid"
+    );
+    // Whatever this computer's resolver says of these, plain HTTP to them is refused.
+    for origin in [
+        "http://manager.example.com:2282",
+        "http://localhost.example.test",
+    ] {
+        assert!(require_encrypted(origin).is_err(), "{origin}");
     }
     for origin in [
         "http://127.0.0.1",

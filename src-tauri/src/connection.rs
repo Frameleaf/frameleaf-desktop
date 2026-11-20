@@ -67,10 +67,36 @@ fn looked_up_name(url: &Url) -> Option<String> {
 static PLAIN_HTTP_NAMES: std::sync::Mutex<std::collections::BTreeSet<String>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
-/// Whether a name is being reached over plain HTTP. While one is, the clients that talk to
-/// the server connect directly: a proxy would resolve the name itself, out of this app's sight.
-pub(crate) fn plain_http_names_in_use() -> bool {
-    !PLAIN_HTTP_NAMES.lock().unwrap().is_empty()
+/// Where a name leads, as far as looking it up can say.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Leads {
+    /// To an address on this computer or the home network.
+    Home,
+    /// Only to addresses elsewhere.
+    Elsewhere,
+    /// No answer: the name can't be found right now (DNS is down, or this is another network).
+    Unknown,
+}
+fn leads(found: Option<Vec<std::net::IpAddr>>) -> Leads {
+    match found {
+        Some(found) if found.iter().copied().any(local_address) => Leads::Home,
+        Some(found) if !found.is_empty() => Leads::Elsewhere,
+        _ => Leads::Unknown,
+    }
+}
+/// How long a name lookup may take before it counts as no answer.
+const LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Look a name up from code that is not async, without waiting on a resolver that hangs: the
+/// lookup runs on a thread of its own and is given `LOOKUP_TIMEOUT`.
+fn look_up(name: &str) -> Leads {
+    use std::net::ToSocketAddrs;
+    let (answer, found) = std::sync::mpsc::channel();
+    let name = name.to_owned();
+    std::thread::spawn(move || {
+        let all = (name.as_str(), 0).to_socket_addrs();
+        let _ = answer.send(all.ok().map(|all| all.map(|a| a.ip()).collect()));
+    });
+    leads(found.recv_timeout(LOOKUP_TIMEOUT).ok().flatten())
 }
 
 /// The addresses a connection to `name` may use. A name reached over plain HTTP connects only
@@ -100,29 +126,28 @@ pub(crate) fn home_addresses(
 /// already accepted (typed and checked, or saved) needs no lookup; any other is looked up
 /// once, and from then on its connections are held to home addresses (`home_addresses`).
 pub fn is_home_server(url: &Url) -> bool {
-    use std::net::ToSocketAddrs;
+    home_server(url) == Leads::Home
+}
+/// As `is_home_server`, telling a name that leads elsewhere from one that can't be found right
+/// now: the first needs HTTPS, the second is a network problem and says nothing about HTTPS.
+pub(crate) fn home_server(url: &Url) -> Leads {
     if url.host().is_some_and(is_local_network) {
-        return true;
+        return Leads::Home;
     }
     if url.scheme() != "http" {
-        return false;
+        return Leads::Elsewhere;
     }
     let Some(name) = looked_up_name(url) else {
-        return false;
+        return Leads::Elsewhere;
     };
     if PLAIN_HTTP_NAMES.lock().unwrap().contains(&name) {
-        return true;
+        return Leads::Home;
     }
-    let found = (name.as_str(), 0).to_socket_addrs();
-    let home = name_is_local(&name, |_| {
-        found
-            .map(|all| all.map(|a| a.ip()).collect())
-            .unwrap_or_default()
-    });
-    if home {
+    let found = look_up(&name);
+    if found == Leads::Home {
         PLAIN_HTTP_NAMES.lock().unwrap().insert(name);
     }
-    home
+    found
 }
 
 /// Take a plain-HTTP origin by name into use, whoever reaches it (a server, a Manager): from
@@ -142,19 +167,13 @@ pub(crate) fn hold_plain_http_name(url: &Url) -> bool {
 /// For what this app does not connect itself (the Photos window is a web view with its own
 /// name lookup): whether a plain-HTTP name leads home right now. Any other server is `true`.
 pub(crate) fn leads_home_now(base: &Url) -> bool {
-    use std::net::ToSocketAddrs;
     if base.scheme() != "http" {
         return true;
     }
     let Some(name) = looked_up_name(base) else {
         return true;
     };
-    let found = (name.as_str(), 0).to_socket_addrs();
-    name_is_local(&name, |_| {
-        found
-            .map(|all| all.map(|a| a.ip()).collect())
-            .unwrap_or_default()
-    })
+    look_up(&name) == Leads::Home
 }
 
 /// The resolver of every client that talks to a server (`transport::streaming_client_builder`).
@@ -214,7 +233,8 @@ pub fn typed_server(value: &str) -> Result<Url, String> {
 /// - `http://nas.fritz.box:2283`: plain HTTP, as typed, when the name is a home one.
 /// - `nas.fritz.box:2283` with no scheme: HTTPS first (a home server behind a reverse proxy),
 ///   then plain HTTP when the name is a home one.
-fn typed_candidates(value: &str, resolves_home: bool) -> Result<Vec<Url>, String> {
+fn typed_candidates(value: &str, resolves: Leads) -> Result<Vec<Url>, String> {
+    let resolves_home = resolves == Leads::Home;
     let typed = value.trim();
     let plain = || -> Option<Url> {
         let address = match typed.contains("://") {
@@ -232,7 +252,16 @@ fn typed_candidates(value: &str, resolves_home: bool) -> Result<Vec<Url>, String
         Ok(url) if typed.contains("://") => Ok(vec![url]),
         Ok(url) => Ok(std::iter::once(url).chain(plain()).collect()),
         Err(code) if code == "server_requires_https_origin" => {
-            plain().map(|url| vec![url]).ok_or(code)
+            let typed_plain_name = Url::parse(typed)
+                .is_ok_and(|url| url.scheme() == "http" && looked_up_name(&url).is_some());
+            plain().map(|url| vec![url]).ok_or(
+                // A plain-HTTP name that can't be found right now is a network problem, not
+                // a reason to ask for HTTPS: it may well be a home server.
+                match typed_plain_name && resolves == Leads::Unknown {
+                    true => "server_unreachable_or_certificate_invalid".into(),
+                    false => code,
+                },
+            )
         }
         Err(code) => Err(code),
     }
@@ -246,17 +275,17 @@ pub(crate) async fn typed_servers(value: &str) -> Result<Vec<Url>, String> {
         .iter()
         .find_map(|address| Url::parse(address).ok().filter(|url| url.host().is_some()))
         .and_then(|url| looked_up_name(&url));
-    let resolves_home = match name {
+    let resolves = match name {
         Some(name) => {
-            let lookup = tokio::net::lookup_host((name.clone(), 0));
-            match tokio::time::timeout(std::time::Duration::from_secs(3), lookup).await {
-                Ok(Ok(found)) => name_is_local(&name, |_| found.map(|a| a.ip()).collect()),
-                _ => false,
+            let lookup = tokio::net::lookup_host((name, 0));
+            match tokio::time::timeout(LOOKUP_TIMEOUT, lookup).await {
+                Ok(Ok(found)) => leads(Some(found.map(|a| a.ip()).collect())),
+                _ => Leads::Unknown,
             }
         }
-        None => false,
+        None => Leads::Elsewhere,
     };
-    typed_candidates(typed, resolves_home)
+    typed_candidates(typed, resolves)
 }
 
 /// A host that is on this computer or the local network by its own shape, with no lookup: loopback,
@@ -306,8 +335,9 @@ fn local_address(address: std::net::IpAddr) -> bool {
 /// A name is a home name when it resolves to an address on this computer or the local
 /// network. Connections to it use only those addresses (`home_addresses`). No answer, or only
 /// addresses elsewhere, is not a home name.
+#[cfg(test)]
 fn name_is_local(name: &str, resolve: impl FnOnce(&str) -> Vec<std::net::IpAddr>) -> bool {
-    resolve(name).into_iter().any(local_address)
+    leads(Some(resolve(name))) == Leads::Home
 }
 
 #[derive(Serialize, Deserialize)]
@@ -604,7 +634,6 @@ mod local_http_tests {
                 .collect()
         };
         normalize_server("http://nas.split.test:2283").unwrap();
-        assert!(plain_http_names_in_use());
         assert!(home_addresses("nas.split.test", addresses(&["192.168.178.20"])).is_ok());
         assert!(home_addresses("NAS.split.test.", addresses(&["10.0.0.2", "fd00::2"])).is_ok());
         // The same name elsewhere, or a hijacked answer: nothing is sent.
@@ -662,7 +691,11 @@ mod local_http_tests {
     #[test]
     fn a_typed_home_name_tries_https_first_and_plain_http_only_when_it_resolves_home() {
         let tried = |typed: &str, home: bool| {
-            typed_candidates(typed, home)
+            let resolves = match home {
+                true => Leads::Home,
+                false => Leads::Elsewhere,
+            };
+            typed_candidates(typed, resolves)
                 .map(|urls| urls.iter().map(Url::to_string).collect::<Vec<_>>())
         };
         // No scheme: HTTPS as before (a reverse proxy on 443), then plain HTTP for a home name.
@@ -682,6 +715,29 @@ mod local_http_tests {
         assert_eq!(
             tried("http://photos.example.com", false),
             Err("server_requires_https_origin".to_string())
+        );
+        // A plain-HTTP name that can't be found right now (DNS down, another network) is a
+        // network problem; only one that leads elsewhere is told to use HTTPS.
+        assert_eq!(
+            typed_candidates("http://nas.fritz.box:2283", Leads::Unknown),
+            Err("server_unreachable_or_certificate_invalid".to_string())
+        );
+        assert_eq!(
+            typed_candidates("http://nas.fritz.box:2283", Leads::Elsewhere),
+            Err("server_requires_https_origin".to_string())
+        );
+        // With no scheme it is still tried over HTTPS, which answers or fails as a network error.
+        assert_eq!(
+            typed_candidates("nas.fritz.box:2283", Leads::Unknown)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(leads(None), Leads::Unknown);
+        assert_eq!(leads(Some(vec![])), Leads::Unknown);
+        assert_eq!(
+            home_server(&Url::parse("http://mgr.fritz.invalid:9443").unwrap()),
+            Leads::Unknown
         );
         // Listing the plain-HTTP fallback does not yet hold the name to the home network: the
         // HTTPS try before it may use a public address the name also resolves to.
@@ -820,7 +876,10 @@ mod local_http_tests {
         // only ever reaches the home network (`home_addresses`).
         for named in ["http://photos.example.com", "http://ts.net.example.com"] {
             assert!(typed_server(named).is_err(), "{named}");
-            assert!(typed_candidates(named, false).is_err(), "{named}");
+            assert!(
+                typed_candidates(named, Leads::Elsewhere).is_err(),
+                "{named}"
+            );
         }
         assert!(normalize_server("https://photos.example.com").is_ok());
     }

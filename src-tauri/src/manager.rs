@@ -341,11 +341,21 @@ pub fn require_encrypted(origin: &str) -> Result<(), String> {
     let url = normalize_manager(origin)?;
     // Local by its shape, or a name that leads home (`nas.fritz.box`): connections to such a
     // name are held to home addresses by this module's client.
-    let local = crate::connection::is_home_server(&url);
-    if url.scheme() == "http" && !local {
-        return Err("manager_https_required".into());
+    if url.scheme() == "http" {
+        plain_http_manager(crate::connection::home_server(&url))?;
     }
     Ok(())
+}
+/// Whether a Manager may be reached over plain HTTP, from where its address leads.
+pub(crate) fn plain_http_manager(leads: crate::connection::Leads) -> Result<(), String> {
+    match leads {
+        crate::connection::Leads::Home => Ok(()),
+        // The name can't be found right now: a network problem, not a reason for HTTPS.
+        crate::connection::Leads::Unknown => {
+            Err("manager_unreachable_or_certificate_invalid".into())
+        }
+        crate::connection::Leads::Elsewhere => Err("manager_https_required".into()),
+    }
 }
 fn canonical_origin(value: &str) -> Result<String, String> {
     let url = normalize_manager(value)?;
@@ -388,15 +398,13 @@ pub fn manager_client(
     if normalize_manager(origin)?.scheme() == "http" && (pem.is_some() || approved.is_some()) {
         return Err("manager_http_certificate_invalid".into());
     }
-    let builder = Client::builder();
     // A Manager reached over plain HTTP by a name (one just paired, or a saved one after a
-    // restart) is held to home addresses from here on, and connected to directly: a proxy
-    // would look the name up itself and be handed the password or the grant's proof.
-    let builder = match crate::connection::hold_plain_http_name(&normalize_manager(origin)?) {
-        true => builder.no_proxy(),
-        false => builder,
-    };
-    let mut builder = builder
+    // restart) is held to home addresses from here on.
+    crate::connection::hold_plain_http_name(&normalize_manager(origin)?);
+    let mut builder = Client::builder()
+        // And connected to directly: a proxy would look the name up itself and be handed the
+        // password or the grant's proof.
+        .proxy(crate::transport::server_proxy())
         .redirect(reqwest::redirect::Policy::none())
         // A Manager reached over plain HTTP by name is connected to at home addresses only.
         .dns_resolver(std::sync::Arc::new(crate::connection::HomeResolver))

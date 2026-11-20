@@ -76,7 +76,11 @@ The desktop never needs a restart or **Retry Setup** because the server changed 
   lookup, so it stays valid when DNS is down or the computer is away. Sign-in, Sign in with
   Frameleaf and Manager accept such a name as a home address once it has resolved home. The desktop connects to
   such a name only at home-network addresses (private, loopback, link-local, CGNAT/Tailscale),
-  directly and never through a proxy; an answer with none of those is a network error.
+  directly and never through a proxy; an answer with none of those is a network error. Both
+  rules are applied to each request as it connects, so they hold for every client whenever it
+  was built, and requests to anything else follow the system's proxy settings as before. A
+  name typed with `http://` that can't be found right now (DNS down, another network) is
+  answered as unreachable, not with a request to use HTTPS.
 - **Clock.** Every response's `Date` header tells the desktop the server's time. After this
   computer's own clock is set, or it wakes from sleep, the desktop asks the server the time
   again (`GET /api/server/ping`, unsigned) before it judges any deadline. When the two clocks

@@ -1404,6 +1404,8 @@ dependencies = [
  "flate2",
  "frameleaf-backup-core",
  "futures-util",
+ "http",
+ "hyper-util",
  "keyring",
  "libc",
  "mdns-sd",
