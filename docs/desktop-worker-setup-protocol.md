@@ -38,11 +38,27 @@ Owner decisions made during this work, which replace the original design:
 - **No desktop is offered those nine.** No desktop runtime is built or factory-signed from that
   source, and `/models` lists a profile only for the runtime source the desktop reports. The
   desktop parses them like any other profile and never runs them.
-- **One embedding space across runtime revisions.** The server treats released spaces as one
-  when they have the same model files and the same expected output for the same fixture; they
-  differ only in the runtime's preprocessing source. So the server's AI works under any runtime
-  revision's key, a second desktop on another runtime revision of the same model is accepted,
-  and a library that already has vectors the server made keeps them.
+- **One embedding space across runtime revisions.** A runtime revision has model keys of its
+  own, because a key covers the hash of the runtime's preprocessing sources. Profiles of one
+  model whose model files, fixture and expected output are the same are one embedding space,
+  whatever their keys.
+  - The smart-search index is admitted under the keys of the first desktop granted smart
+    search. Desktops on other runtime revisions of the same model are granted too and share
+    the index. A task made for one revision's key is leased to a desktop holding the same
+    encoder under its own revision's key, and the claim reply carries the key that desktop
+    holds.
+  - The server asks its own AI under each revision's key of the same encoder until the AI
+    serves one (it serves only the key of its own build), and remembers which. Vectors are
+    stored under the admitted key, so a library keeps one producer key.
+  - A library that already has vectors the server made keeps them.
+- **What happens when the server's AI has no catalogue identity.** It answers
+  `409 model_identity_unavailable` to the server's request, and the server's own work fails with
+  that error: embedding a photo on the server, and encoding the words of a search. It is logged
+  at warn on the server. The refusal is not remembered, so an AI that is updated works on the
+  next request. Desktops are not affected: they keep embedding photos.
+- **Kept in step by the server's checks.** The server's CI fails when its AI build has no
+  profile for some search request, and a recut only appends: no revision, provider or profile
+  is removed, so this repository's copy stays a superset with the same beginning.
 
 ## Version signal
 
@@ -151,7 +167,10 @@ To accept a report:
 - It is bound to the challenge, profile and signed runtime (`DesktopQualificationReceipt.validate`).
 - The account approval is current.
 - The profile is still the configured one (re-read inside the grant transaction).
-- For CLIP, the desktop vector index is admitted for the profile's space. This refuses an existing index from a different model.
+- For CLIP, the desktop vector index is admitted for the profile's embedding space. A library
+  the server already embedded is accepted and keeps its vectors; another runtime revision of the
+  same model is accepted; only a library holding vectors tagged with another model's key is
+  refused.
 
 Removed: the server's own reference run (`DesktopNasProducerService`), default-route checks
 (`assertDefaultRoute`), and destination availability checks.
@@ -198,8 +217,17 @@ lease".
 - The runtime process is started to serve as many requests at once as the desktop will run
   tasks. The signed runtime takes one input per inference call, so several tasks are several
   calls served side by side, not one batched call.
-- The server remembers held plus `slots` from the last claim as how many the desktop can run
-  at once, and starts that many extra queue jobs for it.
+- **A lease whose claim reply was lost** is not returned again under `slots`. It runs out
+  after 120 seconds; the server hands back at once a lease it made while the connection was
+  closing.
+- **Queue jobs.** The server remembers what the desktop holds plus its last `slots` as how
+  many tasks it runs at once (one, for a desktop that never sent `slots`). For each task it
+  holds for a queue, and each task it can still take, the server starts one job in that queue
+  on top of the administrator's own concurrency, under the conditions in the next section, and
+  only while the queue's Jobs setting is not reached for that desktop and one of the queue's
+  next jobs is for a photo it may take. Free slots are counted for smart search first, then
+  faces, then text.
+- A `slots` outside 1 to 64 is refused with `400 desktop_worker_payload_invalid`.
 
 ### Several desktops at once
 
@@ -214,8 +242,8 @@ queue's work would go to desktops first (the first place in the processing order
 now is the desktops). A desktop is counted for one queue at a time: the queue whose job it is
 running or, while free, the first of smart search, faces and text that it can work and that has
 jobs waiting. With the server itself first in the order and its AI answering, no extra jobs start.
-That is on top of the administrator's own concurrency setting. The broker still holds at most 32
-open tasks.
+That is on top of the administrator's own concurrency setting. The broker holds at most 256
+open tasks (it was 32).
 
 For a route pinned to the server, desktops come after the server (it is tried first); for the
 default order, wherever "your computers" sits in the administrator's order.
