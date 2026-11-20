@@ -515,9 +515,8 @@ where
                         running.push(work(index, task, cancel.clone()));
                     }
                     None => {
-                        let wait = (1u64 << empty.min(3)).min(REFILL_WAIT_MOST);
+                        next_claim = tokio::time::Instant::now() + refill_wait(empty);
                         empty += 1;
-                        next_claim = tokio::time::Instant::now() + Duration::from_secs(wait);
                     }
                 }
             }
@@ -616,6 +615,11 @@ where
 const CRASH_REPORT_RETRY: Duration = Duration::from_secs(1);
 /// How long a claim for more room is held off, at most, while the server has nothing to give.
 const REFILL_WAIT_MOST: u64 = 8;
+/// The wait before the next claim for more room, after `empty` of them in a row were
+/// answered with nothing: 1, 2, 4 and then 8 seconds.
+pub(crate) fn refill_wait(empty: u32) -> Duration {
+    Duration::from_secs((1u64 << empty.min(3)).min(REFILL_WAIT_MOST))
+}
 /// `crash_reported`: shared by the tasks in hand together. When the runtime process ends
 /// under several of them, one is reported as `model-unavailable` and the rest are handed back
 /// as `cancelled`: it was one failure of the runtime, and the server, which withdraws a model
@@ -710,6 +714,11 @@ where
     run_pool(transport, qualifications, cancel, &pool, |_| {}, heard, run).await?;
     Ok(steps)
 }
+
+/// After a prediction's connection broke off: how often, and how many times, the process is
+/// looked at to see whether it has ended (half a second in all).
+const EXIT_CHECK_EVERY: Duration = Duration::from_millis(20);
+const EXIT_CHECKS: u32 = 25;
 
 /// How long every runtime process may take to answer its first health check.
 const READY_DEADLINE: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 15 });
@@ -1057,14 +1066,20 @@ impl NativePredictor {
         {
             return Err("worker_predictor_qualification_changed".into());
         }
+        use std::sync::atomic::Ordering;
         self.ready(cancel).await?;
         let roles = &self.roles;
         // Shared by the tasks in hand: each checks its own process after its prediction.
         let children = std::sync::Mutex::new(&mut self.children);
         // Set when this owner stops the processes itself: that is not a process to blame.
         let stopped_here = std::sync::atomic::AtomicBool::new(false);
+        // The lane whose process ended by itself under a prediction. With one task in hand
+        // this owner stops every process next (`abandon`), so it has to be noted before.
+        const NONE: usize = usize::MAX;
+        let exited = std::sync::atomic::AtomicUsize::new(NONE);
+        let exited = &exited;
         let abandon = || {
-            stopped_here.store(true, std::sync::atomic::Ordering::Release);
+            stopped_here.store(true, Ordering::Release);
             for lane in children.lock().unwrap().iter_mut() {
                 let _ = lane.child.stop();
             }
@@ -1088,16 +1103,32 @@ impl NativePredictor {
             |index, task, input| {
                 let (role, children) = (&roles[index], &children);
                 async move {
-                    let value = role
-                        .client
-                        .predict(&task, &input, transport.now()?)
-                        .await
+                    let running = || children.lock().unwrap()[role.lane].child.is_running();
+                    let answer = role.client.predict(&task, &input, transport.now()?).await;
+                    let value = match answer {
+                        Ok(value) => value,
                         // The local model refused this one input; the process itself is still serving.
-                        .map_err(|code| match code.starts_with("server_http_") {
-                            true => "runtime_prediction_refused".into(),
-                            false => code,
-                        })?;
-                    if !children.lock().unwrap()[role.lane].child.is_running()? {
+                        Err(code) if code.starts_with("server_http_") => {
+                            return Err("runtime_prediction_refused".into())
+                        }
+                        Err(code) => {
+                            // The connection broke off. A process that is ending is gone a
+                            // moment later: wait that moment, so its end is told apart from
+                            // a healthy process this owner stops.
+                            if code == "runtime_prediction_interrupted" {
+                                for _ in 0..EXIT_CHECKS {
+                                    if !running().unwrap_or(true) {
+                                        exited.store(role.lane, Ordering::Release);
+                                        break;
+                                    }
+                                    tokio::time::sleep(EXIT_CHECK_EVERY).await;
+                                }
+                            }
+                            return Err(code);
+                        }
+                    };
+                    if !running()? {
+                        exited.store(role.lane, Ordering::Release);
                         return Err("runtime_process_stopped".into());
                     }
                     Ok(value)
@@ -1106,13 +1137,126 @@ impl NativePredictor {
         )
         .await;
         drop(children);
-        // A process that is gone without this owner having stopped it ended by itself.
-        if !stopped_here.load(std::sync::atomic::Ordering::Acquire) {
+        // A process that is gone without this owner having stopped it ended by itself. Where
+        // this owner did stop them, only one seen to have ended before that is blamed.
+        if !stopped_here.load(Ordering::Acquire) {
             for lane in 0..self.children.len() {
                 self.blame_exited(lane);
             }
+        } else if let Some(lane) = Some(exited.load(Ordering::Acquire)).filter(|lane| *lane != NONE)
+        {
+            self.failed = Some(lane);
         }
         outcome
+    }
+}
+
+/// For tests of what follows a runtime that dies: a real, signed runtime pack whose process
+/// ends by itself the moment it is asked to predict.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+    use crate::native_runtime::VerifiedRuntime;
+    use std::{
+        fs,
+        io::{Read, Write},
+        net::TcpListener,
+        path::PathBuf,
+    };
+    pub(crate) struct DyingRuntime {
+        root: PathBuf,
+        pack: VerifiedRuntime,
+        port: u16,
+    }
+    impl DyingRuntime {
+        pub(crate) fn build() -> Self {
+            use ed25519_dalek::{Signer, SigningKey};
+            use sha2::{Digest, Sha256};
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("frameleaf-dying-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&root).unwrap();
+            for name in ["pack", "cache", "work", "compiler"] {
+                fs::create_dir(root.join(name)).unwrap();
+            }
+            // Passes the start gate, then lives until `<root>/die` appears.
+            let source = root.join("compiler/main.rs");
+            fs::write(&source, r#"use std::{io::{self,Read},thread,time::Duration};fn main(){let mut gate=[0;23];io::stdin().read_exact(&mut gate).unwrap();let flag=std::path::PathBuf::from(env!("DIE_FLAG"));loop{if flag.exists(){std::process::exit(3);}thread::sleep(Duration::from_millis(5));}}"#).unwrap();
+            let name = if cfg!(windows) {
+                "python.exe"
+            } else {
+                "python"
+            };
+            assert!(std::process::Command::new("rustc")
+                .env("DIE_FLAG", root.join("die"))
+                .arg(&source)
+                .arg("-o")
+                .arg(root.join("pack").join(name))
+                .status()
+                .unwrap()
+                .success());
+            let bytes = fs::read(root.join("pack").join(name)).unwrap();
+            let raw = serde_json::to_vec(&serde_json::json!({"schemaVersion":1,"protocolVersion":1,"epoch":1,"platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"provider":"CPUExecutionProvider","python":name,"sourceRevision":"a".repeat(40),"files":{name:{"sha256":format!("{:x}",Sha256::digest(&bytes)),"bytes":bytes.len()}}})).unwrap();
+            let key = SigningKey::from_bytes(&[42; 32]);
+            let pack = VerifiedRuntime::verify(
+                &root.join("pack"),
+                &raw,
+                &key.sign(&raw).to_bytes(),
+                &[key.verifying_key()],
+                1,
+            )
+            .unwrap();
+            // What the process would serve: healthy until a prediction arrives, which ends
+            // the process and breaks the connection off without an answer.
+            let serving = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = serving.local_addr().unwrap().port();
+            let flag = root.join("die");
+            std::thread::spawn(move || {
+                for socket in serving.incoming() {
+                    let Ok(mut socket) = socket else { break };
+                    let mut request = [0; 1024];
+                    let read = socket.read(&mut request).unwrap_or(0);
+                    if request[..read].starts_with(b"GET") {
+                        let _ = socket.write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\npong",
+                        );
+                    } else {
+                        fs::write(&flag, b"").unwrap();
+                    }
+                }
+            });
+            Self { root, pack, port }
+        }
+        pub(crate) fn manifest(&self) -> &str {
+            self.pack.manifest_sha256()
+        }
+        /// Start its process anew, bound to this model and qualification.
+        pub(crate) fn start(&self, model_key: &str, qualification_id: &str) -> NativePredictor {
+            let _ = fs::remove_file(self.root.join("die"));
+            let child = self
+                .pack
+                .start_sidecar(&self.root.join("cache"), &self.root.join("work"), 19990)
+                .unwrap();
+            let spec = serde_json::json!({"modelKey":model_key,"entries":{},"fixtureKind":"image"});
+            NativePredictor {
+                children: vec![Lane {
+                    child,
+                    manifest_sha256: self.manifest().into(),
+                }],
+                roles: vec![BoundRole {
+                    client: BoundClient::new(self.port, "a".repeat(64), &spec).unwrap(),
+                    qualification_id: qualification_id.into(),
+                    lane: 0,
+                }],
+                failed: None,
+            }
+        }
+    }
+    impl Drop for DyingRuntime {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
 }
 

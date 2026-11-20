@@ -464,7 +464,7 @@ fn concurrent_tasks(
 }
 /// What a runtime that ended or stopped answering means for how the work goes on.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum AfterCrash {
+pub(crate) enum AfterCrash {
     /// Several tasks were in hand: most likely memory. This many at once, on the same runtime.
     Fewer(u32),
     /// One task in hand on a graphics card or neural engine: the same runtime again, after a
@@ -480,26 +480,33 @@ const CRASHES_AT_ONE: u32 = 3;
 /// This many tasks finished in a row, with none refused and no crash, lets one more run at
 /// once again after a step down.
 const CLEAN_RUN: u32 = 50;
+/// The processor's own runtime, at one task at a time after stepping down, is started once
+/// more before it is treated as failing (as it always was).
+const PROCESSOR_CRASHES_AT_ONE: u32 = 2;
 /// How the runtime has fared since AI processing started, for how many tasks to run at once
 /// and whether a graphics card keeps the work.
 #[derive(Default)]
 struct RuntimeTrouble {
     at_one: u32,
+    processor_at_one: u32,
     clean: u32,
     clean_accelerated: u32,
 }
 impl RuntimeTrouble {
-    /// `in_hand`: the tasks the runtime was working on when it ended. None is a runtime that
-    /// did not start, which says nothing about memory. `accelerated`: the runtime that ended
-    /// is the graphics card's or neural engine's. The processor's own runtime has no other
-    /// device to fall back to: its crashes are counted across restarts of the setup
-    /// (`CRASH_LIMIT`), as they always were.
-    fn crashed(&mut self, in_hand: u32, accelerated: bool) -> AfterCrash {
+    /// `in_hand`: the tasks the runtime was working on when it ended. `accelerated`: the
+    /// runtime that ended is the graphics card's or neural engine's, and how it ended counts
+    /// as a crash (with nothing in hand: its process was found gone, not merely slow to
+    /// start). `stepped_down`: fewer tasks are already run at once than this computer was
+    /// first taken to manage. The processor's own runtime has no other device to fall back
+    /// to: beyond the one more go after a step down, its crashes are counted across restarts
+    /// of the setup (`CRASH_LIMIT`), as they always were.
+    fn crashed(&mut self, in_hand: u32, accelerated: bool, stepped_down: bool) -> AfterCrash {
         self.clean = 0;
         self.clean_accelerated = 0;
         match in_hand {
-            0 => AfterCrash::Failing,
-            1 if accelerated => {
+            // With its one task, or found gone between tasks: the graphics card keeps the
+            // work until the third in a row.
+            0 | 1 if accelerated => {
                 self.at_one += 1;
                 match self.at_one < CRASHES_AT_ONE {
                     true => AfterCrash::Again(self.at_one),
@@ -509,12 +516,26 @@ impl RuntimeTrouble {
                     }
                 }
             }
+            // It did not start: never a matter of memory.
+            0 => AfterCrash::Failing,
+            1 if stepped_down => {
+                self.processor_at_one += 1;
+                match self.processor_at_one < PROCESSOR_CRASHES_AT_ONE {
+                    true => AfterCrash::Again(self.processor_at_one),
+                    false => AfterCrash::Failing,
+                }
+            }
             1 => AfterCrash::Failing,
             several => AfterCrash::Fewer(several / 2),
         }
     }
-    fn refused(&mut self) {
+    /// A task was dropped; `accelerated`: on the graphics card's or neural engine's runtime.
+    /// The run of finished tasks starts again.
+    fn refused(&mut self, accelerated: bool) {
         self.clean = 0;
+        if accelerated {
+            self.clean_accelerated = 0;
+        }
     }
     /// A task finished; `accelerated`: on the graphics card's or neural engine's runtime.
     /// First `true` after a long run of tasks without trouble: one more may run at once.
@@ -527,9 +548,12 @@ impl RuntimeTrouble {
         if raise {
             self.clean = 0;
         }
-        if accelerated {
-            self.at_one = 0;
-            self.clean_accelerated += 1;
+        match accelerated {
+            true => {
+                self.at_one = 0;
+                self.clean_accelerated += 1;
+            }
+            false => self.processor_at_one = 0,
         }
         let recovered = self.clean_accelerated >= CLEAN_RUN;
         if recovered {
@@ -542,6 +566,35 @@ impl RuntimeTrouble {
 /// dropped for a reason of its own (a deadline, say), for the third time in a row: that is
 /// the runtime crashing out, so it rests and is tried again later, and the tray and the AI
 /// page say so. A task handed back or short of memory keeps its own reason.
+/// What follows a pool that ended by itself.
+#[derive(Debug, PartialEq)]
+pub(crate) enum AfterPool {
+    /// The accelerated runtime crashed out: its work has moved to the processor and it rests.
+    CrashedOut,
+    /// The server may have withdrawn a model: qualify again.
+    Requalify,
+    Carry,
+}
+/// The crash-out is decided before qualifying again, which the same failures can ask for at
+/// the same moment: otherwise the runtime would neither fall back nor rest. `lane`: the
+/// runtime whose process ended.
+pub(crate) fn after_pool(
+    plan: &mut crate::provider_selection::Plan,
+    crash: Option<AfterCrash>,
+    dropped: Option<&str>,
+    lane: Option<&str>,
+    requalify: bool,
+) -> AfterPool {
+    if let (Some(AfterCrash::Failing), Some(code), Some(lane)) = (crash, dropped, lane) {
+        if plan.demote_runtime(lane, &crashed_out(crash, code.to_owned())) {
+            return AfterPool::CrashedOut;
+        }
+    }
+    match requalify {
+        true => AfterPool::Requalify,
+        false => AfterPool::Carry,
+    }
+}
 fn crashed_out(crash: Option<AfterCrash>, code: String) -> String {
     let own = code.ends_with("_cancelled")
         || code.starts_with("resource_")
@@ -577,11 +630,44 @@ fn after_crash(
     in_hand: u32,
     accelerated: bool,
 ) -> AfterCrash {
-    let after = trouble.crashed(in_hand, accelerated);
+    let stepped_down = progress.capacity_ceiling().is_some();
+    let after = trouble.crashed(in_hand, accelerated, stepped_down);
     if let AfterCrash::Fewer(fewer) = after {
         progress.lower_capacity(fewer);
     }
     after
+}
+/// What a pool that has ended says about the runtime, if it was the runtime that ended.
+/// `completed`: how the pool ended. `dropped`: the code of a task dropped in it. `in_hand`:
+/// the tasks the runtime was working on. `lane`: the runtime whose process is gone
+/// (`NativePredictor::failed_lane`).
+fn judge(
+    trouble: &mut RuntimeTrouble,
+    progress: &Progress,
+    plan: &crate::provider_selection::Plan,
+    completed: &Result<(), String>,
+    dropped: Option<&str>,
+    in_hand: u32,
+    lane: Option<&str>,
+) -> Option<AfterCrash> {
+    // The graphics card's or neural engine's own runtime is the one that ended.
+    let accelerated = lane.is_some_and(|lane| plan.accelerates(lane));
+    match completed {
+        // With nothing in hand only a process found gone is its crash: one that did not
+        // answer in time has not started, which is handled as it always was.
+        Err(reason) if runtime_crash(reason) => {
+            let counts = in_hand > 0 || crate::provider_selection::crashed(reason);
+            Some(after_crash(
+                trouble,
+                progress,
+                in_hand,
+                accelerated && counts,
+            ))
+        }
+        // Its process died under a task that was dropped for a reason of its own.
+        Ok(()) if dropped.is_some() && accelerated => Some(after_crash(trouble, progress, 1, true)),
+        _ => None,
+    }
 }
 /// The server withdraws a model from this computer after this many failed tasks in a row
 /// (`native_predictor::counts_against_grant`) and then leases it nothing for that model.
@@ -2215,7 +2301,11 @@ async fn prepare_on(
                         Some(Duration::ZERO)
                     }
                     Step::Dropped(code) => {
-                        trouble.refused();
+                        let on_accelerated = task
+                            .model
+                            .as_deref()
+                            .is_some_and(|model| accelerated_models.contains(model));
+                        trouble.refused(on_accelerated);
                         // The model refused two tasks running with others: most likely too
                         // many for this computer's memory. Half as many from here on.
                         let running = at_once_now.load(Ordering::Acquire);
@@ -2274,40 +2364,46 @@ async fn prepare_on(
                 if recovered {
                     plan.recovered();
                 }
-                // The graphics card's or neural engine's own runtime is the one that ended.
-                let accelerated = predictor
-                    .failed_lane()
-                    .is_some_and(|lane| plan.accelerates(lane));
-                let crash = match &completed {
-                    Err(reason) if runtime_crash(reason) => Some(after_crash(
-                        &mut trouble,
-                        &progress,
-                        in_hand.count(),
-                        accelerated,
-                    )),
-                    // Its process died under a task that was dropped for a reason of its own.
-                    Ok(()) if dropped.is_some() && accelerated => {
-                        Some(after_crash(&mut trouble, &progress, 1, true))
-                    }
-                    _ => None,
-                };
+                let crash = judge(
+                    &mut trouble,
+                    &progress,
+                    &plan,
+                    &completed,
+                    dropped.as_deref(),
+                    in_hand.count(),
+                    predictor.failed_lane(),
+                );
                 match completed {
                     Ok(()) => {
                         // The accelerated runtime crashed out. Decided before qualifying
                         // again, which the same failures can ask for: its work moves to the
                         // processor and it rests, and the setup that follows qualifies anew.
-                        if let (Some(AfterCrash::Failing), Some(code)) = (crash, &dropped) {
-                            let lane = predictor.failed_lane().map(str::to_owned);
-                            let code = crashed_out(crash, code.clone());
-                            if lane.is_some_and(|lane| plan.demote_runtime(&lane, &code)) {
+                        let lane = predictor.failed_lane().map(str::to_owned);
+                        match after_pool(
+                            &mut plan,
+                            crash,
+                            dropped.as_deref(),
+                            lane.as_deref(),
+                            requalify,
+                        ) {
+                            AfterPool::CrashedOut => {
                                 progress.crashed(predictor.exit_report());
                                 predictor.stop()?;
                                 continue 'qualification;
                             }
-                        }
-                        if requalify {
-                            predictor.stop()?;
-                            continue 'qualification;
+                            AfterPool::Requalify => {
+                                // Its process died as well: the wait before it is started
+                                // again is kept.
+                                if let Some(AfterCrash::Again(_)) = crash {
+                                    progress.crashed(predictor.exit_report());
+                                }
+                                predictor.stop()?;
+                                if let Some(AfterCrash::Again(crashes)) = crash {
+                                    restart_wait(crashes, &progress.cancelled).await?;
+                                }
+                                continue 'qualification;
+                            }
+                            AfterPool::Carry => {}
                         }
                         if let Some(code) = dropped {
                             // FD-52: the accelerated runtime's process died while inferring: its
@@ -4389,32 +4485,36 @@ mod tests {
 
     #[test]
     fn a_runtime_that_ends_is_judged_by_the_tasks_it_had_in_hand() {
-        // It did not start (nothing in hand): never a matter of memory, whatever the allowance.
+        // The processor's runtime did not start (nothing in hand): never a matter of memory,
+        // whatever the allowance.
         let mut trouble = RuntimeTrouble::default();
-        assert_eq!(trouble.crashed(0, false), AfterCrash::Failing);
-        assert_eq!(trouble.crashed(0, true), AfterCrash::Failing);
+        assert_eq!(trouble.crashed(0, false, false), AfterCrash::Failing);
+        assert_eq!(trouble.crashed(0, false, true), AfterCrash::Failing);
         // Several in hand: half as many each time, on the same runtime, down to one.
-        assert_eq!(trouble.crashed(8, false), AfterCrash::Fewer(4));
-        assert_eq!(trouble.crashed(4, true), AfterCrash::Fewer(2));
-        assert_eq!(trouble.crashed(3, true), AfterCrash::Fewer(1));
-        assert_eq!(trouble.crashed(2, true), AfterCrash::Fewer(1));
+        assert_eq!(trouble.crashed(8, false, false), AfterCrash::Fewer(4));
+        assert_eq!(trouble.crashed(4, true, true), AfterCrash::Fewer(2));
+        assert_eq!(trouble.crashed(3, true, true), AfterCrash::Fewer(1));
+        assert_eq!(trouble.crashed(2, true, true), AfterCrash::Fewer(1));
         // One task in hand on a graphics card: it keeps the work. The same runtime again,
         // twice, and only the third crash in a row is a failing runtime.
-        assert_eq!(trouble.crashed(1, true), AfterCrash::Again(1));
-        assert_eq!(trouble.crashed(1, true), AfterCrash::Again(2));
-        assert_eq!(trouble.crashed(1, true), AfterCrash::Failing);
+        assert_eq!(trouble.crashed(1, true, true), AfterCrash::Again(1));
+        assert_eq!(trouble.crashed(1, true, true), AfterCrash::Again(2));
+        assert_eq!(trouble.crashed(1, true, true), AfterCrash::Failing);
         // After that the count starts again (the card is tried again later).
-        assert_eq!(trouble.crashed(1, true), AfterCrash::Again(1));
+        assert_eq!(trouble.crashed(1, true, false), AfterCrash::Again(1));
+        // Its process found gone between tasks is a crash like any other: one of the three.
+        assert_eq!(trouble.crashed(0, true, false), AfterCrash::Again(2));
+        assert_eq!(trouble.crashed(0, true, false), AfterCrash::Failing);
         // A task finished in between starts that count again too.
         let mut trouble = RuntimeTrouble::default();
-        assert_eq!(trouble.crashed(1, true), AfterCrash::Again(1));
-        assert_eq!(trouble.crashed(1, true), AfterCrash::Again(2));
+        assert_eq!(trouble.crashed(1, true, false), AfterCrash::Again(1));
+        assert_eq!(trouble.crashed(1, true, false), AfterCrash::Again(2));
         // The processor finishing other work in between does not end the row.
         assert_eq!(trouble.completed(false), (false, false));
-        assert_eq!(trouble.crashed(1, true), AfterCrash::Failing);
-        assert_eq!(trouble.crashed(1, true), AfterCrash::Again(1));
+        assert_eq!(trouble.crashed(1, true, false), AfterCrash::Failing);
+        assert_eq!(trouble.crashed(1, true, false), AfterCrash::Again(1));
         assert_eq!(trouble.completed(true), (false, false));
-        assert_eq!(trouble.crashed(1, true), AfterCrash::Again(1));
+        assert_eq!(trouble.crashed(1, true, false), AfterCrash::Again(1));
         // The third crash under a task dropped for its own reason is still the runtime
         // crashing out; a hand-back and a crash code are kept as they are.
         let out = |crash, code: &str| crashed_out(crash, code.to_owned());
@@ -4440,25 +4540,30 @@ mod tests {
         let mut last = (None, false);
         for _ in 0..CRASHES_AT_ONE {
             let requalify = strikes.failed(Some("clip"), "worker_execution_deadline");
-            last = (Some(trouble.crashed(1, true)), requalify);
+            last = (Some(trouble.crashed(1, true, false)), requalify);
         }
         assert_eq!(last, (failing, true));
         assert_eq!(
             out(last.0, "worker_execution_deadline"),
             "runtime_process_stopped"
         );
-        // The processor's own runtime has nowhere to fall back to: counted by the restarts.
-        assert_eq!(
-            RuntimeTrouble::default().crashed(1, false),
-            AfterCrash::Failing
-        );
+        // The processor's own runtime has nowhere to fall back to. One task at a time from
+        // the start: failing at the first crash, counted by the restarts, as it always was.
+        let mut trouble = RuntimeTrouble::default();
+        assert_eq!(trouble.crashed(1, false, false), AfterCrash::Failing);
+        // At one after stepping down: the same runtime once more, then it is failing; a
+        // task finished in between starts that count again.
+        assert_eq!(trouble.crashed(1, false, true), AfterCrash::Again(1));
+        assert_eq!(trouble.completed(false), (false, false));
+        assert_eq!(trouble.crashed(1, false, true), AfterCrash::Again(1));
+        assert_eq!(trouble.crashed(1, false, true), AfterCrash::Failing);
 
         // A long run of finished tasks lets one more run at once; trouble starts the run again.
         let mut trouble = RuntimeTrouble::default();
         for _ in 1..CLEAN_RUN {
             assert_eq!(trouble.completed(false), (false, false));
         }
-        trouble.refused();
+        trouble.refused(false);
         for _ in 1..CLEAN_RUN {
             assert_eq!(trouble.completed(false), (false, false));
         }
@@ -4469,6 +4574,12 @@ mod tests {
             assert!(!trouble.completed(true).1);
         }
         assert!(trouble.completed(true).1);
+        // A task of its own dropped in between starts that run again; the processor's does not.
+        for _ in 1..CLEAN_RUN {
+            assert!(!trouble.completed(true).1);
+        }
+        trouble.refused(false);
+        trouble.refused(true);
         assert!(!trouble.completed(true).1);
         let progress = quiet();
         progress.raise_capacity();
@@ -4540,6 +4651,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_graphics_card_whose_runtime_dies_under_one_task_keeps_the_work_until_the_third() {
+        use crate::native_predictor::{testing::DyingRuntime, Pool, TaskStep};
+        use crate::provider_selection::tests::{directory, end_rest, plan_on};
+        // The real predictor over a real runtime process that ends by itself when its one
+        // task reaches it, three times in a row, judged as the work loop judges it.
+        let runtime = DyingRuntime::build();
+        let manifest = runtime.manifest().to_owned();
+        let data = directory();
+        let mut plan = plan_on(&data, &manifest, "driver-1");
+        assert!(plan.accelerates(&manifest));
+        let server = FakeServer::start();
+        let device = server.enrol();
+        let worker = server.session(&device).await.unwrap();
+        let qualification = server.qualification(&worker).await;
+        let (progress, mut trouble) = (quiet(), RuntimeTrouble::default());
+        let mut judged = Vec::new();
+        for crash in 1..=CRASHES_AT_ONE {
+            server.queue(&device, 1);
+            let mut predictor = runtime.start("fixture-model", qualification.id());
+            let (_keep, mut cancel) = tokio::sync::watch::channel(false);
+            let claimed = AtomicUsize::new(0);
+            let pool = Pool {
+                slots: &|| None,
+                keep_claiming: &|| claimed.load(Ordering::Acquire) == 0,
+                abandon: &|| {},
+            };
+            let quals = [&qualification];
+            let before = server.claims_received();
+            let ended = predictor
+                .work(
+                    &worker,
+                    &quals,
+                    &mut cancel,
+                    &pool,
+                    |_| {},
+                    |_: TaskStep| {
+                        claimed.fetch_add(1, Ordering::AcqRel);
+                        Some(Duration::ZERO)
+                    },
+                )
+                .await;
+            // Its one task was leased, the prediction broke off, and the predictor (which
+            // then stops every process itself) still names the runtime that died.
+            assert!(server.claims_received() > before);
+            assert_eq!(ended, Err("runtime_prediction_interrupted".into()));
+            assert_eq!(predictor.failed_lane(), Some(manifest.as_str()));
+            assert!(!predictor.is_running().unwrap());
+            // One task in hand (the fixture's model key names no workload, so the claim
+            // is not announced to the caller here).
+            let lane = predictor.failed_lane();
+            judged.push(judge(&mut trouble, &progress, &plan, &ended, None, 1, lane));
+            if crash < CRASHES_AT_ONE {
+                // The graphics card keeps the work, and nothing rests.
+                assert!(plan.accelerates(&manifest) && plan.rest_ends().is_none());
+            }
+        }
+        assert_eq!(
+            judged,
+            [
+                Some(AfterCrash::Again(1)),
+                Some(AfterCrash::Again(2)),
+                Some(AfterCrash::Failing)
+            ]
+        );
+        assert_eq!(progress.capacity_ceiling(), None);
+        // The third: the work loop moves that runtime's work to the processor, with the
+        // reason, and it rests.
+        assert!(plan.demote_runtime(&manifest, "runtime_prediction_interrupted"));
+        assert!(!plan.accelerates(&manifest) && plan.rest_ends().is_some());
+        let next = plan_on(&data, &manifest, "driver-1");
+        assert!(next.rest_ends().is_some() && !next.accelerates(&manifest));
+        assert!(next
+            .providers()
+            .iter()
+            .any(|chosen| chosen.fallback.as_deref() == Some("runtime_prediction_interrupted")));
+        // After the rest the plan made then tries the graphics card again.
+        end_rest(&data);
+        let again = plan_on(&data, &manifest, "driver-1");
+        assert!(again.accelerates(&manifest) && again.rest_ends().is_none());
+        crate::provider_selection::forget(&data);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[tokio::test]
     async fn claims_for_more_room_back_off_and_a_finished_task_asks_at_once() {
         use crate::native_predictor::pool_with;
         let server = FakeServer::start();
@@ -4573,6 +4768,12 @@ mod tests {
         let after = times[4].saturating_duration_since(finished).as_millis();
         assert!(after < 900, "{after}");
         assert!(gap(3, 4) < 3900, "{}", gap(3, 4));
+        // The waits the pool uses, in full: 1, 2, 4 and 8 seconds, and never more than 8.
+        let waits: Vec<u64> = (0..7)
+            .map(|empty| crate::native_predictor::refill_wait(empty).as_secs())
+            .collect();
+        assert_eq!(waits, [1, 2, 4, 8, 8, 8, 8]);
+        assert_eq!(crate::native_predictor::refill_wait(u32::MAX).as_secs(), 8);
     }
 
     #[tokio::test]

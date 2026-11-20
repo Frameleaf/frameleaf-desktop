@@ -92,7 +92,9 @@ pub(crate) fn labels(status: &SetupStatus, connected: bool) -> Labels {
                     .is_some_and(crate::provider_selection::crashed)
             });
         match resting {
-            true => format!("AI processing: {word} on the processor (GPU stopped, retried later)"),
+            true => format!(
+                "AI processing: {word} on the processor (acceleration stopped, retried later)"
+            ),
             false => format!("AI processing: {word}"),
         }
     };
@@ -606,7 +608,7 @@ mod tests {
         working.providers = vec![provider(Some("runtime_process_stopped"))];
         assert_eq!(
             labels(&working, true).worker,
-            "AI processing: working on the processor (GPU stopped, retried later)"
+            "AI processing: working on the processor (acceleration stopped, retried later)"
         );
         // Another reason for the processor is the AI page's to explain, as before.
         working.providers = vec![provider(Some("provider_slower")), provider(None)];

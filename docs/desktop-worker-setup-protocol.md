@@ -211,21 +211,27 @@ lease".
       each crash in a row. One crash never moves the work to the processor.
     - Only the third crash in a row, with no task finished on that runtime in between, moves
       its work to the processor (a task the processor finishes beside it does not end the
-      row). A crash under a task that was dropped for a reason of its own, such as its
-      deadline, counts the same, and the third is shown as the process having stopped. The
-      tray then says "on the processor (GPU stopped, retried
-      later)" and the AI page says the process stopped three times in a row and is tried
-      again later.
+      row). What counts as one of the three: its process ending or its answer breaking off
+      under its one task; its process found gone between tasks; and its process dying under
+      a task that was dropped for a reason of its own, such as its deadline (the third is
+      then shown as the process having stopped). When the same failures also ask the desktop
+      to qualify again, the move to the processor comes first, and a restart keeps its wait.
+      The tray then says "on the processor (acceleration stopped, retried later)" and the AI
+      page says the process stopped three times in a row and is tried again later.
     - That move is not lasting. Nothing is written to disk, so the next start of the app
       tries the graphics card at once. While the app runs it is tried again by itself after
       30 minutes; if it crashes out again without 50 of its own tasks finished in a row in
-      between, the wait doubles each time, up to 8 hours. **Retry Setup** tries it at once.
+      between (one of its tasks dropped starts the 50 again), the wait doubles each time, up
+      to 8 hours. **Retry Setup** tries it at once. Earlier versions remembered such a crash
+      on disk as lastingly as a failed check: that record is ignored from now on, so a
+      computer moved to the processor by it tries its graphics card again.
     - Unchanged: a provider that fails its check (a different answer on the test picture, a
       signature or runtime the server does not accept, slower than the processor) is
       remembered for that runtime and device until a newer runtime or Retry Setup. A runtime
-      that does not start in time moves to the processor for that run, as before. The
-      processor's own runtime has nowhere to move to: its crashes are counted across
-      restarts (`runtime_crash_loop`).
+      that starts and does not answer in time moves to the processor for that run, as
+      before. The processor's own runtime has nowhere to move to: at one task at a time
+      after a step down it is started once more, and otherwise its crashes are counted
+      across restarts (`runtime_crash_loop`), as before.
     It does not stop. After 50 tasks in a row with none refused and no crash, one more runs
     at once again, up to what the server allows and this computer can take; until then, and
     after stopping and starting AI processing, the number starts from the estimate again.

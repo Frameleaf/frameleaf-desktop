@@ -453,6 +453,13 @@ impl Failures {
             })
             .map(|saved| (saved.failures, saved.measured))
             .unwrap_or_default();
+        // Earlier versions remembered a crash as lastingly as a failed check. It is not a
+        // verdict on the provider (`crashed`): such a record is dropped, so the provider is
+        // tried again, and it leaves the file the next time something is remembered.
+        let codes: BTreeMap<String, String> = codes
+            .into_iter()
+            .filter(|(_, code)| !crashed(code))
+            .collect();
         Self {
             path: path.into(),
             runtime: runtime.into(),
@@ -1093,7 +1100,7 @@ pub(crate) fn reclaim_superseded(data: &Path, bundle: &Path, active: &str) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     const COREML: &str = "CoreMLExecutionProvider";
     const CUDA: &str = "CUDAExecutionProvider";
@@ -1515,7 +1522,63 @@ mod tests {
         assert!(!profiles.is_empty(), "{name} {provider}");
         profiles
     }
-    fn directory() -> PathBuf {
+    #[test]
+    fn a_crash_out_moves_the_work_and_rests_even_when_the_same_failures_ask_to_qualify_again() {
+        use crate::worker_setup::{after_pool, AfterCrash, AfterPool};
+        let (root, manifest) = (directory(), "a".repeat(64));
+        let failing = Some(AfterCrash::Failing);
+        let deadline = Some("worker_execution_deadline");
+        // The third crash in a row, under a task dropped for its deadline, at the moment
+        // three acknowledged failures of that model ask to qualify again.
+        let mut plan = plan_on(&root, &manifest, "driver-7");
+        assert_eq!(
+            after_pool(&mut plan, failing, deadline, Some(&manifest), true),
+            AfterPool::CrashedOut
+        );
+        assert!(plan.rest_ends().is_some() && !plan.accelerates(&manifest));
+        // The plan made by the setup that follows keeps the processor, with the reason shown.
+        let next = plan_on(&root, &manifest, "driver-7");
+        assert!(next.rest_ends().is_some());
+        assert!(next
+            .providers()
+            .iter()
+            .any(|provider| provider.fallback.as_deref() == Some("runtime_process_stopped")));
+        // Without a crash-out the wish to qualify again stands, and nothing rests.
+        let other = directory();
+        let mut plan = plan_on(&other, &manifest, "driver-7");
+        for crash in [None, Some(AfterCrash::Again(2))] {
+            assert_eq!(
+                after_pool(&mut plan, crash, deadline, Some(&manifest), true),
+                AfterPool::Requalify
+            );
+        }
+        assert_eq!(
+            after_pool(&mut plan, None, deadline, Some(&manifest), false),
+            AfterPool::Carry
+        );
+        // A task handed back under a dead process is not a crash-out.
+        assert_eq!(
+            after_pool(
+                &mut plan,
+                failing,
+                Some("worker_cancelled"),
+                Some(&manifest),
+                false
+            ),
+            AfterPool::Carry
+        );
+        assert!(plan.rest_ends().is_none() && plan.accelerates(&manifest));
+        for root in [root, other] {
+            forget(&root);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+    /// End the rest of the accelerated runtime remembered for this data directory now.
+    pub(crate) fn end_rest(root: &Path) {
+        let mut rests = RESTS.lock().unwrap();
+        rests.get_mut(&root.join(REMEMBERED)).unwrap().until = std::time::Instant::now();
+    }
+    pub(crate) fn directory() -> PathBuf {
         let root = std::env::temp_dir()
             .canonicalize()
             .unwrap()
@@ -1526,7 +1589,7 @@ mod tests {
     fn plan(root: &Path, manifest: &str) -> Plan {
         plan_on(root, manifest, "")
     }
-    fn plan_on(root: &Path, manifest: &str, device: &str) -> Plan {
+    pub(crate) fn plan_on(root: &Path, manifest: &str, device: &str) -> Plan {
         Plan::new(
             vec![
                 group("ViT-B-32__openai", CPU),
@@ -1665,13 +1728,27 @@ mod tests {
         let third = directory();
         let mut failing = plan(&third, &manifest);
         assert!(!failing.measured("face", Some(20.0), Some(28.0)));
-        assert!(failing.demote("face", "runtime_process_stopped", true));
+        assert!(failing.demote("face", "runtime_output_mismatch", true));
         let after = plan(&third, &manifest);
         assert_eq!(
             chosen(&after)[2],
-            row("face", CPU, Some("runtime_process_stopped"))
+            row("face", CPU, Some("runtime_output_mismatch"))
         );
         assert!(!after.unmeasured("face"));
+        // A crash that an earlier version remembered on disk as if it were a failed check
+        // is ignored: the provider is tried again, and the failed check beside it stands.
+        let old = directory();
+        let mut crashed_before = plan(&old, &manifest);
+        assert!(crashed_before.demote("clip", "runtime_process_stopped", true));
+        assert!(crashed_before.demote("face", "runtime_output_mismatch", true));
+        let saved = std::fs::read_to_string(old.join(REMEMBERED)).unwrap();
+        assert!(saved.contains("runtime_process_stopped"), "{saved}");
+        let now = plan(&old, &manifest);
+        assert_eq!(chosen(&now)[0], row("clip", COREML, None));
+        assert_eq!(
+            chosen(&now)[2],
+            row("face", CPU, Some("runtime_output_mismatch"))
+        );
 
         // A record written before measurements existed still loads; one naming an unknown
         // workload as faster remembers nothing.
