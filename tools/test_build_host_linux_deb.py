@@ -245,6 +245,10 @@ class LinuxHostDebTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == 'posix', 'requires POSIX shell')
     def test_hooks_fence_before_replacement_and_preserve_refusals_and_data(self):
+        # The hooks refuse group- or world-writable files, as dpkg installs none; files this
+        # test makes follow the umask, which some runners leave at 002.
+        previous = os.umask(0o022)
+        self.addCleanup(os.umask, previous)
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()
             marker, fail = root / 'called', root / 'fail'

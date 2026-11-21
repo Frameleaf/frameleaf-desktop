@@ -204,12 +204,55 @@ lease".
       on;
     - the runtime process ends or stops answering with several tasks in hand: half as many
       as it had in hand, and half again each time it happens, down to one. The graphics card
-      keeps the work. What counts is the tasks actually in hand, not the number allowed.
-    - at one task at a time after such a step down, the runtime is started once more on the
-      same device; only when it ends again, with no task finished in between, is it treated
-      as failing (the work then moves to the processor, as before).
-    - a runtime that does not start at all, or one that ends with its only task on a
-      computer that never stepped down, is treated as failing at once, as before.
+      keeps the work. What counts is the tasks actually in hand, not the number allowed,
+      and a task dropped for a reason of its own while the crash was being reported is still
+      one of them.
+    - **The graphics card keeps the work after a crash** (owner decision: "Yes, keep the
+      GPU"). With one task in hand, a graphics card's or neural engine's runtime that ends
+      or stops answering is started again on the same device, after a wait that grows with
+      each crash in a row. One crash never moves the work to the processor.
+    - Only the third crash in a row, with no task finished on that runtime in between, moves
+      its work to the processor (a task the processor finishes beside it does not end the
+      row). What counts as one of the three: its process ending or its answer breaking off
+      under its one task, whether its process is already gone or still lingers; its process found gone between tasks; and its process dying under
+      a task that was dropped for a reason of its own, such as its deadline (the third is
+      then shown as the process having stopped). The count is kept while the app runs: a
+      setup that starts again in between (a lost session, say) does not start it again, and
+      Retry Setup does. When the same failures also ask the desktop
+      to qualify again, the move to the processor comes first, and a restart keeps its wait.
+      The tray then says "on the processor (acceleration stopped, retried later)" and the AI
+      page says the process stopped three times in a row and is tried again later.
+    - The server keeps its own count of failures per computer and model, apart from this
+      count of crashes, and withdraws the model at its third failure (see Grant
+      withdrawal); failures reported before a crash count toward that too, so one crash can
+      be the third. A crash under a task is reported as one `model-unavailable` for that
+      task's model, unless the task failed for its own reason first (its deadline, say:
+      then it is reported as that failure, `inference-failed`). A process found gone
+      between tasks reports nothing. From server PR 1370 on, each reported failure counts;
+      server `frameleaf-v1.2.25` and earlier count failures within 10 seconds of the first
+      as one, so crashes close together count once there. A withdrawn model is held for 300
+      seconds before it may qualify again (`desktop_qualification_hold`, for that model on
+      this computer whatever the device): the processor takes that model's work after the
+      hold. While nothing else qualifies and the graphics card rests, the desktop sets up
+      again after 5½ minutes, or sooner when the rest ends first. The computer's other
+      models carry on meanwhile.
+    - That move is not lasting. Nothing is written to disk, so the next start of the app
+      tries the graphics card at once. While the app runs it is tried again by itself after
+      30 minutes; if it crashes out again without 50 of its own tasks finished in a row in
+      between (one of its tasks dropped starts the 50 again), the wait doubles each time, up
+      to 8 hours. **Retry Setup** tries it at once. Earlier versions remembered such a crash
+      on disk as lastingly as a failed check: that record is ignored from now on, so a
+      computer moved to the processor by it tries its graphics card again.
+    - When the graphics card is resting and nothing else qualifies either (the processor
+      fails its own check for the only task), AI processing does not stop for good: the
+      reason is shown while it waits, and at the end of the rest it sets up again.
+    - Unchanged: a provider that fails its check (a different answer on the test picture, a
+      signature or runtime the server does not accept, slower than the processor) is
+      remembered for that runtime and device until a newer runtime or Retry Setup. A runtime
+      that starts and does not answer in time moves to the processor for that run, as
+      before. The processor's own runtime has nowhere to move to: at one task at a time
+      after a step down it is started once more, at once, and otherwise its crashes are
+      counted across restarts (`runtime_crash_loop`), as before.
     It does not stop. After 50 tasks in a row with none refused and no crash, one more runs
     at once again, up to what the server allows and this computer can take; until then, and
     after stopping and starting AI processing, the number starts from the estimate again.
@@ -225,7 +268,7 @@ lease".
 - **Each task is reported as soon as it is done**, its result or its failure, without waiting
   for the others in hand.
 - **A runtime that ends under several tasks is one failure.** One of the tasks in hand is
-  reported `model-unavailable` and the others are handed back `cancelled`, so the server's
+  reported `model-unavailable` first, and only then are the others handed back `cancelled`, so the server's
   count toward withdrawing the model goes up by one, not by the number of tasks. If that one
   report does not arrive it is sent once more, and failing that the next task still in hand
   carries it, so the crash is not counted as nothing. This is a

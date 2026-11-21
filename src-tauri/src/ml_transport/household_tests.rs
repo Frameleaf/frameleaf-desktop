@@ -71,6 +71,7 @@ struct State {
     /// Claims that have arrived, counted before they are answered, and how long each is
     /// kept waiting for its answer (a slow link).
     claims_received: u32,
+    claim_times: Vec<std::time::Instant>,
     claim_delay: std::time::Duration,
     /// Every authenticated request's path, in the order the server handled it.
     handled: Vec<String>,
@@ -322,6 +323,7 @@ fn serve(mut stream: TcpStream, state: &StdMutex<State>) -> Option<()> {
         let delay = {
             let mut state = state.lock().unwrap();
             state.claims_received += 1;
+            state.claim_times.push(std::time::Instant::now());
             state.claim_delay
         };
         std::thread::sleep(delay);
@@ -498,6 +500,10 @@ impl FakeServer {
     /// Keep every claim waiting this long for its answer.
     pub(crate) fn slow_claims(&self, delay: std::time::Duration) {
         self.state.lock().unwrap().claim_delay = delay;
+    }
+    /// When each claim arrived.
+    pub(crate) fn claim_times(&self) -> Vec<std::time::Instant> {
+        self.state.lock().unwrap().claim_times.clone()
     }
     /// How many claims have arrived, answered or not.
     pub(crate) fn claims_received(&self) -> u32 {
