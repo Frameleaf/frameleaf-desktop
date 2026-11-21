@@ -42,6 +42,8 @@ jobs:
       revision: ${{ steps.source.outputs.revision }}
       matrix: ${{ steps.source.outputs.matrix }}
       companions: ${{ steps.companions.outputs.plan }}
+      # Read once, here: the build matrix and the build job's guards all follow this one value.
+      owner_mac: ${{ steps.source.outputs.owner_mac }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -89,7 +91,8 @@ jobs:
           node --input-type=module -e '
             import { appendFileSync } from "node:fs";
             import { releaseMatrix } from "./tools/release_inputs.mjs";
-            appendFileSync(process.env.GITHUB_OUTPUT, "matrix=" + JSON.stringify(releaseMatrix(process.env.RELEASE_PLATFORMS, { ownerMac: process.env.OWNER_MAC === "true" })) + "\n");
+            const ownerMac = process.env.OWNER_MAC === "true";
+            appendFileSync(process.env.GITHUB_OUTPUT, "matrix=" + JSON.stringify(releaseMatrix(process.env.RELEASE_PLATFORMS, { ownerMac })) + "\n" + "owner_mac=" + ownerMac + "\n");
           '
           [[ "$RUNTIME_RUN_ID" =~ ^[1-9][0-9]*$ ]] || fail "runtime_run_id must be the numeric id of a factory-runtime.yml run."
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUNTIME_RUN_ID" > "$RUNNER_TEMP/runtime-run.json"
@@ -297,7 +300,7 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           PROFILE_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_PROVISION_PROFILE }}
-          OWNER_MAC: ${{ github.server_url != 'https://github.com' && vars.DESKTOP_RELEASE_MACOS_ON_OWNER_MAC == 'true' }}
+          OWNER_MAC: ${{ needs.prepare.outputs.owner_mac }}
         shell: bash
         run: |
           set -euo pipefail
@@ -328,13 +331,13 @@ jobs:
           fi
       - name: Exercise the production Keychain entitlements on a disposable macOS user
         # It writes to the signed-in user's keychain: never on the owner's own Mac.
-        if: runner.os == 'macOS' && !(github.server_url != 'https://github.com' && vars.DESKTOP_RELEASE_MACOS_ON_OWNER_MAC == 'true')
+        if: runner.os == 'macOS' && needs.prepare.outputs.owner_mac != 'true'
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         shell: bash
         run: bash tools/qualify_signed_macos_keychain.sh
       - name: Say which checks the owner's Mac did not run
-        if: runner.os == 'macOS' && github.server_url != 'https://github.com' && vars.DESKTOP_RELEASE_MACOS_ON_OWNER_MAC == 'true'
+        if: runner.os == 'macOS' && needs.prepare.outputs.owner_mac == 'true'
         shell: bash
         run: |
           echo '::warning::Not run on the owner'"'"'s Mac: the production Keychain entitlement check (it writes to the signed-in user'"'"'s keychain).'
