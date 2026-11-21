@@ -941,3 +941,21 @@ own copies as repository secrets:
   slot built from `ghcr.io/catthehacker/ubuntu:runner-22.04`). There is no Intel Mac or Arm Linux
   runner, and the one Mac runner is the owner's own Mac, so macOS and `linux-aarch64` cannot be
   released until such runners exist; choose `linux-x86_64` rather than `linux`.
+
+### Apple Silicon on the owner's own Mac (opt-in)
+
+Forgejo's only Mac runner (`mac`, label `macos-26`) is the owner's own Mac, so Apple Silicon is
+refused there by default. The owner allowed it for 0.1.7 (2026-11-20: "Yes, use my Mac"). The
+opt-in is the repository variable `DESKTOP_RELEASE_MACOS_ON_OWNER_MAC=true`: while it is set, the
+factory and release workflows build `macos-aarch64` on that Mac; unset it afterwards, and every
+other run stays refused. On that Mac a job:
+
+- signs only with a keychain it creates under its own `RUNNER_TEMP` and deletes in its cleanup
+  step, which also removes the certificate and profile files and puts the user's keychain search
+  list back as it was;
+- does not launch the installed app (that check ends every running Frameleaf and uses the
+  signed-in user's app data) and does not run the production Keychain entitlement check (it writes
+  to the signed-in user's keychain). Both are named in the run's warnings and summary, and the
+  release notes say they were not run for that build.
+
+Intel Macs (`macos-x86_64`) have no runner on Forgejo and stay on their installed version.

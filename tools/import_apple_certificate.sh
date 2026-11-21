@@ -13,5 +13,11 @@ security import "$RUNNER_TEMP/developer-id.p12" -k "$keychain" -P "$APPLE_CERTIF
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain"
 security find-identity -v -p codesigning "$keychain" |
   awk -F'"' -v identity="$APPLE_SIGNING_IDENTITY" '$2 == identity { matches++ } END { exit matches != 1 }'
-security list-keychains -d user -s "$keychain"
+# The job's keychain goes first in the user's search list; the list as it was is kept beside it
+# and restored by the job's cleanup, so a runner that is a person's own Mac keeps its keychains.
+search_list="$RUNNER_TEMP/keychain-search-list"
+[[ -f "$search_list" ]] || security list-keychains -d user | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//' > "$search_list"
+kept=()
+while IFS= read -r item; do [[ -n "$item" && "$item" != "$keychain" ]] && kept+=("$item"); done < "$search_list"
+security list-keychains -d user -s "$keychain" ${kept[@]+"${kept[@]}"}
 rm "$RUNNER_TEMP/developer-id.p12"

@@ -47,10 +47,19 @@ const selections = {
 };
 export const releasePlatformChoices = Object.keys(selections);
 
-export function releaseMatrix(platforms) {
+// The label of the owner's own Mac on Forgejo, used for Apple Silicon only when the owner opted in.
+export const OWNER_MAC_LABEL = "macos-26";
+
+/** `ownerMac`: on Forgejo, with the owner's opt-in, Apple Silicon builds on the owner's own Mac. */
+export function releaseMatrix(platforms, { ownerMac = false } = {}) {
   if (typeof platforms !== "string" || !Object.hasOwn(selections, platforms))
     throw new Error("release_platforms_invalid");
-  return { include: selections[platforms].map((target) => ({ ...targets[target] })) };
+  return {
+    include: selections[platforms].map((target) => ({
+      ...targets[target],
+      ...(ownerMac && target === "macos-aarch64" ? { os: OWNER_MAC_LABEL } : {}),
+    })),
+  };
 }
 
 // FL-1699: on Forgejo (code.heroapps.ca) the labels above stay GitHub's, and a target is built only
@@ -61,11 +70,15 @@ const noForgejoRunner = {
   // linux-x86_64 builds on the Unraid slot labelled ubuntu-22.04 (FL-1699).
   "linux-aarch64": "Forgejo has no Ubuntu 22.04 Arm runner (Linux builds need its glibc 2.35)",
 };
-/** Why each selected target cannot build on Forgejo: `stage` is "runtime" (factory packs) or "installer". */
-export function forgejoTargetProblems(platforms, stage) {
+/**
+ * Why each selected target cannot build on Forgejo: `stage` is "runtime" (factory packs) or "installer".
+ * `ownerMac`: the owner allowed their own Mac for Apple Silicon (repository variable
+ * `DESKTOP_RELEASE_MACOS_ON_OWNER_MAC`, docs/releases.md); without it that target stays refused.
+ */
+export function forgejoTargetProblems(platforms, stage, { ownerMac = false } = {}) {
   if (stage !== "runtime" && stage !== "installer") throw new Error("forgejo_stage_invalid");
   return releaseMatrix(platforms).include.flatMap(({ target }) => {
-    const reason = noForgejoRunner[target];
+    const reason = ownerMac && target === "macos-aarch64" ? undefined : noForgejoRunner[target];
     return reason ? [`${target}: ${reason}`] : [];
   });
 }

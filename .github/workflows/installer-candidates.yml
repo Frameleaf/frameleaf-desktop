@@ -42,10 +42,11 @@ jobs:
         if: github.server_url != 'https://github.com'
         env:
           RELEASE_PLATFORMS: ${{ inputs.platforms }}
+          OWNER_MAC: ${{ github.server_url != 'https://github.com' && vars.DESKTOP_RELEASE_MACOS_ON_OWNER_MAC == 'true' }}
         run: |
           node --input-type=module -e '
             import { forgejoTargetProblems } from "./tools/release_inputs.mjs";
-            const problems = forgejoTargetProblems(process.env.RELEASE_PLATFORMS, "installer");
+            const problems = forgejoTargetProblems(process.env.RELEASE_PLATFORMS, "installer", { ownerMac: process.env.OWNER_MAC === "true" });
             for (const problem of problems) console.log(`::error::${problem}`);
             process.exitCode = problems.length ? 1 : 0;
           '
