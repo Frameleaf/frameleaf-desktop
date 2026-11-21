@@ -244,8 +244,10 @@ test('each worker failure family shows its own reason and the action that fixes 
 test('a Windows update stops the library itself, and says why when that cannot be proven', () => {
   const updates = readFileSync(new URL('../src-tauri/src/updates.rs', import.meta.url), 'utf8');
   const install = updates.slice(updates.indexOf('async fn install_desktop_update'));
-  // Windows: download, stop in order, take the gate, install. Elsewhere the gate comes first, as before.
-  assert.match(install, /#\[cfg\(not\(windows\)\)\]\s*let _owner = host\.lock_for_update\(\)\?;[\s\S]*\.download\([\s\S]*#\[cfg\(windows\)\]\s*let _owner = \{\s*host\s*\.stop_for_update\(\)\s*\.await\s*\.map_err\(stop_refused\)\?;\s*host\.lock_for_update\(\)\?\s*\};[\s\S]*update\.install\(bytes\)/);
+  // Both gates are checked before the download and released during it (it can take long), then
+  // taken again after it and held through install. Windows: download, stop in order, take the gate,
+  // install. Elsewhere the library must already be idle when the gate is taken.
+  assert.match(install, /#\[cfg\(not\(windows\)\)\]\s*drop\(host\.lock_for_update\(\)\?\);\s*drop\(copies\.lock_for_update\(\)\?\);[\s\S]*\.download\([\s\S]*#\[cfg\(not\(windows\)\)\]\s*let _owner = host\.lock_for_update\(\)\?;\s*let media_copy = copies\.lock_for_update\(\)\?;[\s\S]*#\[cfg\(windows\)\]\s*let _owner = \{\s*host\s*\.stop_for_update\(\)\s*\.await\s*\.map_err\(stop_refused\)\?;\s*host\.lock_for_update\(\)\?\s*\};[\s\S]*let _media_copy = media_copy;[\s\S]*update\.install\(bytes\)/);
   // The stop is the orderly one, which needs the journal's idle proof, and it opens no gate by itself.
   const host = readFileSync(new URL('../src-tauri/src/host_setup.rs', import.meta.url), 'utf8');
   assert.match(host, /pub\(crate\) async fn stop_for_update\(&self\) -> Result<\(\), String> \{\s*self\.stop_proven\(true\)\.await\.map\(\|_\| \(\)\)\s*\}/);
