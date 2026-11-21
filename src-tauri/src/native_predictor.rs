@@ -129,11 +129,17 @@ impl BoundClient {
             .client
             .post(format!("{}/predict", self.base))
             .bearer_auth(self.token.as_str())
-            .timeout(duration)
+            // A backstop only: the task's own deadline (`race_prediction`) ends a slow
+            // prediction first, so a healthy runtime that runs late is never taken for one
+            // whose answer broke off.
+            .timeout(duration + PREDICTION_TIMEOUT_SLACK)
             .multipart(form)
             .send()
             .await
-            .map_err(|_| "runtime_prediction_interrupted")?;
+            .map_err(|error| match error.is_timeout() {
+                true => "worker_execution_deadline",
+                false => "runtime_prediction_interrupted",
+            })?;
         let value: Value = transport::json_limit(response, 4 * 1024 * 1024).await?;
         if !value.is_object() {
             return Err("runtime_prediction_invalid".into());
@@ -390,7 +396,7 @@ where
 {
     use futures_util::{stream::FuturesUnordered, StreamExt};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    let (in_hand, crash_reported) = (AtomicUsize::new(0), AtomicBool::new(false));
+    let (in_hand, crash_reported) = (AtomicUsize::new(0), tokio::sync::Mutex::new(false));
     // The runtime was stopped under an abandoned prediction: nothing more is started on it.
     let stopped = AtomicBool::new(false);
     let (in_hand, crash_reported, stopped, predict) =
@@ -515,9 +521,8 @@ where
                         running.push(work(index, task, cancel.clone()));
                     }
                     None => {
-                        let wait = (1u64 << empty.min(3)).min(REFILL_WAIT_MOST);
+                        next_claim = tokio::time::Instant::now() + refill_wait(empty);
                         empty += 1;
-                        next_claim = tokio::time::Instant::now() + Duration::from_secs(wait);
                     }
                 }
             }
@@ -616,6 +621,11 @@ where
 const CRASH_REPORT_RETRY: Duration = Duration::from_secs(1);
 /// How long a claim for more room is held off, at most, while the server has nothing to give.
 const REFILL_WAIT_MOST: u64 = 8;
+/// The wait before the next claim for more room, after `empty` of them in a row were
+/// answered with nothing: 1, 2, 4 and then 8 seconds.
+pub(crate) fn refill_wait(empty: u32) -> Duration {
+    Duration::from_secs((1u64 << empty.min(3)).min(REFILL_WAIT_MOST))
+}
 /// `crash_reported`: shared by the tasks in hand together. When the runtime process ends
 /// under several of them, one is reported as `model-unavailable` and the rest are handed back
 /// as `cancelled`: it was one failure of the runtime, and the server, which withdraws a model
@@ -625,28 +635,39 @@ async fn settle(
     task: &ClaimedTask,
     qualification: &AcceptedQualification,
     outcome: Result<(), TaskFailure>,
-    crash_reported: &std::sync::atomic::AtomicBool,
+    crash_reported: &tokio::sync::Mutex<bool>,
 ) -> Result<(Step, bool), String> {
     let Err(failure) = outcome else {
         return Ok((Step::Completed, false));
     };
     let mut reported = false;
     if !lease_gone(&failure.code) {
-        use std::sync::atomic::Ordering;
         let mut report = failure_report(&failure.code);
-        let crash = matches!(report, WorkerFailure::ModelUnavailable);
-        if crash && crash_reported.swap(true, Ordering::AcqRel) {
-            report = WorkerFailure::Cancelled;
+        // The one report that stands for the whole crash goes first: the server takes the
+        // hand-backs that follow a `model-unavailable` as part of that failure, and would
+        // count one that came before it as a hand-back of its own. The others wait here
+        // until it has been sent.
+        let mut first = None;
+        if matches!(report, WorkerFailure::ModelUnavailable) {
+            let mut told = crash_reported.lock().await;
+            match *told {
+                true => report = WorkerFailure::Cancelled,
+                false => {
+                    *told = true;
+                    first = Some(told);
+                }
+            }
         }
         let mut sent = transport.fail(task, report, qualification).await;
-        // The one report that stands for the whole crash must arrive, or the server counts
-        // the crash as nothing: it is sent once more, and if that fails too, the next task
-        // still in hand carries it instead.
-        if crash && matches!(report, WorkerFailure::ModelUnavailable) && sent.is_err() {
-            tokio::time::sleep(CRASH_REPORT_RETRY).await;
-            sent = transport.fail(task, report, qualification).await;
+        // It must arrive, or the server counts the crash as nothing: it is sent once more,
+        // and if that fails too, the next task still in hand carries it instead.
+        if let Some(mut told) = first {
             if sent.is_err() {
-                crash_reported.store(false, Ordering::Release);
+                tokio::time::sleep(CRASH_REPORT_RETRY).await;
+                sent = transport.fail(task, report, qualification).await;
+                if sent.is_err() {
+                    *told = false;
+                }
             }
         }
         reported = sent == Ok(true);
@@ -675,7 +696,7 @@ where
     };
     let run = |_, input| predict(input);
     let outcome = run_claimed(transport, &task, qualifications[index], cancel, run).await;
-    let alone = std::sync::atomic::AtomicBool::new(false);
+    let alone = tokio::sync::Mutex::new(false);
     let settled = settle(transport, &task, qualifications[index], outcome, &alone).await;
     settled.map(|(step, _)| step)
 }
@@ -710,6 +731,9 @@ where
     run_pool(transport, qualifications, cancel, &pool, |_| {}, heard, run).await?;
     Ok(steps)
 }
+
+/// How much longer than the task's deadline a prediction request itself may run.
+const PREDICTION_TIMEOUT_SLACK: Duration = Duration::from_secs(5);
 
 /// How long every runtime process may take to answer its first health check.
 const READY_DEADLINE: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 15 });
@@ -1057,15 +1081,28 @@ impl NativePredictor {
         {
             return Err("worker_predictor_qualification_changed".into());
         }
+        use std::sync::atomic::Ordering;
         self.ready(cancel).await?;
         let roles = &self.roles;
         // Shared by the tasks in hand: each checks its own process after its prediction.
         let children = std::sync::Mutex::new(&mut self.children);
         // Set when this owner stops the processes itself: that is not a process to blame.
         let stopped_here = std::sync::atomic::AtomicBool::new(false);
+        // The lane whose process ended, or whose answer broke off, under a prediction. With
+        // one task in hand this owner stops every process next (`abandon`), so it has to be
+        // noted before.
+        const NONE: usize = usize::MAX;
+        let exited = std::sync::atomic::AtomicUsize::new(NONE);
+        let exited = &exited;
         let abandon = || {
-            stopped_here.store(true, std::sync::atomic::Ordering::Release);
-            for lane in children.lock().unwrap().iter_mut() {
+            stopped_here.store(true, Ordering::Release);
+            for (index, lane) in children.lock().unwrap().iter_mut().enumerate() {
+                // Already gone before this owner stops it (a deadline can win the race with
+                // the broken connection, and then nothing else has looked): it ended by itself.
+                if !lane.child.is_running().unwrap_or(true) {
+                    let _ =
+                        exited.compare_exchange(NONE, index, Ordering::AcqRel, Ordering::Acquire);
+                }
                 let _ = lane.child.stop();
             }
         };
@@ -1088,16 +1125,30 @@ impl NativePredictor {
             |index, task, input| {
                 let (role, children) = (&roles[index], &children);
                 async move {
-                    let value = role
-                        .client
-                        .predict(&task, &input, transport.now()?)
-                        .await
+                    let running = || children.lock().unwrap()[role.lane].child.is_running();
+                    let answer = role.client.predict(&task, &input, transport.now()?).await;
+                    let value = match answer {
+                        Ok(value) => value,
                         // The local model refused this one input; the process itself is still serving.
-                        .map_err(|code| match code.starts_with("server_http_") {
-                            true => "runtime_prediction_refused".into(),
-                            false => code,
-                        })?;
-                    if !children.lock().unwrap()[role.lane].child.is_running()? {
+                        Err(code) if code.starts_with("server_http_") => {
+                            return Err("runtime_prediction_refused".into())
+                        }
+                        // Its answer broke off, before or after the first line: this runtime
+                        // stopped answering, whether its process is already gone or still
+                        // lingers. It is the one that failed, and it is reported as a crash.
+                        Err(code)
+                            if matches!(
+                                code.as_str(),
+                                "runtime_prediction_interrupted" | "server_response_interrupted"
+                            ) =>
+                        {
+                            exited.store(role.lane, Ordering::Release);
+                            return Err("runtime_prediction_interrupted".into());
+                        }
+                        Err(code) => return Err(code),
+                    };
+                    if !running()? {
+                        exited.store(role.lane, Ordering::Release);
                         return Err("runtime_process_stopped".into());
                     }
                     Ok(value)
@@ -1105,14 +1156,138 @@ impl NativePredictor {
             },
         )
         .await;
-        drop(children);
-        // A process that is gone without this owner having stopped it ended by itself.
-        if !stopped_here.load(std::sync::atomic::Ordering::Acquire) {
+        // The runtime seen to fail under a prediction is blamed. Otherwise a process that is
+        // gone without this owner having stopped it ended by itself.
+        if let Some(lane) = Some(exited.load(Ordering::Acquire)).filter(|lane| *lane != NONE) {
+            self.failed = Some(lane);
+        } else if !stopped_here.load(Ordering::Acquire) {
             for lane in 0..self.children.len() {
                 self.blame_exited(lane);
             }
         }
         outcome
+    }
+}
+
+/// For tests of what follows a runtime that dies: a real, signed runtime pack whose process
+/// ends by itself the moment it is asked to predict.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+    use crate::native_runtime::VerifiedRuntime;
+    use std::{
+        fs,
+        io::{Read, Write},
+        net::TcpListener,
+        path::PathBuf,
+    };
+    pub(crate) struct DyingRuntime {
+        root: PathBuf,
+        pack: VerifiedRuntime,
+        port: u16,
+        dies: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl DyingRuntime {
+        pub(crate) fn build() -> Self {
+            use ed25519_dalek::{Signer, SigningKey};
+            use sha2::{Digest, Sha256};
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("frameleaf-dying-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&root).unwrap();
+            for name in ["pack", "cache", "work", "compiler"] {
+                fs::create_dir(root.join(name)).unwrap();
+            }
+            // Passes the start gate, then lives until `<root>/die` appears.
+            let source = root.join("compiler/main.rs");
+            fs::write(&source, r#"use std::{io::{self,Read},thread,time::Duration};fn main(){let mut gate=[0;23];io::stdin().read_exact(&mut gate).unwrap();let flag=std::path::PathBuf::from(env!("DIE_FLAG"));loop{if flag.exists(){std::process::exit(3);}thread::sleep(Duration::from_millis(5));}}"#).unwrap();
+            let name = if cfg!(windows) {
+                "python.exe"
+            } else {
+                "python"
+            };
+            assert!(std::process::Command::new("rustc")
+                .env("DIE_FLAG", root.join("die"))
+                .arg(&source)
+                .arg("-o")
+                .arg(root.join("pack").join(name))
+                .status()
+                .unwrap()
+                .success());
+            let bytes = fs::read(root.join("pack").join(name)).unwrap();
+            let raw = serde_json::to_vec(&serde_json::json!({"schemaVersion":1,"protocolVersion":1,"epoch":1,"platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"provider":"CPUExecutionProvider","python":name,"sourceRevision":"a".repeat(40),"files":{name:{"sha256":format!("{:x}",Sha256::digest(&bytes)),"bytes":bytes.len()}}})).unwrap();
+            let key = SigningKey::from_bytes(&[42; 32]);
+            let pack = VerifiedRuntime::verify(
+                &root.join("pack"),
+                &raw,
+                &key.sign(&raw).to_bytes(),
+                &[key.verifying_key()],
+                1,
+            )
+            .unwrap();
+            // What the process would serve: healthy until a prediction arrives, which ends
+            // the process and breaks the connection off without an answer.
+            let serving = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = serving.local_addr().unwrap().port();
+            let flag = root.join("die");
+            let dies = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let dying = dies.clone();
+            std::thread::spawn(move || {
+                for socket in serving.incoming() {
+                    let Ok(mut socket) = socket else { break };
+                    let mut request = [0; 1024];
+                    let read = socket.read(&mut request).unwrap_or(0);
+                    if request[..read].starts_with(b"GET") {
+                        let _ = socket.write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\npong",
+                        );
+                    } else if dying.load(std::sync::atomic::Ordering::Acquire) {
+                        fs::write(&flag, b"").unwrap();
+                    }
+                }
+            });
+            Self {
+                root,
+                pack,
+                port,
+                dies,
+            }
+        }
+        /// `true` (the start): its process ends when asked to predict. `false`: only its
+        /// answer breaks off, and the process lives on until it is stopped.
+        pub(crate) fn dies(&self, dies: bool) {
+            self.dies.store(dies, std::sync::atomic::Ordering::Release);
+        }
+        pub(crate) fn manifest(&self) -> &str {
+            self.pack.manifest_sha256()
+        }
+        /// Start its process anew, bound to this model and qualification.
+        pub(crate) fn start(&self, model_key: &str, qualification_id: &str) -> NativePredictor {
+            let _ = fs::remove_file(self.root.join("die"));
+            let child = self
+                .pack
+                .start_sidecar(&self.root.join("cache"), &self.root.join("work"), 19990)
+                .unwrap();
+            let spec = serde_json::json!({"modelKey":model_key,"entries":{},"fixtureKind":"image"});
+            NativePredictor {
+                children: vec![Lane {
+                    child,
+                    manifest_sha256: self.manifest().into(),
+                }],
+                roles: vec![BoundRole {
+                    client: BoundClient::new(self.port, "a".repeat(64), &spec).unwrap(),
+                    qualification_id: qualification_id.into(),
+                    lane: 0,
+                }],
+                failed: None,
+            }
+        }
+    }
+    impl Drop for DyingRuntime {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
 }
 

@@ -46,6 +46,11 @@ test('each workload shows the provider the backend chose and why the processor s
   for (const text of words) assert.doesNotMatch(text, /could not be prepared/);
   assert.equal(workloadProvider([{ workload: 'face', provider: 'CPUExecutionProvider', fallback: 'provider_device_ineligible' }], 'face'),
     'Runs on CPU (GPU acceleration is not used: this computer has no supported GPU)');
+  // A runtime that kept crashing: said as it is, with the promise that it is tried again.
+  assert.equal(workloadProvider([{ workload: 'clip', provider: 'CPUExecutionProvider', fallback: 'runtime_process_stopped' }], 'clip'),
+    'Runs on CPU (GPU acceleration is not used: its process stopped three times in a row while working; Frameleaf tries it again later by itself)');
+  assert.equal(workloadProvider([{ workload: 'clip', provider: 'CPUExecutionProvider', fallback: 'runtime_prediction_interrupted' }], 'clip'),
+    'Runs on CPU (GPU acceleration is not used: its process stopped answering three times in a row; Frameleaf tries it again later by itself)');
   // FD-63: a driver known to be too old is named, so the person knows what to do.
   assert.equal(workloadProvider([{ workload: 'face', provider: 'CPUExecutionProvider', fallback: 'provider_driver_outdated' }], 'face'),
     'Runs on CPU (GPU acceleration is not used: the NVIDIA driver is too old; update it to use the GPU)');

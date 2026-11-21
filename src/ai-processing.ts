@@ -89,8 +89,8 @@ function fallbackReason(code: string): string {
   if (code === 'runtime_output_mismatch') return 'it gave a different answer than expected on the test picture';
   if (code === 'runtime_provider_unavailable') return 'the graphics card could not run the model';
   if (code === 'runtime_model_missing') return 'its model files are missing or changed';
-  if (code === 'runtime_process_stopped') return 'its process stopped while working';
-  if (code === 'runtime_prediction_interrupted') return 'its process stopped answering during a task';
+  if (code === 'runtime_process_stopped') return 'its process stopped three times in a row while working; Frameleaf tries it again later by itself';
+  if (code === 'runtime_prediction_interrupted') return 'its process stopped answering three times in a row; Frameleaf tries it again later by itself';
   if (code === 'runtime_not_ready' || code === 'worker_execution_deadline') return 'it did not start in time this time';
   if (code.startsWith('runtime_qualification_') || code === 'provider_failed') return 'it did not pass its check on this computer';
   return 'it could not be prepared on this computer';
