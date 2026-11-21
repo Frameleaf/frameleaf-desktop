@@ -220,13 +220,45 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
-        with:
-          python-version: '3.12'
+      # On Forgejo's Mac host setup-python would install under /Users/runner: a runner-owned Python.
+      - uses: ./.github/actions/python
       - name: Linux native dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev squashfs-tools
+      # Forgejo's macOS runner is a shared Mac host without rustup: use a runner-owned toolchain,
+      # and a temporary folder of the job's own (tests check that nothing lands beside theirs).
+      - name: Runner-owned rustup and temporary folder on the Forgejo Mac host
+        if: github.server_url != 'https://github.com' && runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          CARGO_HOME="$HOME/Library/Caches/forgejo-runner/cargo"
+          RUSTUP_HOME="$HOME/Library/Caches/forgejo-runner/rustup"
+          export CARGO_HOME RUSTUP_HOME
+          [ -x "$CARGO_HOME/bin/rustup" ] || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
+          { echo "CARGO_HOME=$CARGO_HOME"; echo "RUSTUP_HOME=$RUSTUP_HOME"; } >> "$GITHUB_ENV"
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+      # Forgejo's Ubuntu runner has no rustup either: the same runner-owned toolchain.
+      - name: Runner-owned rustup on the Forgejo Linux host
+        if: github.server_url != 'https://github.com' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO_HOME="$HOME/.cache/forgejo-runner/cargo"
+          RUSTUP_HOME="$HOME/.cache/forgejo-runner/rustup"
+          export CARGO_HOME RUSTUP_HOME
+          # Jobs of other branches can run on the same host at once: one changes the shared
+          # toolchain at a time, here, and the step after this one leaves it alone.
+          mkdir -p "$(dirname "$RUSTUP_HOME")"
+          flock "$RUSTUP_HOME.lock" sh -eu -c '
+            [ -x "$CARGO_HOME/bin/rustup" ] || curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
+            "$CARGO_HOME/bin/rustup" update stable
+            "$CARGO_HOME/bin/rustup" default stable
+            "$CARGO_HOME/bin/rustup" component add rustfmt clippy'
+          { echo "CARGO_HOME=$CARGO_HOME"; echo "RUSTUP_HOME=$RUSTUP_HOME"; } >> "$GITHUB_ENV"
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - name: Rust stable
+        if: github.server_url == 'https://github.com' || runner.os != 'Linux'
         run: rustup update stable && rustup default stable
       - run: npm ci
       - run: npm test
