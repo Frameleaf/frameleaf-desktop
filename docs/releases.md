@@ -662,8 +662,13 @@ The Library 1.2.4 packages were made before this:
   controller `045568dc0bbbe5a582516e83b2d4f11b4122a381cb91a6d29c778aff128b5cc7`
   and manifest `b3ce270798e290f89505e554dee9be0fd3006a49af11fe3bf5d0025dde5d7a74`.
 - Windows x64: only the unsigned 1.2.4 installer exists. A signed one needs the
-  Windows chain above once signing is configured; until then release Windows
-  with `companion_run_ids=none` or leave Windows out.
+  Windows chain above once signing is configured. Until then Windows is released
+  with `companion_run_ids=none`, as every release so far (owner decision for 0.1.7,
+  2026-11-20: "Ship as before"): the Windows installer and its CUDA and OpenVINO
+  packs are staged as usual, no Windows companion package is added, and the
+  release notes say so. Azure signing on Forgejo would need a client secret,
+  since Forgejo cannot issue the GitHub OIDC token `windows-compiled-host.yml`
+  uses.
 
 ### Staging: one draft per tag
 
@@ -853,7 +858,7 @@ validation; macOS and Linux ship without it.
      -f companion_run_ids=<ubuntu-host-qualification run>
    gh workflow run release.yml --repo Frameleaf/frameleaf-desktop --ref main \
      -f tag=v<version> -f platforms=windows -f runtime_run_id=<factory run> \
-     -f companion_run_ids=<windows-compiled-host run>   # needs step 1
+     -f companion_run_ids=none   # no signed Windows companion yet (Reusing a companion package)
    ```
 
    A run that selects several platforms takes their run ids comma-separated.
