@@ -1207,14 +1207,21 @@ pub(crate) mod testing {
             } else {
                 "python"
             };
+            // Compiled beside the source and copied in: on Windows the compiler also leaves a
+            // debug-symbols file next to its output, which the pack's inventory does not list.
             assert!(std::process::Command::new("rustc")
                 .env("DIE_FLAG", root.join("die"))
                 .arg(&source)
                 .arg("-o")
-                .arg(root.join("pack").join(name))
+                .arg(root.join("compiler").join(name))
                 .status()
                 .unwrap()
                 .success());
+            fs::copy(
+                root.join("compiler").join(name),
+                root.join("pack").join(name),
+            )
+            .unwrap();
             let bytes = fs::read(root.join("pack").join(name)).unwrap();
             let raw = serde_json::to_vec(&serde_json::json!({"schemaVersion":1,"protocolVersion":1,"epoch":1,"platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"provider":"CPUExecutionProvider","python":name,"sourceRevision":"a".repeat(40),"files":{name:{"sha256":format!("{:x}",Sha256::digest(&bytes)),"bytes":bytes.len()}}})).unwrap();
             let key = SigningKey::from_bytes(&[42; 32]);

@@ -42,6 +42,8 @@ jobs:
       revision: ${{ steps.source.outputs.revision }}
       matrix: ${{ steps.source.outputs.matrix }}
       companions: ${{ steps.companions.outputs.plan }}
+      # Read once, here: the build matrix and the build job's guards all follow this one value.
+      owner_mac: ${{ steps.source.outputs.owner_mac }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -58,16 +60,18 @@ jobs:
         if: github.server_url != 'https://github.com'
         env:
           RELEASE_PLATFORMS: ${{ inputs.platforms }}
+          OWNER_MAC: ${{ github.server_url != 'https://github.com' && vars.DESKTOP_RELEASE_MACOS_ON_OWNER_MAC == 'true' }}
         run: |
           node --input-type=module -e '
             import { forgejoTargetProblems } from "./tools/release_inputs.mjs";
-            const problems = forgejoTargetProblems(process.env.RELEASE_PLATFORMS, "installer");
+            const problems = forgejoTargetProblems(process.env.RELEASE_PLATFORMS, "installer", { ownerMac: process.env.OWNER_MAC === "true" });
             for (const problem of problems) console.log(`::error::${problem}`);
             process.exitCode = problems.length ? 1 : 0;
           '
       - name: Validate immutable release source and runtime run
         id: source
         env:
+          OWNER_MAC: ${{ github.server_url != 'https://github.com' && vars.DESKTOP_RELEASE_MACOS_ON_OWNER_MAC == 'true' }}
           RELEASE_TAG: ${{ inputs.tag }}
           RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
           RELEASE_PLATFORMS: ${{ inputs.platforms }}
@@ -87,7 +91,8 @@ jobs:
           node --input-type=module -e '
             import { appendFileSync } from "node:fs";
             import { releaseMatrix } from "./tools/release_inputs.mjs";
-            appendFileSync(process.env.GITHUB_OUTPUT, "matrix=" + JSON.stringify(releaseMatrix(process.env.RELEASE_PLATFORMS)) + "\n");
+            const ownerMac = process.env.OWNER_MAC === "true";
+            appendFileSync(process.env.GITHUB_OUTPUT, "matrix=" + JSON.stringify(releaseMatrix(process.env.RELEASE_PLATFORMS, { ownerMac })) + "\n" + "owner_mac=" + ownerMac + "\n");
           '
           [[ "$RUNTIME_RUN_ID" =~ ^[1-9][0-9]*$ ]] || fail "runtime_run_id must be the numeric id of a factory-runtime.yml run."
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUNTIME_RUN_ID" > "$RUNNER_TEMP/runtime-run.json"
@@ -295,6 +300,7 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           PROFILE_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_PROVISION_PROFILE }}
+          OWNER_MAC: ${{ needs.prepare.outputs.owner_mac }}
         shell: bash
         run: |
           set -euo pipefail
@@ -314,14 +320,28 @@ jobs:
           install=$(mktemp -d "$RUNNER_TEMP/installed-desktop.XXXXXX")
           ditto "$mount/Frameleaf.app" "$install/Frameleaf.app"
           codesign --verify --deep --strict "$install/Frameleaf.app"
-          open -n -g -a "$install/Frameleaf.app"
-          xcrun swift tools/qualify_macos_app_launch.swift "$install/Frameleaf.app"
+          if [[ "$OWNER_MAC" == true ]]; then
+            # The launch check ends every running Frameleaf and uses the signed-in user's app data:
+            # on the owner's own Mac it is not run (docs/releases.md, Releasing from Forgejo).
+            echo '::warning::Not run on the owner'"'"'s Mac: launching the installed app (it would end their running Frameleaf and use their app data).'
+            echo '- Not run on the owner'"'"'s Mac: launching the installed app.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            open -n -g -a "$install/Frameleaf.app"
+            xcrun swift tools/qualify_macos_app_launch.swift "$install/Frameleaf.app"
+          fi
       - name: Exercise the production Keychain entitlements on a disposable macOS user
-        if: runner.os == 'macOS'
+        # It writes to the signed-in user's keychain: never on the owner's own Mac.
+        if: runner.os == 'macOS' && needs.prepare.outputs.owner_mac != 'true'
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         shell: bash
         run: bash tools/qualify_signed_macos_keychain.sh
+      - name: Say which checks the owner's Mac did not run
+        if: runner.os == 'macOS' && needs.prepare.outputs.owner_mac == 'true'
+        shell: bash
+        run: |
+          echo '::warning::Not run on the owner'"'"'s Mac: the production Keychain entitlement check (it writes to the signed-in user'"'"'s keychain).'
+          echo '- Not run on the owner'"'"'s Mac: the production Keychain entitlement check.' >> "$GITHUB_STEP_SUMMARY"
       - name: Submit the distribution disk image to Apple
         if: runner.os == 'macOS'
         shell: bash
@@ -450,8 +470,15 @@ jobs:
         if: always() && runner.os == 'macOS'
         shell: bash
         run: |
-          rm -f "$RUNNER_TEMP/developer-id.p12"
+          rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/desktop.provisionprofile"
           if [ -f "$RUNNER_TEMP/desktop-release.keychain-db" ]; then security delete-keychain "$RUNNER_TEMP/desktop-release.keychain-db"; fi
+          # The user's keychain search list as it was before the job (tools/import_apple_certificate.sh).
+          if [ -f "$RUNNER_TEMP/keychain-search-list" ]; then
+            kept=()
+            while IFS= read -r item; do [ -n "$item" ] && [ -e "$item" ] && kept+=("$item"); done < "$RUNNER_TEMP/keychain-search-list"
+            security list-keychains -d user -s ${kept[@]+"${kept[@]}"}
+            rm -f "$RUNNER_TEMP/keychain-search-list"
+          fi
   stage:
     # `build` has a skipped ancestor when Windows is not selected, so its result is tested explicitly.
     if: ${{ !cancelled() && inputs.tag != '' && needs.build.result == 'success' }}

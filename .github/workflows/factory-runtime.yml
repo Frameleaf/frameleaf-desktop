@@ -45,10 +45,11 @@ jobs:
         if: github.server_url != 'https://github.com'
         env:
           RELEASE_PLATFORMS: ${{ inputs.platforms }}
+          OWNER_MAC: ${{ github.server_url != 'https://github.com' && vars.DESKTOP_RELEASE_MACOS_ON_OWNER_MAC == 'true' }}
         run: |
           node --input-type=module -e '
             import { forgejoTargetProblems } from "./tools/release_inputs.mjs";
-            const problems = forgejoTargetProblems(process.env.RELEASE_PLATFORMS, "runtime");
+            const problems = forgejoTargetProblems(process.env.RELEASE_PLATFORMS, "runtime", { ownerMac: process.env.OWNER_MAC === "true" });
             for (const problem of problems) console.log(`::error::${problem}`);
             process.exitCode = problems.length ? 1 : 0;
           '
@@ -57,6 +58,7 @@ jobs:
           RELEASE_PLATFORMS: ${{ inputs.platforms }}
           RUNTIME_EPOCH: ${{ inputs.epoch }}
           RUNTIME_ACCELERATED: ${{ inputs.accelerated }}
+          OWNER_MAC: ${{ github.server_url != 'https://github.com' && vars.DESKTOP_RELEASE_MACOS_ON_OWNER_MAC == 'true' }}
         run: |
           node tools/release_prerequisites.mjs factory-epoch "$RUNTIME_EPOCH"
           node --input-type=module <<'JS'
@@ -66,7 +68,7 @@ jobs:
           // One entry per pack: the pack each installer carries and (FD-60) the CUDA and
           // OpenVINO packs the app downloads on demand, named `<target>-<profile>`.
           const packs = [];
-          for (const item of releaseMatrix(process.env.RELEASE_PLATFORMS).include) {
+          for (const item of releaseMatrix(process.env.RELEASE_PLATFORMS, { ownerMac: process.env.OWNER_MAC === 'true' }).include) {
             const built = factoryPacksFor(item.target, process.env.RUNTIME_ACCELERATED);
             for (const { profile, delivered } of built)
               packs.push({
@@ -276,8 +278,15 @@ jobs:
         if: always() && runner.os == 'macOS'
         shell: bash
         run: |
-          rm -f "$RUNNER_TEMP/developer-id.p12"
+          rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/desktop.provisionprofile"
           if [ -f "$RUNNER_TEMP/desktop-release.keychain-db" ]; then security delete-keychain "$RUNNER_TEMP/desktop-release.keychain-db"; fi
+          # The user's keychain search list as it was before the job (tools/import_apple_certificate.sh).
+          if [ -f "$RUNNER_TEMP/keychain-search-list" ]; then
+            kept=()
+            while IFS= read -r item; do [ -n "$item" ] && [ -e "$item" ] && kept+=("$item"); done < "$RUNNER_TEMP/keychain-search-list"
+            security list-keychains -d user -s ${kept[@]+"${kept[@]}"}
+            rm -f "$RUNNER_TEMP/keychain-search-list"
+          fi
       - name: Sign and verify the exact archive accepted by installer packaging
         env:
           FACTORY_PRIVATE_KEY: ${{ secrets.DESKTOP_RELEASE_ED25519_PRIVATE_KEY }}
