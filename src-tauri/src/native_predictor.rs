@@ -1217,7 +1217,11 @@ pub(crate) mod testing {
                 .status()
                 .unwrap()
                 .success());
-            fs::copy(root.join("compiler").join(name), root.join("pack").join(name)).unwrap();
+            fs::copy(
+                root.join("compiler").join(name),
+                root.join("pack").join(name),
+            )
+            .unwrap();
             let bytes = fs::read(root.join("pack").join(name)).unwrap();
             let raw = serde_json::to_vec(&serde_json::json!({"schemaVersion":1,"protocolVersion":1,"epoch":1,"platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"provider":"CPUExecutionProvider","python":name,"sourceRevision":"a".repeat(40),"files":{name:{"sha256":format!("{:x}",Sha256::digest(&bytes)),"bytes":bytes.len()}}})).unwrap();
             let key = SigningKey::from_bytes(&[42; 32]);
