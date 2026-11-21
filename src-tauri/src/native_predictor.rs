@@ -1207,14 +1207,18 @@ pub(crate) mod testing {
             } else {
                 "python"
             };
+            // Built outside the pack: on Windows rustc also leaves a .pdb beside the program, and
+            // a signed pack holds only the files its manifest lists.
+            let built = root.join("compiler").join(name);
             assert!(std::process::Command::new("rustc")
                 .env("DIE_FLAG", root.join("die"))
                 .arg(&source)
                 .arg("-o")
-                .arg(root.join("pack").join(name))
+                .arg(&built)
                 .status()
                 .unwrap()
                 .success());
+            fs::copy(&built, root.join("pack").join(name)).unwrap();
             let bytes = fs::read(root.join("pack").join(name)).unwrap();
             let raw = serde_json::to_vec(&serde_json::json!({"schemaVersion":1,"protocolVersion":1,"epoch":1,"platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"provider":"CPUExecutionProvider","python":name,"sourceRevision":"a".repeat(40),"files":{name:{"sha256":format!("{:x}",Sha256::digest(&bytes)),"bytes":bytes.len()}}})).unwrap();
             let key = SigningKey::from_bytes(&[42; 32]);
