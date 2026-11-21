@@ -10,8 +10,12 @@ fn server_selection_requires_tls_off_the_local_network_and_refuses_credentials_p
         "https://nas.example:2283/"
     );
     assert!(normalize_server("http://nas.local").is_ok());
+    // Plain HTTP to an address must be to a local one. Plain HTTP to a name is held to the home
+    // network when connecting (see `connection::HomeResolver`), not judged by a lookup here.
+    assert!(normalize_server("http://nas.example").is_ok());
+    assert!(frameleaf_desktop::connection::typed_server("http://nas.example").is_err());
     for value in [
-        "http://nas.example",
+        "http://203.0.113.7",
         "http://user:pass@nas.local",
         "https://user:pass@nas.local",
         "https://nas.local/api",
@@ -119,6 +123,8 @@ fn navigation_scope_binds_server_origin_identity_and_account_without_using_crede
                 worker: false,
                 worker_session: false,
                 worker_auto_setup: false,
+                worker_withdrawal_notice: false,
+                worker_concurrent_leases: false,
                 sources: false,
                 native_host: false,
             },

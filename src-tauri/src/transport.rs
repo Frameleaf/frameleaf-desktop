@@ -24,13 +24,106 @@ pub(crate) fn client_builder() -> ClientBuilder {
 }
 
 pub(crate) fn streaming_client_builder() -> ClientBuilder {
+    public_client_builder().proxy(server_proxy())
+}
+
+/// The proxy for one request of a client that talks to a person's server or Manager, decided
+/// when the request connects, so it does not matter when the client was built or which other
+/// server is in use.
+///
+/// A plain-HTTP request to a name is never proxied: a proxy would look the name up itself and
+/// be handed the request (and its credential) without this app checking where it leads. The
+/// name is taken into use here too, so the connection that follows is held to home addresses
+/// (`connection::HomeResolver`). Every other request follows the system's proxy settings,
+/// exactly as a client with no rule of its own would.
+pub(crate) fn server_proxy() -> reqwest::Proxy {
+    let system = hyper_util::client::proxy::matcher::Matcher::from_system();
+    reqwest::Proxy::custom(move |url| {
+        if crate::connection::hold_plain_http_name(url) {
+            return None;
+        }
+        let via = system.intercept(&url.as_str().parse::<http::Uri>().ok()?)?;
+        let mut proxy = reqwest::Url::parse(&via.uri().to_string()).ok()?;
+        // The matcher takes the proxy's own user and password out of its address: put them
+        // back, so a proxy that asks for them still gets them.
+        if let Some((user, password)) = via.raw_auth().map(owned).or_else(|| basic(&via)) {
+            let _ = proxy.set_username(&user);
+            let _ = proxy.set_password(Some(&password));
+        }
+        Some(proxy)
+    })
+}
+
+/// For Frameleaf's own download hosts (the model mirror, the release host), never a person's
+/// server: always through the system's proxy settings, whatever server is in use.
+pub(crate) fn public_client_builder() -> ClientBuilder {
     Client::builder()
         // Operating-system roots are loaded only for Manager's system-trust option.
         .tls_built_in_native_certs(false)
         .redirect(reqwest::redirect::Policy::none())
+        // A name reached over plain HTTP may connect only to the home network.
+        .dns_resolver(std::sync::Arc::new(crate::connection::HomeResolver))
         // Retry only through our durable coordinators, so payload attempts cannot evade admission.
         .retry(reqwest::retry::never())
         .user_agent(concat!("FrameleafDesktop/", env!("CARGO_PKG_VERSION")))
+}
+fn owned((user, password): (&str, &str)) -> (String, String) {
+    (user.to_owned(), password.to_owned())
+}
+/// The user and password of an HTTP proxy, which the matcher keeps as a ready
+/// `Proxy-Authorization: Basic …` value.
+fn basic(via: &hyper_util::client::proxy::matcher::Intercept) -> Option<(String, String)> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let encoded = via.basic_auth()?.to_str().ok()?.strip_prefix("Basic ")?;
+    let pair = String::from_utf8(STANDARD.decode(encoded).ok()?).ok()?;
+    pair.split_once(':').map(owned)
+}
+/// Clocks closer than this are treated as equal: the server accepts requests timed within two
+/// minutes of its own clock, and `Date` only counts whole seconds.
+const CLOCK_SKEW_IGNORED_MS: i64 = 30_000;
+/// How far the server's clock is ahead of this computer's (negative: behind), from the `Date`
+/// header of one of its responses and this computer's clock when it arrived. Zero when the
+/// clocks agree, so a computer with a correct clock behaves exactly as before; `None` when the
+/// header is missing or unreadable. A real difference is returned so requests can be timed, and the
+/// server's deadlines read, by the server's clock: a wrong clock here must not stop AI work.
+pub(crate) fn clock_skew_from(date: Option<&str>, local_ms: i64) -> Option<i64> {
+    let server =
+        time::OffsetDateTime::parse(date?, &time::format_description::well_known::Rfc2822).ok()?;
+    let skew = (server.unix_timestamp_nanos() / 1_000_000) as i64 - local_ms;
+    if skew.abs() < CLOCK_SKEW_IGNORED_MS {
+        return Some(0);
+    }
+    // `Date` is cut to the second and was written before the response travelled: without this,
+    // the corrected clock would run up to about two seconds behind the server's.
+    Some(skew + 2_000)
+}
+/// `None` when the response says nothing usable about the server's clock.
+pub(crate) fn clock_skew(response: &Response) -> Option<i64> {
+    let local = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    let date = response.headers().get(reqwest::header::DATE);
+    clock_skew_from(date.and_then(|value| value.to_str().ok()), local)
+}
+/// The named reason (`message`) of a refused request. Anything but a small JSON error (a
+/// proxy's page, a cut connection) has no name.
+pub(crate) async fn refused(mut response: Response) -> (u16, String) {
+    let status = response.status().as_u16();
+    let mut bytes = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if bytes.len() + chunk.len() <= 4096 => bytes.extend_from_slice(&chunk),
+            Ok(None) => break,
+            // Too long, or cut short: what arrived is not known to be the server's whole reply.
+            _ => return (status, String::new()),
+        }
+    }
+    let message = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|value| value["message"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    (status, message)
 }
 pub async fn json<T: DeserializeOwned>(response: Response) -> Result<T, String> {
     json_limit(response, 65_536).await
@@ -69,7 +162,9 @@ pub async fn capabilities(
     if response.status() == StatusCode::NOT_FOUND {
         return Ok(None);
     }
-    let caps: Capabilities = json(response).await?;
+    let clock_skew_ms = clock_skew(&response).unwrap_or(0);
+    let mut caps: Capabilities = json(response).await?;
+    caps.clock_skew_ms = clock_skew_ms;
     if caps.protocol_version != 1 || caps.server_id.is_empty() || caps.server_id.len() > 128 {
         return Err("desktop_protocol_unsupported".into());
     }
@@ -78,56 +173,88 @@ pub async fn capabilities(
     }
     Ok(Some(caps))
 }
-pub async fn enroll(client: &Client, saved: &SavedConnection) -> Result<Enrollment, String> {
-    enroll_with_identity(client, saved, &credentials::identity()?).await
+/// `clock_skew_ms`: from the capabilities just read (`Capabilities::clock_skew_ms`).
+pub async fn enroll(
+    client: &Client,
+    saved: &SavedConnection,
+    clock_skew_ms: i64,
+) -> Result<Enrollment, String> {
+    enroll_with_identity(client, saved, &credentials::identity()?, clock_skew_ms).await
 }
 
 pub(crate) async fn enroll_with_identity(
     client: &Client,
     saved: &SavedConnection,
     identity: &crate::connection::DeviceIdentity,
+    clock_skew_ms: i64,
 ) -> Result<Enrollment, String> {
-    let dto = identity.enrollment(
+    let dto = identity.enrollment_at(
         &saved.server_id,
         &saved.account_id,
         &saved.device_name,
         &saved.mode,
+        clock_skew_ms,
     )?;
     let base = normalize_server(&saved.server)?;
-    json(
-        client
-            .post(base.join("api/desktop/devices/enroll").unwrap())
-            .bearer_auth(&saved.token)
-            .json(&dto)
-            .send()
-            .await
-            .map_err(|_| "desktop_enrollment_interrupted")?,
-    )
-    .await
+    let response = client
+        .post(base.join("api/desktop/devices/enroll").unwrap())
+        .bearer_auth(&saved.token)
+        .json(&dto)
+        .send()
+        .await
+        .map_err(|_| "desktop_enrollment_interrupted")?;
+    if !response.status().is_success() {
+        let (status, message) = refused(response).await;
+        // The server refuses a request timed more than two minutes from its own clock.
+        return Err(if message == "device_proof_expired" {
+            "clock_invalid".into()
+        } else {
+            format!("server_http_{status}")
+        });
+    }
+    json(response).await
 }
 
+/// A refusal keeps its name (`ml_transport::worker_refusal`): the worker waits out "AI processing
+/// is off" and "not on the home network" instead of failing with a bare status.
 pub async fn issue_worker_session(
     client: &Client,
     saved: &SavedConnection,
+    clock_skew_ms: i64,
 ) -> Result<crate::worker::SavedWorker, String> {
-    let identity = credentials::identity()?;
+    issue_worker_session_as(client, saved, &credentials::identity()?, clock_skew_ms).await
+}
+
+pub(crate) async fn issue_worker_session_as(
+    client: &Client,
+    saved: &SavedConnection,
+    identity: &crate::connection::DeviceIdentity,
+    clock_skew_ms: i64,
+) -> Result<crate::worker::SavedWorker, String> {
     let device = saved
         .device_id
         .as_ref()
         .ok_or("desktop_enrollment_required")?;
-    let dto =
-        crate::worker::session_request(&identity, &saved.server_id, &saved.account_id, device)?;
+    let dto = crate::worker::session_request_at(
+        identity,
+        &saved.server_id,
+        &saved.account_id,
+        device,
+        clock_skew_ms,
+    )?;
     let base = normalize_server(&saved.server)?;
-    let response: crate::worker::SessionResponse = json(
-        client
-            .post(base.join("api/desktop/devices/session").unwrap())
-            .bearer_auth(&saved.token)
-            .json(&dto)
-            .send()
-            .await
-            .map_err(|_| "worker_session_setup_interrupted")?,
-    )
-    .await?;
+    let response = client
+        .post(base.join("api/desktop/devices/session").unwrap())
+        .bearer_auth(&saved.token)
+        .json(&dto)
+        .send()
+        .await
+        .map_err(|_| "worker_session_setup_interrupted")?;
+    if !response.status().is_success() {
+        let (status, message) = refused(response).await;
+        return Err(crate::ml_transport::session_refusal(status, &message));
+    }
+    let response: crate::worker::SessionResponse = json(response).await?;
     crate::worker::bind_session(saved, &response)
 }
 
@@ -223,6 +350,74 @@ mod tests {
             }
             server.join().unwrap();
         }
+    }
+    /// Run in a child process (`a_plain_http_home_name_is_never_sent_through_a_configured_proxy`),
+    /// where the proxy variables can be set without touching the tests running beside this one.
+    #[test]
+    #[ignore = "run by its parent test, in a process of its own"]
+    fn proxy_child() {
+        let Ok(case) = std::env::var("FRAMELEAF_PROXY_CASE") else {
+            return;
+        };
+        // The client is built first, before anything knows which server it will talk to: the
+        // rule is applied to each request, not when a client is built.
+        let client = client().unwrap();
+        let url = if case == "home" {
+            reqwest::Url::parse("http://nas.proxied.test:2283/api/users/me").unwrap()
+        } else {
+            // Plain HTTP to an address follows the system's proxy settings, as before.
+            reqwest::Url::parse("http://203.0.113.9/api/users/me").unwrap()
+        };
+        tauri::async_runtime::block_on(async {
+            let request = client.get(url).bearer_auth("secret").send();
+            let _ = tokio::time::timeout(Duration::from_secs(3), request).await;
+        });
+    }
+    #[test]
+    fn a_plain_http_home_name_is_never_sent_through_a_configured_proxy() {
+        // What the "proxy" was sent by a child process, if anything connected to it.
+        let child = |case: &str, credentials: &str| -> Option<String> {
+            let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = format!("http://{credentials}{}", proxy.local_addr().unwrap());
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "transport::tests::proxy_child", "--ignored"])
+                .env("FRAMELEAF_PROXY_CASE", case)
+                .env("HTTP_PROXY", &address)
+                .env("http_proxy", &address)
+                .env("ALL_PROXY", &address)
+                .env_remove("NO_PROXY")
+                .env_remove("no_proxy")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "{case}");
+            proxy.set_nonblocking(true).unwrap();
+            let (mut stream, _) = proxy.accept().ok()?;
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let read = stream.read(&mut request).unwrap_or(0);
+            Some(String::from_utf8_lossy(&request[..read]).to_lowercase())
+        };
+        // The check can see a proxied request: the same client sends plain HTTP to an address
+        // through the configured proxy.
+        let control = child("control", "").expect("the control request did not reach the proxy");
+        assert!(!control.contains("proxy-authorization"), "{control}");
+        // A proxy that asks for a user and password still gets them.
+        let signed = child("control", "alice:opensesame@").expect("not sent to the proxy");
+        assert!(
+            // base64("alice:opensesame")
+            signed.contains("proxy-authorization: basic ywxpy2u6b3blbnnlc2ftzq=="),
+            "{signed}"
+        );
+        // A plain-HTTP home name, in a fresh process, with its credential: never the proxy.
+        assert!(
+            child("home", "").is_none(),
+            "the home server's request went to the proxy"
+        );
     }
     #[test]
     fn keeps_photo_json_small_and_accepts_only_explicit_bounded_worker_replies() {

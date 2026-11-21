@@ -378,3 +378,52 @@ test('no worker card text shows a raw code or state name', async () => {
     }
   assert.equal((await card({ state: 'unsupported-server' })).headline, 'Your server needs a desktop-worker update');
 });
+
+test('each new stop reason has its own words, and waits or asks as the worker does', async () => {
+  const { workerView } = await import('../src/mode-state.ts');
+  // Stopped until somebody acts: its own headline or its own detail, never the general one.
+  const general = (await card({ state: 'setup-needs-attention', code: 'brand_new_backend_code' })).detail;
+  const stops: [code: string, headline: RegExp, detail: RegExp][] = [
+    ['runtime_crash_loop', /keeps stopping/, /three times in a row/],
+    ['clock_invalid', /date and time/, /Correct them.*Retry Setup/],
+    ['worker_device_refused', /no longer accepts this computer/, /allow this computer again/],
+    ['worker_sign_in_required', /setting up again/, /sign-in to your server has ended/],
+    ['runtime_qualification_timeout', /model checks/, /took too long/],
+    ['worker_qualification_refused', /model checks/, /did not accept this computer’s result/],
+    ['model_disk_space_insufficient', /could not be saved/, /enough free disk space/],
+  ];
+  const details = new Set<string>();
+  for (const [code, headline, detail] of stops) {
+    const view = await card({ state: 'setup-needs-attention', code });
+    assert.match(view.headline, headline, code);
+    assert.match(view.detail, detail, code);
+    assert.notEqual(view.detail, general, code);
+    assert.equal(view.attention, 'needs-you', code);
+    assert.equal(view.reference, null, code);
+    details.add(view.detail);
+  }
+  assert.equal(details.size, stops.length);
+  // Retried by the worker itself: said as waiting, with the reason.
+  for (const [code, detail] of [
+    ['server_http_500', /ran into a problem.*keeps trying by itself/],
+    ['server_http_503', /by itself/],
+    ['worker_challenge_busy', /busy checking other computers.*by itself/],
+    ['worker_qualification_restart', /check its models again.*by itself/],
+    ['runtime_process_stopped', /stopped unexpectedly.*by itself/],
+    ['runtime_not_ready', /did not answer in time.*by itself/],
+  ] as const) {
+    const view = await card({ state: 'reconnecting', code });
+    assert.equal(view.attention, 'waiting', code);
+    assert.match(view.detail, detail, code);
+    assert.doesNotMatch(view.detail, /try again/i, code);
+  }
+  // What the runtime said when it stopped is shown with the problem, and not once work resumes.
+  const crash = { state: 'setup-needs-attention', code: 'runtime_crash_loop', detail: 'signal: 9 (SIGKILL): out of memory' };
+  assert.equal(workerView({ connectionState: 'preparing', workerSupported: true, computer: 'Mac', setup: crash }).diagnostic, 'signal: 9 (SIGKILL): out of memory');
+  assert.equal(workerView({ connectionState: 'preparing', workerSupported: true, computer: 'Mac', setup: { state: 'working', detail: 'old' } }).diagnostic, null);
+  // An enrolment refusal says why when the backend names it.
+  const clock = workerView({ connectionState: 'enrollment-failed', connectionCode: 'clock_invalid', workerSupported: true, computer: 'Mac', setup: null });
+  assert.match(clock.detail, /date and time look wrong/);
+  const unnamed = workerView({ connectionState: 'enrollment-failed', workerSupported: true, computer: 'Mac', setup: null });
+  assert.match(unnamed.detail, /Reopen the app/);
+});

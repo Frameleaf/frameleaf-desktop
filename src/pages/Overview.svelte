@@ -26,7 +26,7 @@
   let failureReference = $state<string | null>(null);
   function fail(error: unknown) { ({ message: failure, reference: failureReference } = describeError(error)); }
   // The backend publishes every worker status change as the worker-setup event, which App passes down as `setup`.
-  const worker = $derived(workerView({ connectionState: connection.state, workerSupported: connection.features.worker || connection.features.workerSession, computer, setup }));
+  const worker = $derived(workerView({ connectionState: connection.state, connectionCode: connection.code, workerSupported: connection.features.worker || connection.features.workerSession, computer, setup }));
   const connectionPill = $derived(connection.state === 'offline' ? { label: 'Server unavailable', tone: 'off' } : connection.state === 'identity-changed' ? { label: 'Identity changed', tone: 'bad' } : connection.state === 'awaiting-approval' ? { label: 'Awaiting approval', tone: 'wait' } : { label: 'Connected', tone: 'ok' });
   const control = $derived(setup?.control ?? 'running');
   const canControl = $derived(connection.mode === 'client-worker' && connection.features.workerSession);
@@ -220,7 +220,7 @@
       <div class="group" role="group" aria-label="Computer processing status">
         <div class="row">
           <span class="ic" aria-hidden="true"><Icon name="ai" /></span>
-          <span class="l"><b>{worker.headline}</b><small><ErrorText text={worker.detail} reference={worker.reference} /></small></span>
+          <span class="l"><b>{worker.headline}</b><small><ErrorText text={worker.detail} reference={worker.reference} /></small>{#if worker.diagnostic}<small class="diagnostic" title="What the AI runtime reported when it stopped">{worker.diagnostic}</small>{/if}</span>
           <span class="pill {worker.pill.tone}"><i aria-hidden="true"></i>{worker.pill.label}</span>
           {#if worker.action === 'download-models'}<button class="btn" disabled={busy || !native} onclick={() => prepareModels(true)}>Download Models</button>{/if}
           {#if worker.action === 'check-approval'}<button class="btn" disabled={busy || !native} onclick={checkApproval}>Check Approval</button>{/if}

@@ -388,8 +388,87 @@ pub struct NativeSidecar {
     lease: Option<std::sync::Arc<File>>,
     /// Released before the scratch is removed.
     owner: Option<File>,
+    /// The last lines the process wrote to its error stream.
+    stderr: StderrTail,
+}
+/// The kept lines, and whether the stream has been read to its end.
+type StderrTail = (
+    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+);
+const STDERR_LINES: usize = 12;
+const STDERR_LINE_LENGTH: usize = 240;
+/// Keep the tail of a process's error stream, so a crash can say why. The thread ends when the
+/// process closes the stream, which it does by exiting.
+fn keep_stderr_tail(mut stream: impl std::io::Read + Send + 'static) -> StderrTail {
+    let tail = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let drained = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (kept, done) = (tail.clone(), drained.clone());
+    std::thread::spawn(move || {
+        let keep = |line: &[u8]| {
+            let text = String::from_utf8_lossy(line);
+            let text: String = text
+                .trim_end()
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(STDERR_LINE_LENGTH)
+                .collect();
+            if text.is_empty() {
+                return;
+            }
+            let mut kept = kept.lock().unwrap();
+            if kept.len() == STDERR_LINES {
+                kept.pop_front();
+            }
+            kept.push_back(text);
+        };
+        // Read in small pieces and keep only the start of each line: a line of any length
+        // (a diagnostic with no newline) costs no more memory than a short one.
+        let (mut piece, mut line) = ([0u8; 4096], Vec::with_capacity(STDERR_LINE_LENGTH * 4));
+        loop {
+            let count = match stream.read(&mut piece) {
+                Ok(0) => break,
+                Ok(count) => count,
+                // Interrupted by a signal, not ended: read again.
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            for &byte in &piece[..count] {
+                if byte == b'\n' {
+                    keep(&line);
+                    line.clear();
+                } else if line.len() < STDERR_LINE_LENGTH * 4 {
+                    line.push(byte);
+                }
+            }
+        }
+        keep(&line);
+        done.store(true, std::sync::atomic::Ordering::Release);
+    });
+    (tail, drained)
 }
 impl NativeSidecar {
+    /// Why the process ended by itself: its exit status and the last lines of its error stream.
+    /// `None` while it runs, and when this app stopped it.
+    pub(crate) fn exit_report(&mut self) -> Option<String> {
+        let _ = self.is_running();
+        let status = self.exit_status?;
+        // The process is gone; its last lines may still be on their way through the pipe.
+        // Briefly, and no longer: something it started may still hold the pipe open.
+        for _ in 0..20 {
+            if self.stderr.1.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let lines = self.stderr.0.lock().unwrap();
+        let tail: Vec<&str> = lines.iter().map(String::as_str).collect();
+        Some(if tail.is_empty() {
+            status.to_string()
+        } else {
+            format!("{status}: {}", tail.join(" | "))
+        })
+    }
     pub(crate) fn hold_lease(&mut self, lease: std::sync::Arc<File>) {
         self.lease = Some(lease);
     }
@@ -417,6 +496,10 @@ impl NativeSidecar {
     }
     pub fn stop(&mut self) -> Result<(), String> {
         if !self.stopped {
+            // A process that had already ended by itself keeps its own exit status.
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.exit_status = Some(status);
+            }
             self.tree.terminate();
             let _ = self.child.kill();
             self.child
@@ -450,6 +533,7 @@ impl VerifiedRuntime {
             Invocation::Serve {
                 port,
                 qualified: &[],
+                threads: 1,
             },
         )
     }
@@ -469,6 +553,18 @@ impl VerifiedRuntime {
         private_root: &Path,
         port: u16,
     ) -> Result<NativeSidecar, String> {
+        self.start_bound_sidecar_threads(qualified, cache, private_root, port, 1)
+    }
+    /// As `start_bound_sidecar`, serving up to `threads` requests at once (one, when the
+    /// worker runs one task at a time).
+    pub(crate) fn start_bound_sidecar_threads(
+        &self,
+        qualified: &[&QualifiedRuntime],
+        cache: &Path,
+        private_root: &Path,
+        port: u16,
+        threads: u32,
+    ) -> Result<NativeSidecar, String> {
         if !(1..=64).contains(&qualified.len())
             || port < 1024
             || qualified
@@ -477,7 +573,16 @@ impl VerifiedRuntime {
         {
             return Err("runtime_qualification_binding_invalid".into());
         }
-        self.launch(cache, private_root, Invocation::Serve { port, qualified })
+        let threads = threads.clamp(1, 64);
+        self.launch(
+            cache,
+            private_root,
+            Invocation::Serve {
+                port,
+                qualified,
+                threads,
+            },
+        )
     }
     fn launch(
         &self,
@@ -572,12 +677,21 @@ impl VerifiedRuntime {
             .env("MKL_NUM_THREADS", "1")
             .env("MACHINE_LEARNING_MODEL_INTRA_OP_THREADS", "4")
             .env("MACHINE_LEARNING_MODEL_INTER_OP_THREADS", "1")
-            .env("MACHINE_LEARNING_REQUEST_THREADS", "1")
+            .env(
+                "MACHINE_LEARNING_REQUEST_THREADS",
+                match &invocation {
+                    // As many requests at once as the worker runs tasks at once.
+                    Invocation::Serve { threads, .. } => threads.to_string(),
+                    Invocation::Qualify { .. } => "1".into(),
+                },
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         match invocation {
-            Invocation::Serve { port, qualified } => {
+            Invocation::Serve {
+                port, qualified, ..
+            } => {
                 if qualified.len() > 1 {
                     // Older signed runtimes must reject this invocation rather than use only the last pair.
                     command.arg("--binding-set");
@@ -634,6 +748,11 @@ impl VerifiedRuntime {
             }
         };
         let mut child = child;
+        let stderr = child
+            .stderr
+            .take()
+            .map(keep_stderr_tail)
+            .unwrap_or_default();
         let tree = match crate::process_tree::ProcessTree::attach(&child) {
             Ok(value) => value,
             Err(error) => {
@@ -652,6 +771,7 @@ impl VerifiedRuntime {
             exit_status: None,
             lease: None,
             owner: Some(owner),
+            stderr,
         };
         owner
             .child
@@ -732,6 +852,8 @@ enum Invocation<'a> {
     Serve {
         port: u16,
         qualified: &'a [&'a QualifiedRuntime],
+        /// How many requests the process serves at once.
+        threads: u32,
     },
     Qualify {
         spec: &'a [u8],
@@ -1769,7 +1891,6 @@ mod accepted_qualification_tests {
             ("qualifiedAt", json!("2026-10-15T20:05:00Z")),
             ("expiresAt", json!("2026-10-15T21:00:01Z")),
             ("expiresAt", json!("2026-10-15T19:00:00Z")),
-            ("extra", json!(true)),
         ] {
             let mut changed = response.clone();
             changed[field] = value;
@@ -1785,5 +1906,11 @@ mod accepted_qualification_tests {
                 "{field}"
             );
         }
+        // A field a newer server adds is not evidence of anything: every known field is still
+        // checked and the reply is accepted.
+        let mut newer = response.clone();
+        newer["somethingNew"] = json!(true);
+        let raw = serde_json::to_vec(&newer).unwrap();
+        assert!(AcceptedQualification::bind(&worker, &profile, &qualified, &raw, AT).is_ok());
     }
 }

@@ -28,6 +28,9 @@ cc = "1"
 tauri = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The proxy settings reqwest itself reads, for deciding per request (`transport::server_proxy`).
+hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
+http = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "multipart", "stream", "blocking"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 ed25519-dalek = "2"

@@ -1,7 +1,7 @@
 //! How one can sign in to a server at an address, before any credential is sent: its ping
 //! (identity, linked, setup) and its public config (password login, its own OAuth, Sign in with
 //! Frameleaf). The same lookup the mobile apps make (Android `ServerLookup`, iOS `ServerLoginOptions`).
-use crate::connection::{is_local_network, normalize_server};
+use crate::connection::normalize_server;
 use crate::transport;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -9,6 +9,8 @@ use tauri::WebviewWindow;
 use url::Url;
 
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long the HTTPS try of a home name typed without a scheme may take before plain HTTP.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Deserialize)]
 struct Ping {
@@ -91,7 +93,7 @@ fn options(base: &Url, ping: Ping, config: Option<PublicConfig>) -> Result<SignI
         .collect::<String>();
     Ok(SignInOptions {
         server: base.to_string(),
-        local: base.host().is_some_and(is_local_network),
+        local: crate::connection::is_home_server(base),
         // A linked server is joined with Sign in with Frameleaf, never set up again.
         needs_setup: !ping.linked && ping.setup == "needed",
         // An older server without these fields still takes a password; a linked one also Frameleaf.
@@ -138,17 +140,38 @@ pub(crate) async fn server_sign_in_options(
 ) -> Result<SignInOptions, String> {
     crate::require_local(&window)?;
     // The one place an address is typed: every later step is given the origin this returns.
-    let base = crate::connection::typed_server(&server)?;
+    let candidates = crate::connection::typed_servers(&server).await?;
+    // A home name typed without a scheme is tried over HTTPS, then over plain HTTP.
+    let mut reached = Err("server_unreachable_or_certificate_invalid".to_string());
+    let mut base = candidates[0].clone();
+    let fallback = candidates.len() > 1;
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        // Taken into use only now, and before its client is built: a plain-HTTP name is held
+        // to the home network and reached directly from its first request.
+        let candidate = normalize_server(candidate.as_str())?;
+        let client = transport::client()?;
+        let ping = get::<Ping>(&client, &candidate, "api/server/ping");
+        reached = if fallback && index == 0 {
+            // With plain HTTP still to try, a port that drops packets is not waited out in full.
+            tokio::time::timeout(PROBE_TIMEOUT, ping)
+                .await
+                .unwrap_or_else(|_| Err("server_unreachable_or_certificate_invalid".into()))
+        } else {
+            ping.await
+        };
+        base = candidate;
+        if !matches!(&reached, Err(code) if code == "server_unreachable_or_certificate_invalid") {
+            break;
+        }
+    }
+    let ping: Ping = reached.map_err(|code| {
+        if code.starts_with("server_http_") || code == "server_response_invalid" {
+            "server_not_frameleaf".into()
+        } else {
+            code
+        }
+    })?;
     let client = transport::client()?;
-    let ping: Ping = get(&client, &base, "api/server/ping")
-        .await
-        .map_err(|code| {
-            if code.starts_with("server_http_") || code == "server_response_invalid" {
-                "server_not_frameleaf".into()
-            } else {
-                code
-            }
-        })?;
     // The ping proves who answered; a missing or older config only narrows to the defaults.
     let config = get(&client, &base, "api/public/config").await.ok();
     options(&base, ping, config)
@@ -196,7 +219,9 @@ fn provider_page_allowed(url: &Url) -> bool {
         && url.password().is_none()
         && match url.scheme() {
             "https" => url.host().is_some(),
-            "http" => url.host().is_some_and(is_local_network),
+            // The page opens in a web view, which looks names up itself and can't be held to
+            // home addresses: plain HTTP only for what is local by its shape.
+            "http" => url.host().is_some_and(crate::connection::is_local_network),
             _ => false,
         }
 }

@@ -569,7 +569,7 @@ pub(crate) async fn offline_album_browse_library(
     let _active = state.0.lock().await;
     require_local_photos(&window)?;
     let saved = app.state::<OfflineAlbums>().saved()?;
-    crate::open_photos_window(&app, &saved)
+    crate::open_photos_checked(&app, &saved).await
 }
 
 #[tauri::command]

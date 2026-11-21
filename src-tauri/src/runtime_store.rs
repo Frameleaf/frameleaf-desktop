@@ -439,11 +439,26 @@ impl RuntimeStore {
             return Err("runtime_epoch_reused".into());
         }
         let release = self.root.join("releases").join(id);
-        if release.exists() {
-            self.read_release(id, minimum)?;
-        } else {
+        // An installed copy that no longer verifies (a file changed, went missing or was cut
+        // short) could never be used or replaced. Under the exclusive lock nothing runs from
+        // it: move it aside and stage it again from the bundle just verified.
+        // Anything at the path counts, a link that leads nowhere included.
+        let occupied = |path: &Path| fs::symlink_metadata(path).is_ok();
+        let damaged = occupied(&release) && self.read_release(id, minimum).is_err();
+        if damaged {
+            let aside = self.root.join(format!(".staging-{}", Uuid::new_v4()));
+            fs::rename(&release, &aside).map_err(|_| "runtime_store_activation_failed")?;
+            // A link is removed as a link, never followed.
+            if fs::remove_dir_all(&aside).is_err() {
+                let _ = fs::remove_file(&aside);
+            }
+        }
+        if !occupied(&release) {
             let staging = Staging::create(self.root.join(format!(".staging-{}", Uuid::new_v4())))?;
             private_directory(&staging.0.join("payload"))?;
+            // A repair copies every file from the bundle: a file shared with another installed
+            // release may be the damaged one.
+            let share = if damaged { None } else { share };
             verified.copy_payload(&staging.0.join("payload"), share)?;
             VerifiedRuntime::verify(
                 &staging.0.join("payload"),
@@ -532,9 +547,19 @@ impl InstalledRuntime {
         private_root: &Path,
         port: u16,
     ) -> Result<NativeSidecar, String> {
+        self.start_bound_sidecar_threads(qualified, cache, private_root, port, 1)
+    }
+    pub(crate) fn start_bound_sidecar_threads(
+        &self,
+        qualified: &[&QualifiedRuntime],
+        cache: &Path,
+        private_root: &Path,
+        port: u16,
+        threads: u32,
+    ) -> Result<NativeSidecar, String> {
         let mut child = self.checked(|| {
             self.runtime
-                .start_bound_sidecar(qualified, cache, private_root, port)
+                .start_bound_sidecar_threads(qualified, cache, private_root, port, threads)
         })?;
         child.hold_lease(self.lease.clone());
         Ok(child)
