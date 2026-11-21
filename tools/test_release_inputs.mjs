@@ -193,13 +193,15 @@ test("updater verification requires the embedded key, exact bytes and release ve
   }
 });
 
-test("on Forgejo only Windows and Linux x86_64 have a runner to build on", async () => {
+test("on Forgejo every target but Intel Mac has a runner to build on, Apple Silicon by opt-in", async () => {
   const { forgejoTargetProblems } = await import("./release_inputs.mjs");
   assert.deepEqual(forgejoTargetProblems("windows", "runtime"), []);
   assert.deepEqual(forgejoTargetProblems("windows", "installer"), []);
   assert.deepEqual(forgejoTargetProblems("linux-x86_64", "installer"), []);
   const all = forgejoTargetProblems("all", "runtime");
-  assert.deepEqual(all.map((problem) => problem.split(":")[0]), ["macos-aarch64", "macos-x86_64", "linux-aarch64"]);
+  assert.deepEqual(all.map((problem) => problem.split(":")[0]), ["macos-aarch64", "macos-x86_64"]);
+  assert.deepEqual(forgejoTargetProblems("linux", "installer"), []);
+  assert.deepEqual(forgejoTargetProblems("linux-aarch64", "runtime"), []);
   // The owner's own Mac builds Apple Silicon only with the owner's opt-in; Intel stays refused.
   assert.deepEqual(forgejoTargetProblems("macos-aarch64", "installer", { ownerMac: true }), []);
   assert.match(forgejoTargetProblems("macos-aarch64", "installer")[0], /^macos-aarch64: /);

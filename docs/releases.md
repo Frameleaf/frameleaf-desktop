@@ -936,11 +936,19 @@ own copies as repository secrets:
   runs and their artifacts from Forgejo through `tools/forgejo_gh.mjs`. If the job token cannot
   read them, add a repository secret `RUNS_READ_TOKEN` with read access to the repository.
 - A target runs only where Forgejo has a runner it can safely use (`forgejoTargetProblems` in
-  `tools/release_inputs.mjs`). Today that is Windows (runtime packs and the unsigned installers)
-  and Linux x86_64, which builds on the Unraid CI slot labelled `ubuntu-22.04` (slot 5, a host-mode
-  slot built from `ghcr.io/catthehacker/ubuntu:runner-22.04`). There is no Intel Mac or Arm Linux
-  runner, and the one Mac runner is the owner's own Mac, so macOS and `linux-aarch64` cannot be
-  released until such runners exist; choose `linux-x86_64` rather than `linux`.
+  `tools/release_inputs.mjs`). Today that is:
+  - Windows (runtime packs, CUDA and OpenVINO, and the unsigned installers) on `win-rtx3060`
+    (`windows-2022`);
+  - Linux x86_64 on the runners labelled `ubuntu-22.04`: the DigitalOcean CI slots, where that
+    label runs the job in the `ghcr.io/catthehacker/ubuntu:act-22.04` container, and the Unraid
+    slot 5 when it is online;
+  - Linux Arm (`linux-aarch64`) on the owner's Mac slot `mac-arm64`, whose `ubuntu-22.04-arm`
+    label runs the job in an arm64 Ubuntu 22.04 container (owner, 2026-11-21: "Yes, both");
+  - Apple Silicon on the owner's own Mac, by opt-in (below).
+  Linux is built in Ubuntu 22.04 (glibc 2.35) so it also loads on Debian 12, and every Linux
+  release run checks that no packaged binary needs a newer C library (`check_linux_glibc.py
+  --max 2.35`); a run that fails it does not stage. There is no Intel Mac runner: `macos-x86_64`
+  is refused on Forgejo and Intel Macs stay on their installed version.
 
 ### Apple Silicon on the owner's own Mac (opt-in)
 
