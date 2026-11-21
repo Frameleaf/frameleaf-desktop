@@ -46,11 +46,14 @@ done
 name=$(dpkg-deb --field "$package" Package)
 for image in "${images[@]}"; do
   echo "::group::Install $name in a clean $image container"
-  docker run --rm --network bridge -e DEBIAN_FRONTEND=noninteractive -e PACKAGE_NAME="$name" \
-    -v "$package:/install/package.deb:ro" "$image" bash -euo pipefail -c '
+  # The package is copied into the container, not bind-mounted: when the Docker daemon is not this
+  # machine's (a CI job in a container using its runner's daemon), a bind mount names a path on the
+  # daemon's side, where it does not exist, and arrives as an empty directory.
+  id=$(docker create --network bridge -e DEBIAN_FRONTEND=noninteractive -e PACKAGE_NAME="$name" \
+    "$image" bash -euo pipefail -c '
       apt-get update -qq
       # apt exits non-zero when a dependency cannot be satisfied in this distribution.
-      apt-get install -y --no-install-recommends /install/package.deb
+      apt-get install -y --no-install-recommends /tmp/package.deb
       [[ "$(dpkg-query --show --showformat="\${db:Status-Abbrev}" "$PACKAGE_NAME")" == "ii " ]]
       ls /usr/lib/*/libayatana-appindicator3.so.1 > /dev/null
       # Installing proves the dependencies resolve. Running each installed binary proves this
@@ -69,7 +72,11 @@ for image in "${images[@]}"; do
       done < <(dpkg-query --listfiles "$PACKAGE_NAME" | grep -E "^/usr/bin/")
       [[ $ran -gt 0 ]] || { echo "::error::The package installed no binary in /usr/bin"; exit 1; }
       echo "Installed binaries run in this distribution."
-    '
+    ')
+  status=0
+  docker cp "$package" "$id:/tmp/package.deb" && docker start --attach "$id" || status=$?
+  docker rm --force "$id" > /dev/null
+  [[ $status == 0 ]] || exit "$status"
   echo '::endgroup::'
 done
 echo "Installed and ran $name in: ${images[*]}"
