@@ -443,6 +443,9 @@ jobs:
         run: |
           set -euo pipefail
           : "${TAURI_SIGNING_PRIVATE_KEY:?Missing updater signing key}"
+          # The current updater key has no password: an unset secret arrives as an empty value,
+          # which must not reach the signer as a password.
+          [[ -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]] || unset TAURI_SIGNING_PRIVATE_KEY_PASSWORD
           version="${RELEASE_TAG#v}"
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             bundle=src-tauri/target/release/bundle/macos
