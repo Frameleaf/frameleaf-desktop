@@ -10,7 +10,7 @@ on:
         description: 'Candidate targets; Windows installers are unsigned'
         type: choice
         default: linux
-        options: [linux, windows]
+        options: [linux, linux-x86_64, windows]
 permissions:
   contents: read
   actions: read
@@ -19,8 +19,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   prepare:
-    # Release signing runs on GitHub (docs/releases.md, Releasing from Forgejo). On Forgejo this is off
-    # unless the repository variable DESKTOP_RELEASE_ON_FORGEJO is true, which it is not.
+    # On Forgejo this runs only while the repository variable DESKTOP_RELEASE_ON_FORGEJO is true
+    # (docs/releases.md, Releasing from Forgejo).
     if: ${{ (github.server_url == 'https://github.com' || vars.DESKTOP_RELEASE_ON_FORGEJO == 'true') && (github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -42,10 +42,11 @@ jobs:
         if: github.server_url != 'https://github.com'
         env:
           RELEASE_PLATFORMS: ${{ inputs.platforms }}
+          OWNER_MAC: ${{ github.server_url != 'https://github.com' && vars.DESKTOP_RELEASE_MACOS_ON_OWNER_MAC == 'true' }}
         run: |
           node --input-type=module -e '
             import { forgejoTargetProblems } from "./tools/release_inputs.mjs";
-            const problems = forgejoTargetProblems(process.env.RELEASE_PLATFORMS, "installer");
+            const problems = forgejoTargetProblems(process.env.RELEASE_PLATFORMS, "installer", { ownerMac: process.env.OWNER_MAC === "true" });
             for (const problem of problems) console.log(`::error::${problem}`);
             process.exitCode = problems.length ? 1 : 0;
           '
@@ -68,7 +69,7 @@ jobs:
           node --input-type=module -e '
             import { appendFileSync } from "node:fs";
             import { releaseMatrix } from "./tools/release_inputs.mjs";
-            if (!["linux", "windows"].includes(process.env.CANDIDATE_PLATFORMS)) throw new Error("candidate_platforms_invalid");
+            if (!["linux", "linux-x86_64", "windows"].includes(process.env.CANDIDATE_PLATFORMS)) throw new Error("candidate_platforms_invalid");
             appendFileSync(process.env.GITHUB_OUTPUT, "matrix=" + JSON.stringify(releaseMatrix(process.env.CANDIDATE_PLATFORMS)) + "\n");
           '
   build:

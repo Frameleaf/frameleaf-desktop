@@ -766,3 +766,47 @@ fn retained_runtime_cannot_start_or_qualify_after_another_root_advances() {
     assert!(!cache.exists());
     assert!(!work.exists());
 }
+
+#[test]
+fn an_installed_runtime_that_no_longer_verifies_is_rebuilt_from_the_bundle() {
+    let fixture = Fixture::new();
+    let candidate = fixture.0.join("candidate");
+    fs::create_dir(&candidate).unwrap();
+    fs::write(candidate.join("python"), b"fixture").unwrap();
+    let key = SigningKey::from_bytes(&[42; 32]);
+    let store = RuntimeStore::new(
+        &fixture.0.join("store"),
+        vec![key.verifying_key()],
+        1,
+        common::authority(),
+    )
+    .unwrap();
+    let raw = manifest(2);
+    let signature = key.sign(&raw).to_bytes();
+    store
+        .install_and_activate(&candidate, &raw, &signature)
+        .unwrap();
+    let id = format!("{:x}", Sha256::digest(&raw));
+    let installed = store.release_payload(&id).join("python");
+    // A file of the installed copy is cut short (a full disk, a crash, a cleaner).
+    let mut permissions = fs::metadata(&installed).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    fs::set_permissions(&installed, permissions).unwrap();
+    fs::write(&installed, b"fix").unwrap();
+    assert!(store.load_active().is_err());
+    // Installing the same signed bundle again repairs it, at the same epoch.
+    store
+        .install_and_activate(&candidate, &raw, &signature)
+        .unwrap();
+    let active = store.load_active().unwrap().unwrap();
+    assert_eq!(active.manifest_sha256(), id);
+    assert_eq!(fs::read(&installed).unwrap(), b"fixture");
+    // Nothing of the damaged copy is left beside it.
+    let leftovers: Vec<_> = fs::read_dir(fixture.0.join("store"))
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(".staging-"))
+        .collect();
+    assert!(leftovers.is_empty());
+}

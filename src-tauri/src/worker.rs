@@ -13,19 +13,35 @@ pub struct SessionRequest {
     pub signature: String,
 }
 
+/// The time the server reads: this computer's clock corrected by `clock_skew_ms`
+/// (`transport::clock_skew`). The server refuses a request timed more than two minutes off.
+fn server_time(clock_skew_ms: i64) -> Result<u64, String> {
+    let local = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "clock_invalid")?
+        .as_millis() as i64;
+    Ok((local + clock_skew_ms).max(0) as u64)
+}
+
 pub fn session_request(
     identity: &DeviceIdentity,
     server: &str,
     account: &str,
     device: &str,
 ) -> Result<SessionRequest, String> {
+    session_request_at(identity, server, account, device, 0)
+}
+pub fn session_request_at(
+    identity: &DeviceIdentity,
+    server: &str,
+    account: &str,
+    device: &str,
+    clock_skew_ms: i64,
+) -> Result<SessionRequest, String> {
     let mut request = SessionRequest {
         device_id: device.into(),
         request_id: Uuid::new_v4().to_string(),
-        timestamp: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| "clock_invalid")?
-            .as_millis() as u64,
+        timestamp: server_time(clock_skew_ms)?,
         signature: String::new(),
     };
     request.signature = identity.sign(
@@ -93,16 +109,23 @@ pub fn reserve_proof(
     payload: &str,
     persist: impl FnOnce(&SavedWorker) -> Result<(), String>,
 ) -> Result<WorkerProof, String> {
+    reserve_proof_at(saved, identity, operation, payload, 0, persist)
+}
+pub fn reserve_proof_at(
+    saved: &mut SavedWorker,
+    identity: &DeviceIdentity,
+    operation: &str,
+    payload: &str,
+    clock_skew_ms: i64,
+    persist: impl FnOnce(&SavedWorker) -> Result<(), String>,
+) -> Result<WorkerProof, String> {
     if saved.next_sequence == 0 || saved.next_sequence > 2_147_483_647 {
         return Err("worker_session_renewal_required".into());
     }
     let mut proof = WorkerProof {
         session_id: saved.session_id.clone(),
         sequence: saved.next_sequence,
-        timestamp: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| "clock_invalid")?
-            .as_millis() as u64,
+        timestamp: server_time(clock_skew_ms)?,
         signature: String::new(),
     };
     let mut checkpoint = saved.clone();

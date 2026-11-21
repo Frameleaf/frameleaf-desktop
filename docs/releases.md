@@ -360,7 +360,8 @@ runtime in `runtime/profiles.json` is one the server approves.
 admit, and every source in it has profiles in the catalogue (the parity check
 fails otherwise). Today that is the CPU runtime on every target, `coreml-ort` on
 Apple Silicon, and `cuda-ort` and `openvino-ort` on Windows and Linux x86_64.
-The accelerated profiles build their own runtime source (catalogue epoch 16),
+The accelerated profiles build their own runtime source (since catalogue epoch 16;
+the catalogue is at epoch 17 today),
 which verifies the model bytes a session loads; the CPU profile is unchanged.
 
 `python tools/build_runtime.py --profile coreml-ort` builds an accelerated pack:
@@ -371,7 +372,8 @@ The factory workflow builds it for `macos-aarch64` by default (`accelerated:
 default`; choose `none` for the processor pack alone), and signs both manifests
 (`manifest-accelerated.sig`) after Apple code signing; packaging ships the second
 manifest beside the first. Both manifests of that pack name the accelerated
-profile's source, so the server must already carry catalogue epoch 16: against an
+profile's source, so the server must already carry this catalogue's epoch (17
+today): against an
 older server neither manifest is known and that Mac has no AI processing until
 the server is updated. Release the server first: a tagged release run stops in
 `prepare` with `catalogue_ahead_of_server` when `runtime/model-catalogue.json` has
@@ -660,8 +662,13 @@ The Library 1.2.4 packages were made before this:
   controller `045568dc0bbbe5a582516e83b2d4f11b4122a381cb91a6d29c778aff128b5cc7`
   and manifest `b3ce270798e290f89505e554dee9be0fd3006a49af11fe3bf5d0025dde5d7a74`.
 - Windows x64: only the unsigned 1.2.4 installer exists. A signed one needs the
-  Windows chain above once signing is configured; until then release Windows
-  with `companion_run_ids=none` or leave Windows out.
+  Windows chain above once signing is configured. Until then Windows is released
+  with `companion_run_ids=none`, as every release so far (owner decision for 0.1.7,
+  2026-11-20: "Ship as before"): the Windows installer and its CUDA and OpenVINO
+  packs are staged as usual, no Windows companion package is added, and the
+  release notes say so. Azure signing on Forgejo would need a client secret,
+  since Forgejo cannot issue the GitHub OIDC token `windows-compiled-host.yml`
+  uses.
 
 ### Staging: one draft per tag
 
@@ -800,8 +807,7 @@ validation; macOS and Linux ship without it.
    uses Azure Artifact Signing; see below.)
 2. **Release the server first** when `runtime/model-catalogue.json` has a higher
    epoch than the latest `frameleaf-v<version>` server release (today: Desktop
-   16, `frameleaf-v1.2.22` 15, so a server release carrying catalogue epoch 16
-   comes first).
+   17, `frameleaf-v1.2.25` 17, so no server release has to come first).
 3. **Merge everything that ships, including the version change**, to `main`.
    The commit to release is `<commit>`; `node tools/release_inputs.mjs v<version>`
    on it prints the tag.
@@ -853,7 +859,7 @@ validation; macOS and Linux ship without it.
      -f companion_run_ids=<ubuntu-host-qualification run>
    gh workflow run release.yml --repo Frameleaf/frameleaf-desktop --ref main \
      -f tag=v<version> -f platforms=windows -f runtime_run_id=<factory run> \
-     -f companion_run_ids=<windows-compiled-host run>   # needs step 1
+     -f companion_run_ids=none   # no signed Windows companion yet (Reusing a companion package)
    ```
 
    A run that selects several platforms takes their run ids comma-separated.
@@ -900,16 +906,29 @@ retained DMG after acceptance.
 
 ## Releasing from Forgejo
 
-CI runs on the self-hosted Forgejo at https://code.heroapps.ca/Frameleaf/frameleaf-desktop. **Release
-signing and publishing stay on GitHub** (owner, 2026-11-18): the release keys
-(`DESKTOP_RELEASE_ED25519_PRIVATE_KEY` for runtime packs, `TAURI_SIGNING_PRIVATE_KEY` for updates,
-and the Apple set) live only in GitHub's `desktop-release` environment and are not copied to
-Forgejo. `factory-runtime.yml`, `installer-candidates.yml`, `release.yml` and the host signing
-workflows are run on GitHub, and GitHub keeps git, tags and the releases the app downloads from.
+CI and the release chain run on the self-hosted Forgejo at
+https://code.heroapps.ca/Frameleaf/frameleaf-desktop (owner, 2026-11-19). GitHub Actions is no longer
+used, and the keys in its `desktop-release` environment cannot be read back, so Forgejo holds its
+own copies as repository secrets:
 
-The release workflows can also run on Forgejo, but that path is off: they skip there unless the
-repository variable `DESKTOP_RELEASE_ON_FORGEJO` is `true`, and it is not set. Turning it on would
-also need the keys above on Forgejo. For reference, if that ever changes:
+- `TAURI_SIGNING_PRIVATE_KEY`: the original updater key (key id `6FC9088C9E7444A4`, the one
+  pinned in `src-tauri/tauri.conf.json`), so installed apps keep updating in place. It has no
+  password. The owner's copy is the login keychain item `app.frameleaf.desktop.updater-signing`.
+- `DESKTOP_RELEASE_ED25519_PRIVATE_KEY`: the runtime-pack key `desktop-release-2026-11`, made on
+  2026-11-19 because `desktop-release-2026-10` was lost with GitHub. Both stay in
+  `runtime/release-trust.json` and in Library's `server/resources/desktop/release-trust.json`.
+  Library must carry the new key before a pack signed with it ships. An installed app trusts the
+  new key only once it updates to a release that lists it, which the updater key above still
+  delivers. The owner's copy is the keychain item `app.frameleaf.desktop.runtime-signing` (base64
+  of the PKCS8 PEM; decode it before use).
+- Pull requests stay on GitHub, but their checks come from Forgejo. `github-bridge` on Unraid
+  (`/mnt/shaganappi/appdata/forgejo/github-bridge`) runs once a minute: it fast-forwards Forgejo
+  `main` to GitHub's, pushes each open same-repository pull request's branch to Forgejo and opens a
+  mirror pull request there (fork pull requests are never run: the runners are host-mode slots and
+  the owner's machines), and posts each Forgejo job back to GitHub as a commit status named
+  `Forgejo / <workflow> / <job>`. Posting needs a GitHub token in that folder's `github-token` file.
+- The repository variable `DESKTOP_RELEASE_ON_FORGEJO` is `true`. GitHub keeps git tags and the
+  releases the app downloads from, written with `GH_PUBLISH_TOKEN`.
 
 - Forgejo has no environment approval, so that variable stands in for the `desktop-release` gate.
   The draft release on GitHub is written with the organization secret `GH_PUBLISH_TOKEN`.
@@ -918,6 +937,34 @@ also need the keys above on Forgejo. For reference, if that ever changes:
   runs and their artifacts from Forgejo through `tools/forgejo_gh.mjs`. If the job token cannot
   read them, add a repository secret `RUNS_READ_TOKEN` with read access to the repository.
 - A target runs only where Forgejo has a runner it can safely use (`forgejoTargetProblems` in
-  `tools/release_inputs.mjs`). Today that is Windows only (runtime packs and the unsigned
-  installers): there is no Intel Mac or Ubuntu 22.04 runner, and the one Mac runner is the
-  owner's own Mac.
+  `tools/release_inputs.mjs`). Today that is:
+  - Windows (runtime packs, CUDA and OpenVINO, and the unsigned installers) on `win-rtx3060`
+    (`windows-2022`);
+  - Linux x86_64 on the runners labelled `ubuntu-22.04`: the DigitalOcean CI slots, where that
+    label runs the job in the `ghcr.io/catthehacker/ubuntu:act-22.04` container, and the Unraid
+    slot 5 when it is online;
+  - Linux Arm (`linux-aarch64`) on the owner's Mac slot `mac-arm64`, whose `ubuntu-22.04-arm`
+    label runs the job in an arm64 Ubuntu 22.04 container (owner, 2026-11-21: "Yes, both");
+  - Apple Silicon on the owner's own Mac, by opt-in (below).
+  Linux is built in Ubuntu 22.04 (glibc 2.35) so it also loads on Debian 12, and every Linux
+  release run checks that no packaged binary needs a newer C library (`check_linux_glibc.py
+  --max 2.35`); a run that fails it does not stage. There is no Intel Mac runner: `macos-x86_64`
+  is refused on Forgejo and Intel Macs stay on their installed version.
+
+### Apple Silicon on the owner's own Mac (opt-in)
+
+Forgejo's only Mac runner (`mac`, label `macos-26`) is the owner's own Mac, so Apple Silicon is
+refused there by default. The owner allowed it for 0.1.7 (2026-11-20: "Yes, use my Mac"). The
+opt-in is the repository variable `DESKTOP_RELEASE_MACOS_ON_OWNER_MAC=true`: while it is set, the
+factory and release workflows build `macos-aarch64` on that Mac; unset it afterwards, and every
+other run stays refused. On that Mac a job:
+
+- signs only with a keychain it creates under its own `RUNNER_TEMP` and deletes in its cleanup
+  step, which also removes the certificate and profile files and puts the user's keychain search
+  list back as it was;
+- does not launch the installed app (that check ends every running Frameleaf and uses the
+  signed-in user's app data) and does not run the production Keychain entitlement check (it writes
+  to the signed-in user's keychain). Both are named in the run's warnings and summary, and the
+  release notes say they were not run for that build.
+
+Intel Macs (`macos-x86_64`) have no runner on Forgejo and stay on their installed version.

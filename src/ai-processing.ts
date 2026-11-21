@@ -81,9 +81,18 @@ function fallbackReason(code: string): string {
   if (code === 'provider_driver_outdated') return 'the NVIDIA driver is too old; update it to use the GPU';
   if (code === 'provider_slower') return 'the processor is faster for this on this computer';
   if (code === 'provider_speed_unknown') return 'its speed could not be measured this time';
-  if (code === 'worker_qualification_refused' || code.startsWith('workload_desktop_')) return 'the Library did not accept it';
-  if (code.startsWith('runtime_qualification_') || code === 'runtime_process_stopped' || code === 'runtime_not_ready' || code === 'provider_failed')
-    return 'it did not pass its check on this computer';
+  if (code === 'worker_runtime_unsigned') return 'the Library did not accept its runtime';
+  if (code === 'worker_qualification_report_refused') return 'the Library did not accept its check';
+  if (code === 'worker_qualification_refused' || code.startsWith('workload_desktop_') || code.startsWith('server_http_')) return 'the Library did not accept it';
+  if (code === 'runtime_out_of_memory') return 'the graphics card ran out of memory this time';
+  if (code === 'runtime_qualification_timeout') return 'its check took too long this time';
+  if (code === 'runtime_output_mismatch') return 'it gave a different answer than expected on the test picture';
+  if (code === 'runtime_provider_unavailable') return 'the graphics card could not run the model';
+  if (code === 'runtime_model_missing') return 'its model files are missing or changed';
+  if (code === 'runtime_process_stopped') return 'its process stopped three times in a row while working; Frameleaf tries it again later by itself';
+  if (code === 'runtime_prediction_interrupted') return 'its process stopped answering three times in a row; Frameleaf tries it again later by itself';
+  if (code === 'runtime_not_ready' || code === 'worker_execution_deadline') return 'it did not start in time this time';
+  if (code.startsWith('runtime_qualification_') || code === 'provider_failed') return 'it did not pass its check on this computer';
   return 'it could not be prepared on this computer';
 }
 

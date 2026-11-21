@@ -203,6 +203,26 @@ fn sign_out_wipes_the_photos_data_whether_or_not_its_window_is_open() {
     );
     let open = function("pub(crate) fn open_photos_window(");
     assert!(position(&open, "photo_session::clear_if_owed(app)") < position(&open, "set_cookie("));
+    // Photos is only ever opened after a fresh look at where a plain-HTTP home name leads
+    // (`open_photos_checked`): a computer idle for longer than the last look counts is not
+    // refused, from the window, the tray, an offline album or a library switch undone.
+    let checked = function("pub(crate) async fn open_photos_checked(");
+    assert!(
+        position(&checked, "connection::refresh_home(") < position(&checked, "open_photos_window(")
+    );
+    for source in [
+        include_str!("tray.rs"),
+        include_str!("library_switch.rs"),
+        include_str!("offline_albums/mod.rs"),
+    ] {
+        assert!(!source.contains("open_photos_window("));
+    }
+    assert_eq!(
+        include_str!("lib.rs")
+            .matches("open_photos_window(")
+            .count(),
+        2
+    );
 }
 
 #[test]

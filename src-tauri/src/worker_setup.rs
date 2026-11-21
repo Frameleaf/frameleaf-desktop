@@ -26,6 +26,15 @@ pub(crate) struct SetupStatus {
     pub completed_tasks: u64,
     /// FD-52: the provider each workload runs on, and why when the processor stands in.
     pub providers: Vec<crate::provider_selection::WorkloadProvider>,
+    /// What the AI runtime process said when it last ended by itself: its exit status and the
+    /// last lines of its error output. Shown under the stop reason; cleared by a finished task.
+    pub detail: Option<String>,
+    /// How many tasks this computer runs at once, when the server lets it hold several.
+    pub concurrent_tasks: u32,
+    /// The most this computer runs at once since it ran short of memory doing more. Kept for
+    /// as long as AI processing runs, across restarts of its setup.
+    #[serde(skip)]
+    pub(crate) capacity_ceiling: Option<u32>,
 }
 #[derive(Clone, Serialize, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -77,6 +86,9 @@ impl Progress {
             }),
             completed_tasks: current.completed_tasks,
             providers: current.providers.clone(),
+            detail: current.detail.clone(),
+            concurrent_tasks: current.concurrent_tasks,
+            capacity_ceiling: current.capacity_ceiling,
         };
         if *current == status {
             return;
@@ -99,7 +111,40 @@ impl Progress {
         }
     }
     fn completed(&self) {
-        self.update(|status| status.completed_tasks += 1);
+        self.update(|status| {
+            status.completed_tasks += 1;
+            status.detail = None;
+        });
+    }
+    /// Keep, and log, why the runtime process ended.
+    fn crashed(&self, report: Option<String>) {
+        let Some(report) = report else { return };
+        eprintln!("worker_runtime_exited: {report}");
+        self.update(|status| status.detail = Some(report));
+    }
+    fn capacity_ceiling(&self) -> Option<u32> {
+        self.status.lock().unwrap().capacity_ceiling
+    }
+    /// Run no more than this many tasks at once from now on.
+    fn lower_capacity(&self, ceiling: u32) {
+        self.update(|status| {
+            let ceiling = ceiling.max(1);
+            status.capacity_ceiling =
+                Some(status.capacity_ceiling.map_or(ceiling, |c| c.min(ceiling)));
+            status.concurrent_tasks = status.concurrent_tasks.min(ceiling);
+        });
+    }
+    /// One more at once than it last ran short at, after a long run of tasks without trouble.
+    fn raise_capacity(&self) {
+        self.update(|status| {
+            status.capacity_ceiling = status.capacity_ceiling.map(|ceiling| ceiling + 1);
+        });
+    }
+    fn running_at_once(&self, tasks: u32) {
+        self.update(|status| status.concurrent_tasks = tasks);
+    }
+    fn completed_tasks(&self) -> u64 {
+        self.status.lock().unwrap().completed_tasks
     }
     fn active(&self, workload: Option<&str>) {
         self.update(|status| status.active_workload = workload.map(str::to_owned));
@@ -120,6 +165,15 @@ impl Progress {
                         total_bytes: total,
                     });
                 }
+            }
+        });
+    }
+    /// A download that starts over reports its verified files again: take the first count back.
+    fn uncredit(&self, bytes: u64) {
+        self.update(|status| {
+            if let Some(models) = &mut status.models {
+                models.verified_bytes = models.verified_bytes.saturating_sub(bytes);
+                models.download = None;
             }
         });
     }
@@ -274,7 +328,10 @@ impl WorkerSetup {
                     let paths = paths.clone();
                     let progress = progress.clone();
                     async move {
-                        if refresh {
+                        // No session saved: the connection check could not get one (AI
+                        // processing off, away from home, server busy). Ask here, where a
+                        // refusal is named, waited out and asked again.
+                        if refresh || !session_saved(&saved) {
                             refresh_session(&saved).await?;
                             check_cancel(&progress.cancelled)?;
                         }
@@ -298,7 +355,389 @@ impl WorkerSetup {
     }
 }
 
+fn session_saved(saved: &SavedConnection) -> bool {
+    matches!(
+        crate::credentials::load::<crate::worker::SavedWorker>("worker-session"),
+        Ok(Some(worker)) if worker.server_id == saved.server_id
+            && worker.account_id == saved.account_id
+            && Some(&worker.device_id) == saved.device_id.as_ref()
+    )
+}
+
 const NO_WORK_RECHECK: Duration = Duration::from_secs(5 * 60);
+/// How often a working computer asks the server which models its tasks use now.
+const MODEL_RECHECK: Duration = Duration::from_secs(5 * 60);
+/// How long until a task the server refused here (not the model: the library's index, say) is
+/// offered again. While an administrator's change of the search model is still being applied
+/// on the server the wait is short; a library built with another model is a long one.
+fn refused_task_retry(code: &str) -> Duration {
+    let code = code.strip_prefix("workload_").unwrap_or(code);
+    if code == "desktop_qualification_hold" {
+        // The server's hold lasts five minutes.
+        return Duration::from_secs(5 * 60 + 30);
+    }
+    Duration::from_secs(
+        if matches!(
+            code,
+            "desktop_clip_index_changed" | "desktop_clip_index_dimensions"
+        ) {
+            2 * 60
+        } else {
+            30 * 60
+        },
+    )
+}
+/// A refusal by the server of one task, as `first_failure` reports it when every task was
+/// refused (the `workload_` taken off). This app's own `desktop_…` codes (an unsupported
+/// protocol, a missing enrolment) are not among them and stop the worker with their own words.
+fn server_task_refusal(code: &str) -> bool {
+    code.starts_with("desktop_clip_")
+        || code.starts_with("desktop_model_profile_")
+        || matches!(
+            code,
+            "desktop_pool_model_unavailable"
+                | "desktop_face_profile_unavailable"
+                | "desktop_qualification_hold"
+        )
+}
+/// A refusal the processor would meet just the same (the model is held back, the library's
+/// index is another model's): the task waits where it is, on the provider it had.
+fn provider_independent(code: &str) -> bool {
+    let code = code.strip_prefix("workload_").unwrap_or(code);
+    // Not a profile the server lacks for this provider: the processor's may exist.
+    code == "desktop_qualification_hold"
+        || code.starts_with("desktop_clip_index_")
+        || code == "desktop_clip_space_unavailable"
+}
+/// How many tasks of each kind the server lets one computer run at once (`concurrency` in the
+/// `/models` reply, from the administrator's Jobs setting). One where the reply does not say.
+fn inventory_concurrency(inventory: &serde_json::Value) -> std::collections::BTreeMap<String, u32> {
+    inventory["workloads"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let limit = entry["concurrency"].as_u64().unwrap_or(1).clamp(1, 64) as u32;
+            Some((entry["workload"].as_str()?.to_owned(), limit))
+        })
+        .collect()
+}
+/// How many tasks this computer can work on at once, whatever the server would allow.
+///
+/// - Memory: beside the loaded models (`model_memory`), each task in hand needs working memory
+///   of its own, taken as a quarter of the models' and at least 256 MB. What is free now, less
+///   the models, says how many fit. Unknown free memory is one task.
+/// - The device: a graphics card or neural engine works on several inputs at once, up to
+///   eight here. The processor already gives each task four threads, so one task, or two on a
+///   computer with eight cores or more.
+///
+/// It is a starting point, not a promise: a graphics card's own memory is not something this
+/// app can read, so running short while working lowers it (`Progress::lower_capacity`).
+fn local_capacity(
+    accelerated: bool,
+    cores: usize,
+    available_memory: Option<u64>,
+    model_memory: u64,
+) -> u32 {
+    let per_task = (model_memory / 4).max(256 * 1024 * 1024);
+    let by_memory = available_memory.map_or(1, |free| free.saturating_sub(model_memory) / per_task);
+    let by_device = if accelerated {
+        8
+    } else {
+        (cores / 4).clamp(1, 2) as u64
+    };
+    by_memory.clamp(1, by_device) as u32
+}
+/// How many tasks to run at once: what the server allows for the tasks that are ready, what
+/// this computer can take, and no more than it managed since it last ran short of memory.
+fn concurrent_tasks(
+    limits: &std::collections::BTreeMap<String, u32>,
+    ready: &std::collections::BTreeSet<String>,
+    local: u32,
+    ceiling: Option<u32>,
+) -> u32 {
+    let allowed: u32 = ready
+        .iter()
+        .map(|workload| limits.get(workload).copied().unwrap_or(1))
+        .sum();
+    allowed.min(local).min(ceiling.unwrap_or(u32::MAX)).max(1)
+}
+/// What a runtime that ended or stopped answering means for how the work goes on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum AfterCrash {
+    /// Several tasks were in hand: most likely memory. This many at once, on the same runtime.
+    Fewer(u32),
+    /// One task in hand on a graphics card or neural engine: the same runtime again, after a
+    /// wait that grows with each crash in a row.
+    Again(u32),
+    /// One task in hand on the processor after a step down: its runtime once more, at once.
+    Once,
+    /// The runtime itself is failing: the processor takes its work, or the crash is counted.
+    Failing,
+}
+/// A graphics card or neural engine keeps its work until its runtime has ended this many times
+/// in a row with one task in hand and no task finished in between (owner decision: one crash
+/// at a single task never moves the work to the processor).
+const CRASHES_AT_ONE: u32 = 3;
+/// This many tasks finished in a row, with none refused and no crash, lets one more run at
+/// once again after a step down.
+const CLEAN_RUN: u32 = 50;
+/// The processor's own runtime, at one task at a time after stepping down, is started once
+/// more before it is treated as failing (as it always was).
+const PROCESSOR_CRASHES_AT_ONE: u32 = 2;
+/// How the runtime has fared since AI processing started, for how many tasks to run at once
+/// and whether a graphics card keeps the work.
+#[derive(Default)]
+struct RuntimeTrouble {
+    at_one: u32,
+    processor_at_one: u32,
+    clean: u32,
+    clean_accelerated: u32,
+}
+impl RuntimeTrouble {
+    /// `in_hand`: the tasks the runtime was working on when it ended. `accelerated`: the
+    /// runtime that ended is the graphics card's or neural engine's, and how it ended counts
+    /// as a crash (with nothing in hand: its process was found gone, not merely slow to
+    /// start). `stepped_down`: fewer tasks are already run at once than this computer was
+    /// first taken to manage. The processor's own runtime has no other device to fall back
+    /// to: beyond the one more go after a step down, its crashes are counted across restarts
+    /// of the setup (`CRASH_LIMIT`), as they always were.
+    fn crashed(&mut self, in_hand: u32, accelerated: bool, stepped_down: bool) -> AfterCrash {
+        self.clean = 0;
+        // The processor's runtime crashing says nothing about the graphics card's recovery.
+        if accelerated {
+            self.clean_accelerated = 0;
+        }
+        match in_hand {
+            // With its one task, or found gone between tasks: the graphics card keeps the
+            // work until the third in a row.
+            0 | 1 if accelerated => {
+                self.at_one += 1;
+                match self.at_one < CRASHES_AT_ONE {
+                    true => AfterCrash::Again(self.at_one),
+                    false => {
+                        self.at_one = 0;
+                        AfterCrash::Failing
+                    }
+                }
+            }
+            // It did not start: never a matter of memory.
+            0 => AfterCrash::Failing,
+            1 if stepped_down => {
+                self.processor_at_one += 1;
+                match self.processor_at_one < PROCESSOR_CRASHES_AT_ONE {
+                    true => AfterCrash::Once,
+                    false => AfterCrash::Failing,
+                }
+            }
+            1 => AfterCrash::Failing,
+            several => AfterCrash::Fewer(several / 2),
+        }
+    }
+    /// A task was dropped; `accelerated`: on the graphics card's or neural engine's runtime.
+    /// The run of finished tasks starts again.
+    fn refused(&mut self, accelerated: bool) {
+        self.clean = 0;
+        if accelerated {
+            self.clean_accelerated = 0;
+        }
+    }
+    /// A task finished; `accelerated`: on the graphics card's or neural engine's runtime.
+    /// First `true` after a long run of tasks without trouble: one more may run at once.
+    /// Second `true` after as long a run on the accelerated runtime: it has recovered from
+    /// its crashes. Only its own tasks say so, and only they end a row of its crashes: the
+    /// processor finishing other work beside it says nothing about the graphics card.
+    fn completed(&mut self, accelerated: bool) -> (bool, bool) {
+        self.clean += 1;
+        let raise = self.clean >= CLEAN_RUN;
+        if raise {
+            self.clean = 0;
+        }
+        match accelerated {
+            true => {
+                self.at_one = 0;
+                self.clean_accelerated += 1;
+            }
+            false => self.processor_at_one = 0,
+        }
+        let recovered = self.clean_accelerated >= CLEAN_RUN;
+        if recovered {
+            self.clean_accelerated = 0;
+        }
+        (raise, recovered)
+    }
+}
+/// What follows a pool that ended by itself.
+#[derive(Debug, PartialEq)]
+pub(crate) enum AfterPool {
+    /// The accelerated runtime crashed out: its work has moved to the processor and it rests.
+    CrashedOut,
+    /// The server may have withdrawn a model: qualify again.
+    Requalify,
+    Carry,
+}
+/// The crash-out is decided before qualifying again, which the same failures can ask for at
+/// the same moment: otherwise the runtime would neither fall back nor rest. `lane`: the
+/// runtime whose process ended.
+pub(crate) fn after_pool(
+    plan: &mut crate::provider_selection::Plan,
+    crash: Option<AfterCrash>,
+    dropped: Option<&str>,
+    lane: Option<&str>,
+    requalify: bool,
+) -> AfterPool {
+    if let (Some(AfterCrash::Failing), Some(code), Some(lane)) = (crash, dropped, lane) {
+        if plan.demote_runtime(lane, &crashed_out(crash, code.to_owned())) {
+            return AfterPool::CrashedOut;
+        }
+    }
+    match requalify {
+        true => AfterPool::Requalify,
+        false => AfterPool::Carry,
+    }
+}
+/// The reason work leaves the accelerated runtime. Its process died under a task that was
+/// dropped for a reason of its own (a deadline, say), for the third time in a row: that is
+/// the runtime crashing out, so it rests and is tried again later, and the tray and the AI
+/// page say so. A task handed back or short of memory keeps its own reason.
+fn crashed_out(crash: Option<AfterCrash>, code: String) -> String {
+    let own = code.ends_with("_cancelled")
+        || code.starts_with("resource_")
+        || crate::provider_selection::crashed(&code);
+    match crash {
+        Some(AfterCrash::Failing) if !own => "runtime_process_stopped".into(),
+        _ => code,
+    }
+}
+/// The tasks in hand, counted as the pool claims and settles them. A task that ends the pool
+/// with its failure is never settled and stays counted: after a crash this is how many the
+/// runtime was working on.
+#[derive(Default)]
+struct InHand {
+    now: std::sync::atomic::AtomicU32,
+    /// How many were in hand when a task was last dropped, until a task is claimed or
+    /// finished again. While a crash is being reported another task in hand can be dropped
+    /// for a reason of its own (its deadline): it was still one of the tasks the runtime
+    /// was working on when it ended.
+    at_drop: std::sync::atomic::AtomicU32,
+}
+impl InHand {
+    fn claimed(&self) {
+        self.now.fetch_add(1, Ordering::AcqRel);
+        self.at_drop.store(0, Ordering::Release);
+    }
+    fn settled(&self, task: &crate::native_predictor::TaskStep) {
+        if task.model.is_none() {
+            return;
+        }
+        let before = self.now.fetch_sub(1, Ordering::AcqRel);
+        match task.step {
+            crate::native_predictor::Step::Dropped(_) => {
+                self.at_drop.fetch_max(before, Ordering::AcqRel);
+            }
+            _ => self.at_drop.store(0, Ordering::Release),
+        }
+    }
+    fn count(&self) -> u32 {
+        self.now
+            .load(Ordering::Acquire)
+            .max(self.at_drop.load(Ordering::Acquire))
+    }
+}
+/// The pool ended because the runtime ended or stopped answering: what comes next, with the
+/// number to run at once already lowered when it was a matter of memory.
+fn after_crash(
+    trouble: &mut RuntimeTrouble,
+    progress: &Progress,
+    in_hand: u32,
+    accelerated: bool,
+) -> AfterCrash {
+    let stepped_down = progress.capacity_ceiling().is_some();
+    let after = trouble.crashed(in_hand, accelerated, stepped_down);
+    if let AfterCrash::Fewer(fewer) = after {
+        progress.lower_capacity(fewer);
+    }
+    after
+}
+/// Whether a long run of the accelerated runtime's own tasks, finished in this pool, still
+/// counts as its recovery. Not when that runtime crashed in the same pool: the pool finishes
+/// the tasks still in hand before it ends, so a task can be counted after the crash it
+/// followed, and the crash must win.
+fn keeps_recovery(recovered: bool, crash: Option<AfterCrash>, accelerated: bool) -> bool {
+    recovered && !(accelerated && crash.is_some())
+}
+/// What a pool that has ended says about the runtime, if it was the runtime that ended.
+/// `completed`: how the pool ended. `dropped`: the code of a task dropped in it. `in_hand`:
+/// the tasks the runtime was working on. `lane`: the runtime whose process is gone
+/// (`NativePredictor::failed_lane`).
+fn judge(
+    trouble: &mut RuntimeTrouble,
+    progress: &Progress,
+    plan: &crate::provider_selection::Plan,
+    completed: &Result<(), String>,
+    dropped: Option<&str>,
+    in_hand: u32,
+    lane: Option<&str>,
+) -> Option<AfterCrash> {
+    // The graphics card's or neural engine's own runtime is the one that ended.
+    let accelerated = lane.is_some_and(|lane| plan.accelerates(lane));
+    match completed {
+        // With nothing in hand only a process found gone is its crash: one that did not
+        // answer in time has not started, which is handled as it always was.
+        Err(reason) if runtime_crash(reason) => {
+            let counts = in_hand > 0 || crate::provider_selection::crashed(reason);
+            Some(after_crash(
+                trouble,
+                progress,
+                in_hand,
+                accelerated && counts,
+            ))
+        }
+        // Its process died under a task that was dropped for a reason of its own.
+        // Judged by the tasks it was working on, as any crash.
+        Ok(()) if dropped.is_some() && accelerated => {
+            Some(after_crash(trouble, progress, in_hand.max(1), true))
+        }
+        _ => None,
+    }
+}
+/// The server withdraws a model from this computer after this many failed tasks in a row
+/// (`native_predictor::counts_against_grant`) and then leases it nothing for that model.
+const GRANT_STRIKES: u32 = 3;
+/// The server's count, kept the way the server keeps it: for each model, the failed tasks in a
+/// row since that model's last result.
+#[derive(Default)]
+struct GrantStrikes(std::collections::BTreeMap<String, u32>);
+impl GrantStrikes {
+    fn completed(&mut self, model: Option<&str>) {
+        if let Some(model) = model {
+            self.0.remove(model);
+        }
+    }
+    /// Whether the server has now withdrawn this model, so it must be qualified again.
+    fn failed(&mut self, model: Option<&str>, code: &str) -> bool {
+        let Some(model) = model else { return false };
+        if !crate::native_predictor::counts_against_grant(code) {
+            return false;
+        }
+        let strikes = self.0.entry(model.to_owned()).or_default();
+        *strikes += 1;
+        if *strikes < GRANT_STRIKES {
+            return false;
+        }
+        self.0.remove(model);
+        true
+    }
+}
+/// How many times a challenge the server refuses the same way every time is asked for again.
+const CHALLENGE_REJECTED_LIMIT: u32 = 3;
+/// How long a stop waits for the held lease to be handed back to the server.
+const LEASE_RETURN: Duration = Duration::from_secs(3);
+/// How long quitting the app waits for the worker to stop and hand its lease back.
+pub(crate) const QUIT_GRACE: Duration = Duration::from_secs(11);
+/// The AI runtime ending by itself this many times in a row, with no task finished in between,
+/// stops the worker with `runtime_crash_loop`.
+const CRASH_LIMIT: u32 = 3;
 const POLICY_RECHECK: Duration = Duration::from_secs(5 * 60);
 const ROUTE_POLL: Duration = Duration::from_secs(5);
 
@@ -321,6 +760,19 @@ where
         let result = reconnect(progress, fresh, &mut attempt).await;
         fresh = false;
         match result {
+            // The server refused every task for a reason of its own (`first_failure` took the
+            // `workload_` off): nothing here is broken. Wait and offer again.
+            Err(code) if server_task_refusal(&code) => {
+                let wait = refused_task_retry(&code);
+                progress.set("paused", Some(code));
+                recheck_after(progress, wait).await?;
+            }
+            // The server refused this computer's timestamp. Each attempt reads the server's
+            // clock again (`Capabilities::clock_skew_ms`), and the person may correct theirs.
+            Err(code) if code == "clock_invalid" => {
+                progress.set("paused", Some(code));
+                recheck_after(progress, POLICY_RECHECK).await?;
+            }
             // An administrator can assign work, or update the server, at any time: ask again later.
             Err(code)
                 if matches!(
@@ -364,14 +816,14 @@ where
     R: FnMut() -> RFut,
     RFut: Future<Output = Option<std::net::IpAddr>>,
 {
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let initial = route().await;
-    let mut polled = std::time::Instant::now();
+    let mut polled = tokio::time::Instant::now();
     while started.elapsed() < period || progress.user_paused.load(Ordering::Acquire) {
         check_cancel(&progress.cancelled)?;
         tokio::time::sleep(Duration::from_millis(250).min(poll)).await;
         if polled.elapsed() >= poll && !progress.user_paused.load(Ordering::Acquire) {
-            polled = std::time::Instant::now();
+            polled = tokio::time::Instant::now();
             if route().await != initial {
                 break;
             }
@@ -429,6 +881,35 @@ async fn cancellable<T>(
         result = future => result,
         _ = async { loop { if cancel.load(Ordering::Acquire) { break; } tokio::time::sleep(Duration::from_millis(50)).await; } } => Err("worker_setup_cancelled".into())
     }
+}
+/// The wait before a runtime that crashed is started again on the same device: longer with
+/// each crash in a row. A stop ends the wait.
+async fn restart_wait(crashes: u32, cancel: &AtomicBool) -> Result<(), String> {
+    let wait = reconnect_delay(crashes, rand::random());
+    hold_off(Some(tokio::time::Instant::now() + wait), cancel).await
+}
+/// With nothing qualified while the accelerated runtime rests: how long to wait before setting
+/// up again. The rest's end, or sooner when the server offers the refused work again before
+/// it (a hold of five minutes, say). `None`: not resting, which is handled as it always was.
+fn empty_wait(rest: Option<Duration>, failure: &str) -> Option<Duration> {
+    let refused = server_task_refusal(failure).then(|| refused_task_retry(failure));
+    rest.map(|rest| refused.map_or(rest, |refused| refused.min(rest)))
+}
+/// How long the accelerated runtime's rest still has to run, if it is resting.
+fn rest_left(ends: Option<std::time::Instant>) -> Option<Duration> {
+    ends.map(|due| due.saturating_duration_since(std::time::Instant::now()))
+}
+/// Wait out what is left of a pause before the next claim; a stop ends the wait.
+async fn hold_off(until: Option<tokio::time::Instant>, cancel: &AtomicBool) -> Result<(), String> {
+    let Some(until) = until else { return Ok(()) };
+    cancellable(
+        async {
+            tokio::time::sleep_until(until).await;
+            Ok(())
+        },
+        cancel,
+    )
+    .await
 }
 async fn wait_for_user<F: Future<Output = Result<(), String>>>(
     progress: &Progress,
@@ -495,20 +976,22 @@ impl WakeClock {
     }
 }
 const TASK_FAILURE_LIMIT: u32 = 5;
-/// One bad task is dropped and the next is claimed; an unbroken run of them parks the worker.
+/// One bad task is dropped and the next is claimed. A run of them slows the claims down and,
+/// from the limit on, shows why; it never stops the worker, because each is a different task or
+/// a server that will recover.
 #[derive(Default)]
 struct TaskFailures(u32);
 impl TaskFailures {
     fn completed(&mut self) {
         self.0 = 0;
     }
-    /// The pause before the next claim, or the code to park with once the run reaches the limit.
-    fn dropped(&mut self, code: String) -> Result<Duration, String> {
-        self.0 += 1;
-        if self.0 >= TASK_FAILURE_LIMIT {
-            return Err(code);
-        }
-        Ok(reconnect_delay(self.0, rand::random()))
+    /// The pause before the next claim, and whether the run is long enough to show its reason.
+    fn dropped(&mut self) -> (Duration, bool) {
+        self.0 = self.0.saturating_add(1);
+        (
+            reconnect_delay(self.0, rand::random()),
+            self.0 >= TASK_FAILURE_LIMIT,
+        )
     }
 }
 fn reconnect_delay(attempt: u32, entropy: u64) -> Duration {
@@ -536,11 +1019,18 @@ pub(crate) fn retryable(error: &str) -> bool {
             | "runtime_process_stopped"
             | "runtime_not_ready"
             | "runtime_prediction_interrupted"
+            // The server no longer holds the challenge or qualification: qualify again.
+            | "worker_qualification_restart"
+            | "worker_challenge_busy"
             | "server_http_408"
-            | "server_http_429"
-            | "server_http_502"
-            | "server_http_503"
-            | "server_http_504"
+            | "server_http_429" // A failing or busy server, or a proxy in front of it, recovers by itself: 500 like 503.
+    ) || error.starts_with("server_http_5")
+}
+/// The AI runtime process ended or stopped answering while it was serving.
+fn runtime_crash(error: &str) -> bool {
+    matches!(
+        error,
+        "runtime_process_stopped" | "runtime_prediction_interrupted" | "runtime_not_ready"
     )
 }
 async fn reconnect<F: FnMut(bool) -> Fut, Fut: Future<Output = Result<(), String>>>(
@@ -549,24 +1039,52 @@ async fn reconnect<F: FnMut(bool) -> Fut, Fut: Future<Output = Result<(), String
     mut attempt: F,
 ) -> Result<(), String> {
     let mut retries = 0u32;
+    // Kept here, across every restart of the setup: counted inside it, a runtime that dies
+    // every time would be set up again for ever, a few seconds apart.
+    let mut crashes = 0u32;
     loop {
         wait_for_user(progress, || async { Ok(()) }).await?;
+        let finished = progress.completed_tasks();
         let error = match attempt(refresh).await {
             Ok(()) => return Ok(()),
+            // The server changed which models its tasks use: set up again with them, now.
+            Err(error) if error == "worker_models_changed" => {
+                check_cancel(&progress.cancelled)?;
+                (refresh, retries, crashes) = (false, 0, 0);
+                continue;
+            }
             Err(error) if retryable(&error) => error,
             Err(error) => return Err(error),
         };
         check_cancel(&progress.cancelled)?;
-        if matches!(
-            progress.status.lock().unwrap().state.as_str(),
-            "working" | "waiting-for-work"
-        ) {
-            retries = 0;
+        let worked = progress.completed_tasks() > finished;
+        if worked {
+            // A task finished: the run of crashes ended, whatever stopped this attempt.
+            crashes = 0;
         }
+        let delay = if runtime_crash(&error) {
+            crashes += 1;
+            if crashes >= CRASH_LIMIT {
+                return Err("runtime_crash_loop".into());
+            }
+            // Nor is a new session asked for: one issued for an earlier fault is saved.
+            refresh = false;
+            // The session is not at fault: the same one sets up again, after a longer wait.
+            reconnect_delay(crashes, rand::random())
+        } else {
+            if worked
+                // "working" is announced before the server has answered a claim; an answered
+                // claim with no task leaves "waiting-for-work".
+                || progress.status.lock().unwrap().state == "waiting-for-work"
+            {
+                retries = 0;
+            }
+            refresh = true;
+            let delay = reconnect_delay(retries, rand::random());
+            retries = retries.saturating_add(1);
+            delay
+        };
         progress.set("reconnecting", Some(error));
-        let delay = reconnect_delay(retries, rand::random());
-        retries = retries.saturating_add(1);
-        refresh = true;
         cancellable(
             async {
                 tokio::time::sleep(delay).await;
@@ -586,7 +1104,8 @@ async fn refresh_session(saved: &SavedConnection) -> Result<(), String> {
         return Err("desktop_worker_session_unavailable".into());
     }
     // Issue rechecks the existing device and photo session; recovery must never re-enroll a revoked device.
-    let worker = crate::transport::issue_worker_session(&client, saved).await?;
+    let worker =
+        crate::transport::issue_worker_session(&client, saved, capabilities.clock_skew_ms).await?;
     crate::credentials::save("worker-session", &worker)
 }
 /// FD-64: what stopped a qualification or a measurement, if anything. `Ok` is a pause for power,
@@ -655,26 +1174,137 @@ async fn download_network_loss<F: Future<Output = Option<bool>>>(mut sample: imp
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
+/// `paused` ends the download with `user_paused`: what was received stays on disk and the
+/// download continues from there when the person resumes.
 async fn acquisition<T, F: Future<Output = Result<(), String>>>(
     work: impl Future<Output = Result<T, String>>,
     explicit_permission: bool,
     maintain: impl FnMut() -> F,
     network_loss: impl Future<Output = ()>,
+    paused: impl Future<Output = ()>,
     cancelled: &AtomicBool,
 ) -> Result<T, String> {
     maintained(
         work,
         async {
-            if explicit_permission {
-                std::future::pending::<()>().await;
+            tokio::select! {
+                _ = paused => "user_paused".into(),
+                _ = async {
+                    if explicit_permission {
+                        std::future::pending::<()>().await;
+                    }
+                    network_loss.await;
+                } => "model_download_permission_required".into(),
             }
-            network_loss.await;
-            "model_download_permission_required".into()
         },
         maintain,
         cancelled,
     )
     .await
+}
+async fn flag_set(flag: &AtomicBool) {
+    while !flag.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+/// Why work that holds a lease must stop now: Stop, sign-out or quit; a pause for power or
+/// network; the computer waking from sleep.
+async fn lease_interruption(progress: &Progress, clock: &WakeClock) -> String {
+    tokio::select! {
+        reason = resource_loss(clock) => format!("resource_{reason}"),
+        _ = flag_set(&progress.cancelled) => "worker_setup_cancelled".into(),
+    }
+}
+/// Run one step of work (a claim and its task). When `interrupt` says to stop first, signal
+/// `stop` and give the step `grace` to hand its lease back (`fail` with `cancelled`) before it
+/// is dropped: the server gives the task to another computer at once instead of waiting for the
+/// lease to run out.
+async fn returning_lease<T>(
+    step: impl Future<Output = Result<T, String>>,
+    interrupt: impl Future<Output = String>,
+    stop: &tokio::sync::watch::Sender<bool>,
+    grace: Duration,
+) -> Result<T, String> {
+    tokio::pin!(step);
+    tokio::select! {
+        biased;
+        result = &mut step => result,
+        reason = interrupt => {
+            let _ = stop.send(true);
+            let _ = tokio::time::timeout(grace, &mut step).await;
+            Err(reason)
+        }
+    }
+}
+/// What `/models` says each task runs: its state and model keys. Two replies with the same
+/// signature need the same models on this computer.
+fn inventory_signature(inventory: &serde_json::Value) -> Vec<(String, String, Vec<String>)> {
+    let text = |value: &serde_json::Value| value.as_str().unwrap_or_default().to_owned();
+    let mut signature: Vec<_> = inventory["workloads"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            let keys = entry["modelKeys"].as_array().into_iter().flatten();
+            (
+                text(&entry["workload"]),
+                text(&entry["state"]),
+                keys.map(text).collect(),
+            )
+        })
+        .collect();
+    signature.sort();
+    signature
+}
+/// What to do about a refusal while qualifying one model.
+#[derive(Debug, PartialEq)]
+enum Refusal {
+    /// The server's bookkeeping, or a challenge it no longer holds: ask for a new challenge for
+    /// this model after a pause.
+    Again,
+    /// The task's model may have changed on the server: read `/models` again.
+    Models,
+    /// The server does not take this provider's result: use the processor.
+    Processor,
+    /// This task can't be done here now; the others carry on.
+    Task,
+    /// Nothing on this computer can change it.
+    Stop,
+}
+fn refusal(code: &str, provider: &str) -> Refusal {
+    if matches!(
+        code,
+        "worker_challenge_busy" | "worker_qualification_restart" | "worker_challenge_rejected"
+    ) {
+        return Refusal::Again;
+    }
+    if matches!(
+        code,
+        "workload_desktop_model_profile_unavailable"
+            | "workload_desktop_model_profile_changed"
+            | "workload_desktop_pool_model_unavailable"
+            | "workload_desktop_clip_profile_unavailable"
+            | "workload_desktop_face_profile_unavailable"
+    ) {
+        return Refusal::Models;
+    }
+    if code.starts_with("workload_") {
+        return Refusal::Task;
+    }
+    // The server refused what a GPU runtime sent (its attestation, its report). The processor
+    // runtime is a different signed runtime with its own report: try that before giving up.
+    let about_the_runtime = matches!(
+        code,
+        "worker_runtime_unsigned"
+            | "worker_qualification_report_refused"
+            | "worker_qualification_refused"
+            | "worker_challenge_invalid"
+            | "worker_qualification_invalid"
+    ) || code.starts_with("server_http_4");
+    if about_the_runtime && provider != crate::provider_selection::CPU {
+        return Refusal::Processor;
+    }
+    Refusal::Stop
 }
 async fn monitored_preparation<T: Send + 'static, F: Future<Output = Result<(), String>>>(
     work: impl FnOnce(Arc<AtomicBool>) -> T + Send + 'static,
@@ -724,17 +1354,28 @@ fn disk_shortfall(code: String, models: &Path, needed: u64) -> String {
 }
 
 /// Why no workload qualified: the first one's reason, or the general code when none was given.
+///
+/// A refusal by the server that passes by itself comes before any other reason: the worker
+/// then waits and offers that task again, instead of stopping over another task's fault and
+/// never coming back for it.
 fn first_failure(workloads: &[WorkloadStatus]) -> String {
-    workloads
+    let codes: Vec<&str> = workloads
         .iter()
         .filter(|item| item.state == "unavailable")
-        .find_map(|item| item.code.clone())
-        .map(|code| {
-            code.strip_prefix("workload_")
-                .map(str::to_owned)
-                .unwrap_or(code)
-        })
-        .unwrap_or_else(|| "worker_no_qualified_workloads".into())
+        .filter_map(|item| item.code.as_deref())
+        .map(|code| code.strip_prefix("workload_").unwrap_or(code))
+        .collect();
+    // Of several such refusals, the one offered again soonest: each task is tried when its own
+    // wait is over, not when the longest one is.
+    codes
+        .iter()
+        .filter(|code| server_task_refusal(code))
+        .min_by_key(|code| refused_task_retry(code))
+        .or(codes.first())
+        .map_or_else(
+            || "worker_no_qualified_workloads".into(),
+            |code| (*code).into(),
+        )
 }
 
 pub(crate) fn inventory_profiles(
@@ -749,8 +1390,10 @@ pub(crate) fn inventory_profiles(
     String,
 > {
     use serde::Deserialize;
+    // A newer server may add fields to the reply or to a task's entry: they are ignored. The
+    // profiles themselves are hashed into their model keys and stay strict (`model_catalogue`).
     #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    #[serde(rename_all = "camelCase")]
     struct Inventory {
         protocol_version: u32,
         provider: String,
@@ -758,7 +1401,7 @@ pub(crate) fn inventory_profiles(
         workloads: Vec<Entry>,
     }
     #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    #[serde(rename_all = "camelCase")]
     struct Entry {
         workload: String,
         state: String,
@@ -974,7 +1617,13 @@ async fn prepare_on(
             return Err("runtime_pack_unavailable".into());
         }
         let store = open_runtime_store(&data.join("runtimes"))?;
-        let active = store.load_active()?;
+        // An installed runtime that no longer verifies (a file changed or went missing) is
+        // rebuilt from the app's signed bundle below, instead of failing the same way for ever.
+        let active = match store.load_active() {
+            Ok(active) => active,
+            Err(_) if bundle.exists() => None,
+            Err(code) => return Err(code),
+        };
         let bundled = if bundle.exists() {
             Some(read_bounded(&bundle.join("manifest.json"), 8 * 1024 * 1024)?)
         } else {
@@ -1020,12 +1669,33 @@ async fn prepare_on(
     if !caps.features.worker_auto_setup {
         return Err("server_update_required".into());
     }
-    let worker = WorkerTransport::load(&saved)?;
+    let several_leases = caps.features.worker_concurrent_leases;
+    let worker = WorkerTransport::load(&saved)?
+        .with_clock_skew(caps.clock_skew_ms)
+        .with_withdrawal_notice(caps.features.worker_withdrawal_notice)
+        .with_concurrent_leases(several_leases);
+    let (source, provider) = (
+        installed.source_revision().to_owned(),
+        installed.provider().to_owned(),
+    );
     let inventory = cancellable(
-        worker.model_inventory(installed.source_revision(), installed.provider()),
+        worker.model_inventory(&source, &provider),
         &progress.cancelled,
     )
     .await?;
+    // The server decides which models run here, and may change its mind at any time: asked
+    // again while working, a different answer sets this computer up again with the new models.
+    let signature = inventory_signature(&inventory);
+    // How many tasks of each kind the server lets this computer run at once.
+    let mut limits = inventory_concurrency(&inventory);
+    // A question that fails changes nothing; the claims report a server in trouble.
+    let latest_inventory = || async { worker.model_inventory(&source, &provider).await.ok() };
+    let models_changed = || async {
+        latest_inventory()
+            .await
+            .is_some_and(|value| inventory_signature(&value) != signature)
+    };
+    let mut models_checked = std::time::Instant::now();
     let (groups, statuses) = inventory_profiles(
         &inventory,
         installed.source_revision(),
@@ -1063,39 +1733,75 @@ async fn prepare_on(
         })
     });
     progress.set("preparing-models", None);
+    // The model mirror is Frameleaf's host, not the person's server: its own client.
+    let mirror = transport::public_client_builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|_| "network_client_unavailable")?;
     // Complete acquisition before requesting short-lived nonces.
     let mut caches = Vec::new();
     for profile in &profiles {
         let count = counted.insert(profile.cache_identity());
-        wait_for_user(&progress, || worker.maintain_session()).await?;
-        let cache = acquisition(
-            profile.prepare_cache(
-                &paths.data.join("models"),
-                &client,
+        let cache = loop {
+            wait_for_user(&progress, || worker.maintain_session()).await?;
+            progress.set("preparing-models", None);
+            let credited = std::sync::atomic::AtomicU64::new(0);
+            let result = acquisition(
+                profile.prepare_cache(
+                    &paths.data.join("models"),
+                    &mirror,
+                    &progress.cancelled,
+                    allow_download,
+                    |event| {
+                        if count {
+                            if let CacheProgress::Verified(bytes) = &event {
+                                credited.fetch_add(*bytes, Ordering::AcqRel);
+                            }
+                            progress.cache_progress(event);
+                        }
+                    },
+                ),
+                explicit_permission,
+                || worker.maintain_session(),
+                download_network_loss(|| async {
+                    tauri::async_runtime::spawn_blocking(crate::resource_policy::sample)
+                        .await
+                        .ok()
+                        .and_then(|status| status.unmetered)
+                }),
+                flag_set(&progress.user_paused),
                 &progress.cancelled,
-                allow_download,
-                |event| {
-                    if count {
-                        progress.cache_progress(event);
-                    }
-                },
-            ),
-            explicit_permission,
-            || worker.maintain_session(),
-            download_network_loss(|| async {
-                tauri::async_runtime::spawn_blocking(crate::resource_policy::sample)
-                    .await
-                    .ok()
-                    .and_then(|status| status.unmetered)
-            }),
-            &progress.cancelled,
-        )
-        .await
+            )
+            .await;
+            match result {
+                // Paused in the middle of a file: wait, then carry on from what was received.
+                Err(code) if code == "user_paused" => {
+                    progress.uncredit(credited.load(Ordering::Acquire));
+                }
+                result => break result,
+            }
+        }
         .map_err(|code| disk_shortfall(code, &paths.data.join("models"), profile.cache_bytes()))?;
         caches.push(cache);
     }
     let mut failures = TaskFailures::default();
+    let mut refusals = 0u32;
+    let mut strikes = GrantStrikes::default();
+    // The graphics card's crashes in a row, and its own tasks finished in a row, are kept
+    // with the plan's records, so a setup that starts again in between (a lost session, say)
+    // does not start those counts again.
+    let (at_one, clean_accelerated) = plan.crash_record();
+    let mut trouble = RuntimeTrouble {
+        at_one,
+        clean_accelerated,
+        ..Default::default()
+    };
+    // When the server refused each task, for offering it again that long after the refusal
+    // (not that long after this setup began, which the downloads and checks may outlast).
+    let mut refused_at = std::collections::BTreeMap::<String, tokio::time::Instant>::new();
     'qualification: loop {
+        refused_at.clear();
+        let pass_started = tokio::time::Instant::now();
         // The provider chosen for each workload; a failed provider is demoted and this restarts.
         let groups = plan.groups();
         progress.update(|status| status.providers = plan.providers());
@@ -1116,130 +1822,169 @@ async fn prepare_on(
                     .iter()
                     .position(|item| item.model_key() == profile.model_key())
                     .ok_or("worker_model_binding_invalid")?;
-                let cache = caches[index].clone();
-                group_caches.push(cache.clone());
-                check_cancel(&progress.cancelled)?;
-                wait_for_capacity(profile.minimum_memory(), &progress, || {
-                    worker.maintain_session()
-                })
-                .await?;
-                progress.set("qualifying", None);
-                let challenge = match cancellable(
-                    worker.request_qualification(
-                        profile,
-                        installed.attestation(profile.provider())?,
-                        &uuid::Uuid::new_v4().to_string(),
-                    ),
-                    &progress.cancelled,
-                )
-                .await
-                {
-                    Ok(value) => value,
-                    // A refusal of one task (`workload_…`) leaves the others to qualify.
-                    Err(code) if code.starts_with("workload_") => {
-                        if plan.demote(workload, &code, false) {
-                            continue 'qualification;
-                        }
-                        progress.workload(workload, "unavailable", Some(code));
-                        continue 'workload;
+                group_caches.push(caches[index].clone());
+                // One model's qualification, from a new challenge to the accepted record. A
+                // refusal the server clears by itself starts this model again, not the others.
+                let mut rejected = 0u32;
+                let (qualified, accepted) = 'attempt: loop {
+                    let cache = caches[index].clone();
+                    check_cancel(&progress.cancelled)?;
+                    wait_for_capacity(profile.minimum_memory(), &progress, || {
+                        worker.maintain_session()
+                    })
+                    .await?;
+                    progress.set("qualifying", None);
+                    // What a refusal from the server means for this model, task and provider.
+                    macro_rules! refused {
+                        ($code:expr) => {{
+                            let code: String = $code;
+                            if retryable(&code)
+                                && code != "worker_qualification_restart"
+                                && code != "worker_challenge_busy"
+                            {
+                                return Err(code);
+                            }
+                            if code == "worker_challenge_rejected" {
+                                rejected += 1;
+                            }
+                            match refusal(&code, profile.provider()) {
+                                Refusal::Again if rejected < CHALLENGE_REJECTED_LIMIT => {
+                                    refusals = refusals.saturating_add(1);
+                                    let delay = reconnect_delay(refusals, rand::random());
+                                    // Say why this computer is waiting.
+                                    progress.set("reconnecting", Some(code));
+                                    cancellable(
+                                        async {
+                                            tokio::time::sleep(delay).await;
+                                            Ok(())
+                                        },
+                                        &progress.cancelled,
+                                    )
+                                    .await?;
+                                    continue 'attempt;
+                                }
+                                Refusal::Models if models_changed().await => {
+                                    return Err("worker_models_changed".into());
+                                }
+                                Refusal::Again
+                                | Refusal::Models
+                                | Refusal::Task
+                                | Refusal::Processor
+                                    if !provider_independent(&code)
+                                        && plan.demote(workload, &code, false) =>
+                                {
+                                    continue 'qualification;
+                                }
+                                Refusal::Again | Refusal::Models | Refusal::Task => {
+                                    refused_at
+                                        .insert(workload.to_owned(), tokio::time::Instant::now());
+                                    progress.workload(workload, "unavailable", Some(code));
+                                    continue 'workload;
+                                }
+                                Refusal::Processor | Refusal::Stop => return Err(code),
+                            }
+                        }};
                     }
-                    Err(code) => return Err(code),
-                };
-                let spec = challenge.specification().to_vec();
-                let fixture = challenge.fixture().to_vec();
-                let scratch = paths.data.join("scratch");
-                let provider = profile.provider().to_owned();
-                let clock = WakeClock::new();
-                let ((runtime, qualified), interrupted) = monitored_preparation(
-                    move |cancel| {
-                        let qualified = installed
-                            .qualify(&provider, &cache, &scratch, &spec, &fixture, &cancel);
-                        (installed, qualified)
-                    },
-                    async { format!("resource_{}", resource_loss(&clock).await) },
-                    || worker.maintain_session(),
-                    &progress.cancelled,
-                )
-                .await?;
-                installed = runtime;
-                check_cancel(&progress.cancelled)?;
-                if clock.observe(std::time::SystemTime::now()) {
-                    progress.set("paused", Some("system_resumed".into()));
-                    continue 'qualification;
-                }
-                if let Some(reason) = interrupted {
-                    if let Some(reason) = reason.strip_prefix("resource_") {
-                        progress.set("paused", Some(reason.into()));
+                    let challenge = match cancellable(
+                        worker.request_qualification(
+                            profile,
+                            installed.attestation(profile.provider())?,
+                            &uuid::Uuid::new_v4().to_string(),
+                        ),
+                        &progress.cancelled,
+                    )
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(code) if code == "worker_setup_cancelled" => return Err(code),
+                        Err(code) => refused!(code),
+                    };
+                    let spec = challenge.specification().to_vec();
+                    let fixture = challenge.fixture().to_vec();
+                    let scratch = paths.data.join("scratch");
+                    let provider = profile.provider().to_owned();
+                    let clock = WakeClock::new();
+                    let ((runtime, qualified), interrupted) = monitored_preparation(
+                        move |cancel| {
+                            let qualified = installed
+                                .qualify(&provider, &cache, &scratch, &spec, &fixture, &cancel);
+                            (installed, qualified)
+                        },
+                        async { format!("resource_{}", resource_loss(&clock).await) },
+                        || worker.maintain_session(),
+                        &progress.cancelled,
+                    )
+                    .await?;
+                    installed = runtime;
+                    check_cancel(&progress.cancelled)?;
+                    if clock.observe(std::time::SystemTime::now()) {
+                        progress.set("paused", Some("system_resumed".into()));
                         continue 'qualification;
                     }
-                    return Err(reason);
-                }
-                let qualified = match qualified {
-                    Ok(value) => value,
-                    Err(code)
-                        if matches!(
-                            code.as_str(),
-                            "runtime_qualification_failed"
-                                | "runtime_qualification_timeout"
-                                | "runtime_qualification_report_invalid"
-                                | "runtime_output_mismatch"
-                                | "runtime_out_of_memory"
-                                | "runtime_model_missing"
-                                | "runtime_provider_unavailable"
-                        ) =>
+                    if let Some(reason) = interrupted {
+                        if let Some(reason) = reason.strip_prefix("resource_") {
+                            progress.set("paused", Some(reason.into()));
+                            continue 'qualification;
+                        }
+                        return Err(reason);
+                    }
+                    let qualified = match qualified {
+                        Ok(value) => value,
+                        Err(code)
+                            if matches!(
+                                code.as_str(),
+                                "runtime_qualification_failed"
+                                    | "runtime_qualification_timeout"
+                                    | "runtime_qualification_report_invalid"
+                                    | "runtime_output_mismatch"
+                                    | "runtime_out_of_memory"
+                                    | "runtime_model_missing"
+                                    | "runtime_provider_unavailable"
+                            ) =>
+                        {
+                            // Memory another program held, or a slow moment, is not remembered
+                            // against the GPU for the whole runtime epoch.
+                            let remember = !crate::provider_selection::passing(&code);
+                            if plan.demote(workload, &code, remember) {
+                                continue 'qualification;
+                            }
+                            progress.workload(workload, "unavailable", Some(code));
+                            continue 'workload;
+                        }
+                        Err(code) => return Err(code),
+                    };
+                    match cancellable(
+                        worker.submit_qualification(&challenge, &qualified),
+                        &progress.cancelled,
+                    )
+                    .await
                     {
-                        if plan.demote(workload, &code, true) {
-                            continue 'qualification;
+                        Ok(true) => {}
+                        Ok(false) => {
+                            if plan.demote(workload, "worker_qualification_refused", false) {
+                                continue 'qualification;
+                            }
+                            progress.workload(
+                                workload,
+                                "unavailable",
+                                Some("worker_qualification_refused".into()),
+                            );
+                            continue 'workload;
                         }
-                        progress.workload(workload, "unavailable", Some(code));
-                        continue 'workload;
+                        Err(code) if code == "worker_setup_cancelled" => return Err(code),
+                        Err(code) => refused!(code),
                     }
-                    Err(code) => return Err(code),
-                };
-                match cancellable(
-                    worker.submit_qualification(&challenge, &qualified),
-                    &progress.cancelled,
-                )
-                .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        if plan.demote(workload, "worker_qualification_refused", false) {
-                            continue 'qualification;
-                        }
-                        progress.workload(
-                            workload,
-                            "unavailable",
-                            Some("worker_qualification_refused".into()),
-                        );
-                        continue 'workload;
-                    }
-                    // A refusal of one task (`workload_…`) leaves the others to qualify.
-                    Err(code) if code.starts_with("workload_") => {
-                        if plan.demote(workload, &code, false) {
-                            continue 'qualification;
-                        }
-                        progress.workload(workload, "unavailable", Some(code));
-                        continue 'workload;
-                    }
-                    Err(code) => return Err(code),
-                }
-                let accepted = match cancellable(
-                    worker.read_accepted_qualification(profile, &qualified, challenge.id()),
-                    &progress.cancelled,
-                )
-                .await
-                {
-                    Ok(value) => value,
-                    // A refusal of one task (`workload_…`) leaves the others to qualify.
-                    Err(code) if code.starts_with("workload_") => {
-                        if plan.demote(workload, &code, false) {
-                            continue 'qualification;
-                        }
-                        progress.workload(workload, "unavailable", Some(code));
-                        continue 'workload;
-                    }
-                    Err(code) => return Err(code),
+                    let accepted = match cancellable(
+                        worker.read_accepted_qualification(profile, &qualified, challenge.id()),
+                        &progress.cancelled,
+                    )
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(code) if code == "worker_setup_cancelled" => return Err(code),
+                        Err(code) => refused!(code),
+                    };
+                    break (qualified, accepted);
                 };
                 check_cancel(&progress.cancelled)?;
                 if let Err(code) = installed.runtime(profile.provider()).and_then(|runtime| {
@@ -1249,6 +1994,7 @@ async fn prepare_on(
                         profile,
                         runtime,
                         &qualified,
+                        worker.now()?,
                     )
                 }) {
                     eprintln!("worker_qualification_evidence_failed: {code}");
@@ -1330,7 +2076,19 @@ async fn prepare_on(
         if prepared.is_empty() {
             // The server offered work but none qualified here: say why (wrong answer, out of
             // memory, server refusal…), a fault Retry Setup can clear, not a server setting.
-            return Err(first_failure(&progress.status.lock().unwrap().workloads));
+            let failure = first_failure(&progress.status.lock().unwrap().workloads);
+            // A graphics card resting after crashes is still owed its next try: wait for
+            // it with the reason shown, then set up again, instead of stopping for good.
+            if let Some(wait) = empty_wait(rest_left(plan.rest_ends()), &failure) {
+                progress.set("reconnecting", Some(failure));
+                hold_off(
+                    Some(tokio::time::Instant::now() + wait),
+                    &progress.cancelled,
+                )
+                .await?;
+                return Err("worker_models_changed".into());
+            }
+            return Err(failure);
         }
         let mut memory_by_cache = std::collections::BTreeMap::new();
         for (profile, cache) in accepted_profiles.iter().zip(&accepted_caches) {
@@ -1338,6 +2096,15 @@ async fn prepare_on(
             *memory = (*memory).max(profile.minimum_memory());
         }
         let required_memory = memory_by_cache.values().sum();
+        // For choosing how many tasks to run at once: which tasks are ready, and whether any
+        // runs on a graphics card or neural engine.
+        let ready: std::collections::BTreeSet<String> = accepted_profiles
+            .iter()
+            .filter_map(|profile| profile.model_key().split(':').next().map(str::to_owned))
+            .collect();
+        let accelerated = accepted_profiles
+            .iter()
+            .any(|profile| profile.provider() != crate::provider_selection::CPU);
         let combined = paths.data.join("model-sets");
         let cancelled = progress.cancelled.clone();
         let cache = tauri::async_runtime::spawn_blocking(move || {
@@ -1371,9 +2138,11 @@ async fn prepare_on(
             crate::release_policy::reclaim_superseded(&data, &bundle, &active_runtime, &set, now)
         })
         .await;
+        // How long this pass took, from the first challenge to here.
+        let pass_took = pass_started.elapsed();
         loop {
             wait_for_capacity(required_memory, &progress, || worker.maintain_session()).await?;
-            let now = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+            let now = worker.now()?;
             if prepared
                 .iter()
                 .any(|(proof, accepted)| accepted.validate_runtime(proof, now + 60_000).is_err())
@@ -1381,6 +2150,25 @@ async fn prepare_on(
                 continue 'qualification;
             }
             progress.set("starting-worker", None);
+            // One task at a time unless the server lets a desktop hold several leases. Then:
+            // as many as the server's Jobs setting allows and this computer can take.
+            let free_memory = tauri::async_runtime::spawn_blocking(crate::resource_policy::sample)
+                .await
+                .ok()
+                .and_then(|status| status.available_memory);
+            let cores = std::thread::available_parallelism().map_or(1, |cores| cores.get());
+            let local = local_capacity(accelerated, cores, free_memory, required_memory);
+            let mut at_once = match several_leases {
+                true => concurrent_tasks(&limits, &ready, local, progress.capacity_ceiling()),
+                false => 1,
+            };
+            progress.running_at_once(at_once);
+            // The process is started able to serve as many requests at once as this computer
+            // could ever take, so a higher Jobs setting takes effect with the next claim.
+            let threads = match several_leases {
+                true => local,
+                false => 1,
+            };
             let scratch = paths.data.join("scratch");
             let cache = cache.clone();
             let (runtime, proofs, mut predictor) =
@@ -1397,7 +2185,8 @@ async fn prepare_on(
                         .iter()
                         .map(|(proof, accepted)| (proof, accepted))
                         .collect();
-                    let predictor = installed.start(&bindings, &cache, &scratch, port)?;
+                    let predictor =
+                        installed.start(&bindings, &cache, &scratch, port, now, threads)?;
                     Ok::<_, String>((installed, prepared, predictor))
                 })
                 .await
@@ -1405,7 +2194,12 @@ async fn prepare_on(
             installed = runtime;
             prepared = proofs;
             check_cancel(&progress.cancelled)?;
-            let (_sender, mut cancel) = tokio::sync::watch::channel(false);
+            // The tasks that are ready get at least as long to work as it took to get here,
+            // before a refused task is offered again and everything is checked once more:
+            // however long the checks take, work is never starved by retries.
+            let work_due = tokio::time::Instant::now() + pass_took.max(Duration::from_secs(120));
+            // Signalled to make the step in hand give its lease back before it is dropped.
+            let (stop, mut cancel) = tokio::sync::watch::channel(false);
             let clock = WakeClock::new();
             loop {
                 worker.maintain_session().await?;
@@ -1432,66 +2226,325 @@ async fn prepare_on(
                     progress.set("paused", Some(reason.into()));
                     break;
                 }
-                let now =
-                    (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+                let now = worker.now()?;
                 if prepared.iter().any(|(proof, accepted)| {
                     accepted.validate_runtime(proof, now + 60_000).is_err()
                 }) {
                     continue 'qualification;
                 }
+                // A task the server refused for a reason of its own is offered again in time.
+                let offer_again = progress
+                    .status
+                    .lock()
+                    .unwrap()
+                    .workloads
+                    .iter()
+                    .filter(|item| item.state == "unavailable")
+                    .filter_map(|item| {
+                        Some((refused_at.get(&item.workload)?, item.code.as_deref()?))
+                    })
+                    .any(|(at, code)| {
+                        code.starts_with("workload_") && at.elapsed() >= refused_task_retry(code)
+                    });
+                if offer_again && tokio::time::Instant::now() >= work_due {
+                    predictor.stop()?;
+                    return Err("worker_models_changed".into());
+                }
+                // A graphics card or neural engine that rested after crashes is tried again:
+                // set up again, and the plan made then gives it its work back.
+                if plan
+                    .rest_ends()
+                    .is_some_and(|due| std::time::Instant::now() >= due)
+                {
+                    predictor.stop()?;
+                    return Err("worker_models_changed".into());
+                }
+                // The server may have changed a task's model, or turned a task on or off.
+                if models_checked.elapsed() >= MODEL_RECHECK {
+                    models_checked = std::time::Instant::now();
+                    if let Some(latest) = latest_inventory().await {
+                        if inventory_signature(&latest) != signature {
+                            predictor.stop()?;
+                            return Err("worker_models_changed".into());
+                        }
+                        // The administrator's Jobs setting is followed without setting up
+                        // again: the next claim asks for what it allows now.
+                        limits = inventory_concurrency(&latest);
+                        if several_leases {
+                            at_once = concurrent_tasks(
+                                &limits,
+                                &ready,
+                                local,
+                                progress.capacity_ceiling(),
+                            );
+                            progress.running_at_once(at_once);
+                        }
+                    }
+                }
                 progress.set("working", None);
                 let accepted: Vec<_> = prepared.iter().map(|(_, accepted)| accepted).collect();
-                let completed = cancellable(async {
-                    tokio::select! {
-                        biased;
-                        reason = resource_loss(&clock) => Err(format!("resource_{reason}")),
-                        result = predictor.execute_next_with_activity(&worker, &accepted, &mut cancel, |workload| progress.active(Some(workload))) => result,
-                    }
-                }, &progress.cancelled).await;
-                progress.active(None);
-                match completed {
-                    Ok(Step::Completed) => {
+                // How many tasks to have in hand, which a memory shortfall lowers as it goes.
+                let at_once_now = std::sync::atomic::AtomicU32::new(at_once);
+                let slots = || several_leases.then(|| at_once_now.load(Ordering::Acquire));
+                // The pool works on, refilling as tasks finish, until this loop is needed:
+                // a pause, the next look at the server's models, a refused task due to be
+                // offered again, or the qualifications nearing their end. It then finishes
+                // what is in hand and hands back.
+                let models_due = models_checked + MODEL_RECHECK;
+                let offer_due = progress
+                    .status
+                    .lock()
+                    .unwrap()
+                    .workloads
+                    .iter()
+                    .filter(|item| item.state == "unavailable")
+                    .filter_map(|item| {
+                        Some((refused_at.get(&item.workload)?, item.code.as_deref()?))
+                    })
+                    .filter(|(_, code)| code.starts_with("workload_"))
+                    .map(|(at, code)| (*at + refused_task_retry(code)).max(work_due))
+                    .min();
+                let rest_ends = plan.rest_ends();
+                let keep_claiming = || {
+                    !progress.user_paused.load(Ordering::Acquire)
+                        && std::time::Instant::now() < models_due
+                        && rest_ends.is_none_or(|due| std::time::Instant::now() < due)
+                        && offer_due.is_none_or(|due| tokio::time::Instant::now() < due)
+                        && worker.now().is_ok_and(|now| {
+                            prepared.iter().all(|(proof, accepted)| {
+                                accepted.validate_runtime(proof, now + 60_000).is_ok()
+                            })
+                        })
+                };
+                let pool = crate::native_predictor::Pool {
+                    slots: &slots,
+                    keep_claiming: &keep_claiming,
+                    abandon: &|| {},
+                };
+                let mut requalify = false;
+                let mut refused_in_a_row = 0u32;
+                let mut dropped: Option<String> = None;
+                // Until when the next claim is held off after a dropped task. The pool waits
+                // it out itself, except where it ends first because the runtime was stopped.
+                let mut held_off: Option<tokio::time::Instant> = None;
+                let mut unclaimed: Option<Step> = None;
+                // The tasks in hand. One that ends the pool with its failure stays counted:
+                // after a crash this is how many the runtime was working on.
+                let in_hand = InHand::default();
+                let mut recovered = false;
+                // The models the graphics card or neural engine is working on in this plan.
+                let accelerated_models = plan.accelerated_models();
+                let (limits_now, ready_now) = (&limits, &ready);
+                let mut on_task = |task: crate::native_predictor::TaskStep| match task.step {
+                    Step::Completed => {
                         failures.completed();
+                        held_off = None;
+                        strikes.completed(task.model.as_deref());
                         progress.completed();
-                    }
-                    Ok(Step::Dropped(code)) => {
-                        // FD-52: the accelerated runtime's process died while inferring: its
-                        // workloads move to the processor instead of crashing on every restart.
-                        let lane = predictor.failed_lane().map(str::to_owned);
-                        if lane.is_some_and(|lane| plan.demote_runtime(&lane, &code)) {
-                            predictor.stop()?;
-                            continue 'qualification;
+                        refused_in_a_row = 0;
+                        // A long run without trouble: one more at once than it last ran
+                        // short at, up to what the server allows and this computer can take.
+                        let on_accelerated = task
+                            .model
+                            .as_deref()
+                            .is_some_and(|model| accelerated_models.contains(model));
+                        let (clean, well) = trouble.completed(on_accelerated);
+                        recovered |= well;
+                        if clean && progress.capacity_ceiling().is_some() {
+                            progress.raise_capacity();
+                            let more = concurrent_tasks(
+                                limits_now,
+                                ready_now,
+                                local,
+                                progress.capacity_ceiling(),
+                            );
+                            at_once_now.store(more, Ordering::Release);
+                            progress.running_at_once(more);
                         }
-                        let delay = match failures.dropped(code) {
-                            Ok(delay) => delay,
-                            Err(code) => {
-                                predictor.stop()?;
-                                return Err(code);
-                            }
+                        Some(Duration::ZERO)
+                    }
+                    Step::Dropped(code) => {
+                        let on_accelerated = task
+                            .model
+                            .as_deref()
+                            .is_some_and(|model| accelerated_models.contains(model));
+                        trouble.refused(on_accelerated);
+                        // The model refused two tasks running with others: most likely too
+                        // many for this computer's memory. Half as many from here on.
+                        let running = at_once_now.load(Ordering::Acquire);
+                        refused_in_a_row = match code.as_str() {
+                            "runtime_prediction_refused" => refused_in_a_row + 1,
+                            _ => 0,
                         };
-                        cancellable(
-                            async {
-                                tokio::time::sleep(delay).await;
-                                Ok(())
-                            },
-                            &progress.cancelled,
-                        )
-                        .await?;
-                        if !predictor.is_running()? {
-                            // Inference was cut short: load the models again before the next claim.
-                            break;
+                        if refused_in_a_row >= 2 && running > 1 {
+                            refused_in_a_row = 0;
+                            let fewer = (running / 2).max(1);
+                            at_once_now.store(fewer, Ordering::Release);
+                            progress.lower_capacity(fewer);
+                        }
+                        // By now the server has withdrawn the model and will lease nothing
+                        // for it: stop claiming and qualify again, which grants it again.
+                        // Only a failure the server acknowledged was counted there.
+                        requalify |= task.reported && strikes.failed(task.model.as_deref(), &code);
+                        dropped = Some(code);
+                        let pause = failures.dropped().0;
+                        held_off = Some(tokio::time::Instant::now() + pause);
+                        (!requalify).then_some(pause)
+                    }
+                    step @ (Step::Idle | Step::Busy(_)) => {
+                        unclaimed = Some(step);
+                        None
+                    }
+                };
+                let on_step = |task: crate::native_predictor::TaskStep| {
+                    in_hand.settled(&task);
+                    on_task(task)
+                };
+                // A stop waits for every lease in hand to be handed back, one request each.
+                let grace = LEASE_RETURN + Duration::from_secs(u64::from(at_once.min(8)) - 1);
+                let completed = returning_lease(
+                    predictor.work(
+                        &worker,
+                        &accepted,
+                        &mut cancel,
+                        &pool,
+                        |workload| {
+                            in_hand.claimed();
+                            progress.active(Some(workload))
+                        },
+                        on_step,
+                    ),
+                    lease_interruption(&progress, &clock),
+                    &stop,
+                    grace,
+                )
+                .await;
+                progress.active(None);
+                let running = at_once_now.load(Ordering::Acquire);
+                at_once = running;
+                // A runtime that ended or stopped answering: what it means depends on how
+                // many tasks it was working on, not on how many it was allowed.
+                let accelerated_ended = predictor
+                    .failed_lane()
+                    .is_some_and(|lane| plan.accelerates(lane));
+                let crash = judge(
+                    &mut trouble,
+                    &progress,
+                    &plan,
+                    &completed,
+                    dropped.as_deref(),
+                    in_hand.count(),
+                    predictor.failed_lane(),
+                );
+                if keeps_recovery(recovered, crash, accelerated_ended) {
+                    plan.recovered();
+                }
+                plan.set_crash_record((trouble.at_one, trouble.clean_accelerated));
+                match completed {
+                    Ok(()) => {
+                        // The accelerated runtime crashed out. Decided before qualifying
+                        // again, which the same failures can ask for: its work moves to the
+                        // processor and it rests, and the setup that follows qualifies anew.
+                        let lane = predictor.failed_lane().map(str::to_owned);
+                        match after_pool(
+                            &mut plan,
+                            crash,
+                            dropped.as_deref(),
+                            lane.as_deref(),
+                            requalify,
+                        ) {
+                            AfterPool::CrashedOut => {
+                                progress.crashed(predictor.exit_report());
+                                predictor.stop()?;
+                                continue 'qualification;
+                            }
+                            AfterPool::Requalify => {
+                                // Its process died as well: the wait before it is started
+                                // again is kept.
+                                if let Some(AfterCrash::Again(_)) = crash {
+                                    progress.crashed(predictor.exit_report());
+                                }
+                                predictor.stop()?;
+                                if let Some(AfterCrash::Again(crashes)) = crash {
+                                    restart_wait(crashes, &progress.cancelled).await?;
+                                }
+                                continue 'qualification;
+                            }
+                            AfterPool::Carry => {}
+                        }
+                        if let Some(code) = dropped {
+                            // FD-52: the accelerated runtime's process died while inferring: its
+                            // workloads move to the processor instead of crashing on every restart.
+                            let lane = predictor.failed_lane().map(str::to_owned);
+                            let code = crashed_out(crash, code);
+                            if let Some(AfterCrash::Again(_) | AfterCrash::Fewer(_)) = crash {
+                                // The graphics card keeps the work: its runtime is started
+                                // again, after a wait with one task in hand, or at once
+                                // with fewer at a time. Only a failing runtime moves.
+                                progress.crashed(predictor.exit_report());
+                                predictor.stop()?;
+                                if let Some(AfterCrash::Again(crashes)) = crash {
+                                    restart_wait(crashes, &progress.cancelled).await?;
+                                }
+                                break;
+                            }
+                            if lane.is_some_and(|lane| plan.demote_runtime(&lane, &code)) {
+                                progress.crashed(predictor.exit_report());
+                                predictor.stop()?;
+                                continue 'qualification;
+                            }
+                            if !predictor.is_running()? {
+                                // Inference was cut short: load the models again before the
+                                // next claim, which is still held off as after any dropped task.
+                                hold_off(held_off, &progress.cancelled).await?;
+                                break;
+                            }
+                        }
+                        let pause = match unclaimed {
+                            Some(Step::Busy(code)) => {
+                                let (delay, show) = failures.dropped();
+                                if show {
+                                    // A long run of server errors: say why while waiting.
+                                    progress.set("reconnecting", Some(code));
+                                }
+                                Some(delay)
+                            }
+                            Some(_) => {
+                                progress.set("waiting-for-work", None);
+                                Some(Duration::from_secs(1))
+                            }
+                            None => None,
+                        };
+                        if let Some(pause) = pause {
+                            cancellable(
+                                async {
+                                    tokio::time::sleep(pause).await;
+                                    Ok(())
+                                },
+                                &progress.cancelled,
+                            )
+                            .await?;
                         }
                     }
-                    Ok(Step::Idle) => {
-                        progress.set("waiting-for-work", None);
-                        cancellable(
-                            async {
-                                tokio::time::sleep(Duration::from_secs(1)).await;
-                                Ok(())
-                            },
-                            &progress.cancelled,
-                        )
-                        .await?;
+                    // With several tasks in hand the likeliest cause is memory, not the
+                    // device: half as many on the same runtime, halved again each time down
+                    // to one. With one task in hand a graphics card or neural engine keeps
+                    // the work: its runtime is started again after a wait, and only the third
+                    // crash in a row with no task finished in between is a failing runtime
+                    // (FD-52 below). So is one that did not start.
+                    Err(_)
+                        if matches!(
+                            crash,
+                            Some(AfterCrash::Fewer(_) | AfterCrash::Again(_) | AfterCrash::Once)
+                        ) =>
+                    {
+                        check_cancel(&progress.cancelled)?;
+                        progress.crashed(predictor.exit_report());
+                        predictor.stop()?;
+                        if let Some(AfterCrash::Again(crashes)) = crash {
+                            restart_wait(crashes, &progress.cancelled).await?;
+                        }
+                        break;
                     }
                     Err(reason) if reason.starts_with("resource_") => {
                         predictor.stop()?;
@@ -1501,11 +2554,21 @@ async fn prepare_on(
                         }
                         break;
                     }
+                    // The server withdrew a model from this computer (its count of failed
+                    // tasks outlives this setup's). Qualify again: the withdrawn model is
+                    // held back and set aside, the others go back to work.
+                    Err(reason) if reason == "worker_model_withdrawn" => {
+                        predictor.stop()?;
+                        strikes = GrantStrikes::default();
+                        continue 'qualification;
+                    }
                     Err(reason) => {
                         // FD-52: the accelerated runtime's process did not serve: use the
                         // processor for its workloads instead of failing the worker. A stop
                         // or sign-out while it was starting is not a provider failure.
                         check_cancel(&progress.cancelled)?;
+                        // Why the process ended, for the page and the log, before it is cleared.
+                        progress.crashed(predictor.exit_report());
                         let lane = predictor.failed_lane().map(str::to_owned);
                         if lane.is_some_and(|lane| plan.demote_runtime(&lane, &reason)) {
                             predictor.stop()?;
@@ -1740,8 +2803,12 @@ mod tests {
             .unwrap()
             .pop();
         assert!(inventory_profiles(&value, source, "CPUExecutionProvider").is_err());
+        // A field this app does not know is never used, wherever it claims to point; the same
+        // field inside a profile is refused (the profile is hashed into its key).
         let mut value = inventory_fixture();
         value["workloads"][0]["url"] = serde_json::json!("https://untrusted");
+        assert!(inventory_profiles(&value, source, "CPUExecutionProvider").is_ok());
+        value["workloads"][0]["profiles"][0]["url"] = serde_json::json!("https://untrusted");
         assert!(inventory_profiles(&value, source, "CPUExecutionProvider").is_err());
         let mut value = inventory_fixture();
         value["workloads"][2] = value["workloads"][1].clone();
@@ -2016,6 +3083,7 @@ mod tests {
                         }
                     },
                     std::future::pending(),
+                    std::future::pending(),
                     &cancelled,
                 )
                 .await
@@ -2092,6 +3160,7 @@ mod tests {
                 .await;
                 assert_eq!(samples.load(Ordering::Acquire), 2);
             },
+            std::future::pending(),
             &cancel,
         )
         .await;
@@ -2117,6 +3186,7 @@ mod tests {
             true,
             || async { Err("worker_session_revoked".into()) },
             async {},
+            std::future::pending(),
             &AtomicBool::new(false),
         )
         .await;
@@ -2127,6 +3197,7 @@ mod tests {
                 true,
                 || async { Ok(()) },
                 async {},
+                std::future::pending(),
                 &AtomicBool::new(false)
             )
             .await
@@ -2159,6 +3230,7 @@ mod tests {
             false,
             || async { Ok(()) },
             async {},
+            std::future::pending(),
             &cancel,
         )
         .await;
@@ -2682,7 +3754,7 @@ mod tests {
             .await?;
             match step {
                 Step::Completed => failures.completed(),
-                Step::Dropped(code) => drop(failures.dropped(code)?),
+                Step::Dropped(_) | Step::Busy(_) => drop(failures.dropped()),
                 Step::Idle => tokio::time::sleep(Duration::from_millis(10)).await,
             }
         }
@@ -2811,21 +3883,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn five_failed_tasks_in_a_row_park_the_worker_and_fewer_do_not() {
+    async fn failed_tasks_in_a_row_slow_the_claims_down_and_never_stop_the_worker() {
         let mut failures = TaskFailures::default();
-        for _ in 0..3 {
-            for _ in 0..TASK_FAILURE_LIMIT - 1 {
-                let delay = failures.dropped("worker_result_refused".into()).unwrap();
-                assert!(delay >= Duration::from_secs(1) && delay <= Duration::from_secs(64));
-            }
-            failures.completed();
+        for round in 1..=3 * TASK_FAILURE_LIMIT {
+            let (delay, show) = failures.dropped();
+            assert!(delay >= Duration::from_secs(1) && delay <= Duration::from_secs(64));
+            // From the limit on, the reason is shown while waiting.
+            assert_eq!(show, round >= TASK_FAILURE_LIMIT);
         }
+        failures.completed();
+        assert!(!failures.dropped().1);
 
+        // Six refused results in a row: each is a different task, and the seventh is done.
         let server = FakeServer::start();
         let device = server.enrol();
         let saved = SavedSession::default();
-        server.queue(&device, 6);
-        for _ in 0..5 {
+        server.queue(&device, 7);
+        for _ in 0..6 {
             server.respond_next(
                 &device,
                 "/result",
@@ -2833,26 +3907,1357 @@ mod tests {
                 serde_json::json!({"accepted":false}),
             );
         }
-        let (result, refreshes) = run(&server, &device, &saved, false, &|| {}, &|| false).await;
-        assert_eq!(result, Err("worker_result_refused".into()));
+        let done = || server.completed(&device) == 1;
+        let (result, refreshes) = run(&server, &device, &saved, false, &|| {}, &done).await;
+        assert_eq!(result, Ok(()));
         assert_eq!(refreshes, [false]);
-        assert_eq!(server.completed(&device), 0);
+    }
 
-        // Parked is the state Retry Setup is offered in.
-        let setup = WorkerSetup::default();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        setup
-            .start_work(
-                Arc::new(move |status| {
-                    let _ = tx.send(status);
-                }),
-                move |_| async move { result },
+    #[tokio::test]
+    async fn a_failing_server_and_an_unknown_refusal_of_one_task_never_stop_the_worker() {
+        // 500 is a server in trouble, like 503: retried, whatever it is asked.
+        for code in ["server_http_500", "server_http_503", "server_http_520"] {
+            assert!(retryable(code), "{code}");
+        }
+        for code in ["worker_challenge_busy", "worker_qualification_restart"] {
+            assert!(retryable(code), "{code}");
+        }
+        assert!(!retryable("server_http_400"));
+
+        let server = FakeServer::start();
+        let device = server.enrol();
+        let saved = SavedSession::default();
+        server.queue(&device, 2);
+        // The claim fails six times over, then a task's input is refused with a status this app
+        // has never heard of, then the next task is done: same session throughout.
+        for _ in 0..6 {
+            server.respond_next(&device, "/claim", 500, serde_json::json!({}));
+        }
+        server.respond_next(
+            &device,
+            "/input",
+            418,
+            serde_json::json!({"message":"teapot"}),
+        );
+        let done = || server.completed(&device) == 1;
+        let (result, refreshes) = run(&server, &device, &saved, false, &|| {}, &done).await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(refreshes, [false]);
+        assert_eq!(server.sessions_issued(&device), 1);
+        // The refused task was handed back; the other was done.
+        assert_eq!(server.reports(&device), ["fail", "result"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_runtime_that_keeps_dying_stops_the_worker_instead_of_being_set_up_for_ever() {
+        for error in ["runtime_process_stopped", "runtime_prediction_interrupted"] {
+            let progress = quiet();
+            let attempts = AtomicUsize::new(0);
+            let result = reconnect(&progress, false, |refresh| {
+                attempts.fetch_add(1, Ordering::AcqRel);
+                // The session is not at fault: no new one is asked for.
+                assert!(!refresh);
+                // As the real setup: "working" is announced before the runtime has served.
+                progress.set("working", None);
+                async move { Err(error.into()) }
+            })
+            .await;
+            assert_eq!(result, Err("runtime_crash_loop".into()), "{error}");
+            assert_eq!(attempts.load(Ordering::Acquire), CRASH_LIMIT as usize);
+        }
+        // A task finished since the last crash: the run of crashes starts again from one.
+        let progress = quiet();
+        let attempts = AtomicUsize::new(0);
+        let result = reconnect(&progress, false, |_| {
+            if attempts.fetch_add(1, Ordering::AcqRel) == 2 {
+                progress.completed();
+            }
+            async { Err("runtime_process_stopped".into()) }
+        })
+        .await;
+        assert_eq!(result, Err("runtime_crash_loop".into()));
+        assert_eq!(attempts.load(Ordering::Acquire), 5);
+    }
+
+    #[tokio::test]
+    async fn a_model_change_on_the_server_sets_up_again_at_once_with_the_same_session() {
+        let progress = quiet();
+        let refreshes = Mutex::new(Vec::new());
+        let started = std::time::Instant::now();
+        reconnect(&progress, false, |refresh| {
+            let mut seen = refreshes.lock().unwrap();
+            seen.push(refresh);
+            let first = seen.len() == 1;
+            async move {
+                if first {
+                    Err("worker_models_changed".into())
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*refreshes.lock().unwrap(), [false, false]);
+        // No backoff, and nothing shown as a fault.
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(progress.status.lock().unwrap().state, "");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_of_every_task_by_the_server_is_waited_out_and_offered_again() {
+        // The search model is being changed on the server: minutes, not a stop.
+        assert_eq!(
+            refused_task_retry("workload_desktop_clip_index_changed"),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            refused_task_retry("desktop_clip_index_dimensions"),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            refused_task_retry("workload_desktop_clip_index_incompatible"),
+            Duration::from_secs(1800)
+        );
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let seen = statuses.clone();
+        let progress = Progress {
+            notify: Arc::new(move |status: SetupStatus| {
+                seen.lock().unwrap().push((status.state, status.code))
+            }),
+            ..quiet()
+        };
+        let attempts = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let result = supervise(
+            &progress,
+            false,
+            |_| {
+                let first = attempts.fetch_add(1, Ordering::AcqRel) == 0;
+                async move {
+                    if first {
+                        // What `first_failure` reports when the only task was refused.
+                        Err("desktop_clip_index_changed".into())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            || async { None },
+            ROUTE_POLL,
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(attempts.load(Ordering::Acquire), 2);
+        assert!(started.elapsed() >= Duration::from_secs(120));
+        assert_eq!(
+            *statuses.lock().unwrap(),
+            [(
+                "paused".to_owned(),
+                Some("desktop_clip_index_changed".to_owned())
+            )]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_runtime_that_never_answers_or_a_server_that_keeps_failing_is_backed_off() {
+        // The runtime starts and never becomes healthy: counted like a crash, then stopped.
+        let progress = quiet();
+        let attempts = AtomicUsize::new(0);
+        let result = reconnect(&progress, false, |refresh| {
+            attempts.fetch_add(1, Ordering::AcqRel);
+            assert!(!refresh);
+            progress.set("working", None);
+            async { Err("runtime_not_ready".into()) }
+        })
+        .await;
+        assert_eq!(result, Err("runtime_crash_loop".into()));
+        assert_eq!(attempts.load(Ordering::Acquire), CRASH_LIMIT as usize);
+
+        // "working" is announced before the server has answered anything: it does not make the
+        // next wait short again. Five failures in a row wait 1-2, 2-4, 4-8, 8-16 and 16-32 s.
+        let progress = quiet();
+        let attempts = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        reconnect(&progress, false, |_| {
+            let failing = attempts.fetch_add(1, Ordering::AcqRel) < 5;
+            progress.set("working", None);
+            async move {
+                match failing {
+                    true => Err("server_http_503".into()),
+                    false => Ok(()),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(31));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_task_ends_the_run_of_crashes_and_a_crash_asks_for_no_new_session() {
+        // Two crashes, then an attempt that finishes a task and loses the connection, then a
+        // crash: that is one crash since the last finished task, not three.
+        let progress = quiet();
+        let attempts = AtomicUsize::new(0);
+        let refreshes = Mutex::new(Vec::new());
+        let result = reconnect(&progress, false, |refresh| {
+            refreshes.lock().unwrap().push(refresh);
+            let attempt = attempts.fetch_add(1, Ordering::AcqRel);
+            if attempt == 2 {
+                progress.completed();
+            }
+            async move {
+                match attempt {
+                    0 | 1 | 3 => Err("runtime_process_stopped".into()),
+                    2 => Err("worker_request_interrupted".into()),
+                    _ => Ok(()),
+                }
+            }
+        })
+        .await;
+        assert_eq!(result, Ok(()));
+        // The lost connection asks for a new session once; the crash after it does not ask again.
+        assert_eq!(
+            *refreshes.lock().unwrap(),
+            [false, false, false, true, false]
+        );
+    }
+
+    #[test]
+    fn a_refusal_that_passes_by_itself_outranks_another_tasks_fault() {
+        let status = |workload: &str, code: &str| WorkloadStatus {
+            workload: workload.into(),
+            state: "unavailable".into(),
+            model_names: vec![],
+            code: Some(code.into()),
+        };
+        // Smart search failed its check here; text recognition is only held back for five
+        // minutes. Stopping over the first would never offer the second again.
+        assert_eq!(
+            first_failure(&[
+                status("clip", "runtime_output_mismatch"),
+                status("ocr", "workload_desktop_qualification_hold"),
+            ]),
+            "desktop_qualification_hold"
+        );
+        assert!(server_task_refusal("desktop_qualification_hold"));
+        // Smart search is refused for 30 minutes and text recognition held for 5½: the wait
+        // is the shorter one, whatever order the tasks come in.
+        for order in [["clip", "ocr"], ["ocr", "clip"]] {
+            let code = |task: &str| match task {
+                "clip" => "workload_desktop_clip_index_incompatible",
+                _ => "workload_desktop_qualification_hold",
+            };
+            assert_eq!(
+                first_failure(&[
+                    status(order[0], code(order[0])),
+                    status(order[1], code(order[1]))
+                ]),
+                "desktop_qualification_hold"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn several_tasks_run_at_once_and_each_free_slot_is_refilled_at_once() {
+        use crate::native_predictor::pool_with;
+        let server = FakeServer::start();
+        server.offer_concurrent_leases(3);
+        let device = server.enrol();
+        let worker = server.session(&device).await.unwrap();
+        let qualification = server.qualification(&worker).await;
+        server.queue(&device, 5);
+        let (_keep, mut cancel) = tokio::sync::watch::channel(false);
+        let (running, most, started) = (
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        );
+        let (slow_running, refilled) = (AtomicBool::new(false), AtomicBool::new(false));
+        // The first task is held until both replacements have started; the second and third
+        // are held until all three are at work.
+        let (slow, quick) = (
+            tokio::sync::Semaphore::new(0),
+            tokio::sync::Semaphore::new(0),
+        );
+        let quals = [&qualification];
+        let work = pool_with(&worker, &quals, &mut cancel, Some(3), |_| async {
+            let now = running.fetch_add(1, Ordering::AcqRel) + 1;
+            most.fetch_max(now, Ordering::AcqRel);
+            match started.fetch_add(1, Ordering::AcqRel) {
+                0 => {
+                    slow_running.store(true, Ordering::Release);
+                    slow.acquire().await.unwrap().forget();
+                    slow_running.store(false, Ordering::Release);
+                }
+                order @ 1..=2 => {
+                    if order == 2 {
+                        quick.add_permits(2);
+                    }
+                    quick.acquire().await.unwrap().forget();
+                }
+                // A fourth and fifth task started while the slow one was still at work.
+                order => {
+                    if slow_running.load(Ordering::Acquire) {
+                        refilled.store(true, Ordering::Release);
+                    }
+                    if order == 4 {
+                        slow.add_permits(1);
+                    }
+                }
+            }
+            running.fetch_sub(1, Ordering::AcqRel);
+            Ok(serde_json::json!({}))
+        });
+        let steps = tokio::time::timeout(Duration::from_secs(20), work)
+            .await
+            .expect("a free place was not refilled")
+            .unwrap();
+        // Room for three: never more than three at once, and all five done.
+        assert_eq!(steps, [const { Step::Completed }; 5]);
+        assert_eq!(most.load(Ordering::Acquire), 3);
+        assert_eq!(server.completed(&device), 5);
+        // The slow task did not hold the other slots up: they were refilled as they emptied.
+        assert!(refilled.load(Ordering::Acquire));
+        // The first claim waits for work; the ones made with tasks in hand do not hold the
+        // line, and every one says how much room there is.
+        let (slots, waits) = server.claims();
+        assert_eq!(slots[..3], [3, 2, 1]);
+        assert_eq!(waits[..3], [20_000, 0, 0]);
+        assert!(
+            waits[3..waits.len() - 1].iter().all(|wait| *wait == 0),
+            "{waits:?}"
+        );
+
+        // One task the model refuses is that task's outcome only: the others are done.
+        server.queue(&device, 2);
+        let turn = AtomicUsize::new(0);
+        let steps = pool_with(&worker, &[&qualification], &mut cancel, Some(3), |_| {
+            let refused = turn.fetch_add(1, Ordering::AcqRel) == 0;
+            async move {
+                match refused {
+                    true => Err("runtime_prediction_refused".into()),
+                    false => Ok(serde_json::json!({})),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| **step == Step::Completed)
+                .count(),
+            1
+        );
+        assert_eq!(server.failures(), ["input-invalid"]);
+        assert_eq!(server.completed(&device), 6);
+    }
+
+    #[tokio::test]
+    async fn a_refused_input_keeps_the_runtime_and_the_next_claim_waits_out_the_backoff() {
+        use crate::native_predictor::{run_pool, Pool, TaskStep};
+        let server = FakeServer::start();
+        let device = server.enrol();
+        let worker = server.session(&device).await.unwrap();
+        let qualification = server.qualification(&worker).await;
+        server.queue(&device, 2);
+        let (_keep, mut cancel) = tokio::sync::watch::channel(false);
+        let (stopped, predictions) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let dropped_at = std::sync::Mutex::new(None);
+        let waited = std::sync::Mutex::new(None);
+        let pool = Pool {
+            slots: &|| None,
+            keep_claiming: &|| true,
+            abandon: &|| {
+                stopped.fetch_add(1, Ordering::AcqRel);
+            },
+        };
+        let mut reported = Vec::new();
+        let on_step = |task: TaskStep| {
+            if let Step::Dropped(_) = task.step {
+                reported.push(task.reported);
+                *dropped_at.lock().unwrap() = Some(std::time::Instant::now());
+                return Some(Duration::from_millis(300));
+            }
+            Some(Duration::ZERO)
+        };
+        let predict = |_, _, _| async {
+            if predictions.fetch_add(1, Ordering::AcqRel) == 0 {
+                return Err("runtime_prediction_refused".to_string());
+            }
+            *waited.lock().unwrap() = dropped_at.lock().unwrap().map(|at| at.elapsed());
+            Ok(serde_json::json!({}))
+        };
+        let quals = [&qualification];
+        run_pool(
+            &worker,
+            &quals,
+            &mut cancel,
+            &pool,
+            |_| {},
+            on_step,
+            predict,
+        )
+        .await
+        .unwrap();
+        // The model answered: its process is left serving, and the server acknowledged the report.
+        assert_eq!(stopped.load(Ordering::Acquire), 0);
+        assert_eq!(server.failures(), ["input-invalid"]);
+        assert_eq!(reported, [true]);
+        // The only task in hand was dropped: the pool held the next claim off itself.
+        assert!(waited.lock().unwrap().unwrap() >= Duration::from_millis(300));
+        assert_eq!(server.completed(&device), 1);
+    }
+
+    #[tokio::test]
+    async fn a_claim_held_off_stays_held_off_when_the_runtime_must_be_loaded_again() {
+        // The pool ended early (the runtime was stopped under the dropped task): what is left
+        // of the pause is waited before the models are loaded and the next claim is made.
+        let cancel = AtomicBool::new(false);
+        let (start, pause) = (tokio::time::Instant::now(), Duration::from_millis(200));
+        hold_off(Some(start + pause), &cancel).await.unwrap();
+        assert!(start.elapsed() >= pause);
+        // Nothing held off, or the pause already over: no wait.
+        let again = tokio::time::Instant::now();
+        hold_off(None, &cancel).await.unwrap();
+        hold_off(Some(start), &cancel).await.unwrap();
+        assert!(again.elapsed() < pause);
+        // A stop ends the wait.
+        cancel.store(true, Ordering::Release);
+        let far = tokio::time::Instant::now() + Duration::from_secs(60);
+        assert_eq!(
+            hold_off(Some(far), &cancel).await,
+            Err("worker_setup_cancelled".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lease_that_arrives_after_claiming_stopped_is_handed_straight_back() {
+        use crate::native_predictor::{run_pool, Pool, TaskStep};
+        let server = FakeServer::start();
+        server.offer_concurrent_leases(2);
+        // A slow link: a claim for more room is still on its way when the first task ends.
+        server.slow_claims(Duration::from_millis(400));
+        let device = server.enrol();
+        let worker = server.session(&device).await.unwrap();
+        let qualification = server.qualification(&worker).await;
+        server.queue(&device, 1);
+        let (_keep, mut cancel) = tokio::sync::watch::channel(false);
+        let pool = Pool {
+            slots: &|| Some(2),
+            keep_claiming: &|| true,
+            abandon: &|| {},
+        };
+        let predictions = AtomicUsize::new(0);
+        let predict = |_, _, _| async {
+            predictions.fetch_add(1, Ordering::AcqRel);
+            // The claim that waited for work, a claim for more room (nothing there), and now
+            // a second one: it has reached the server, which is about to lease it a new task.
+            while server.claims_received() < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            server.queue(&device, 1);
+            // Ends without a word to the server, as a lease the server took back does.
+            Err("worker_lease_lost".to_string())
+        };
+        // As the owner that must qualify again: no more claims.
+        let on_step = |task: TaskStep| match task.step {
+            Step::Dropped(_) => None,
+            _ => Some(Duration::ZERO),
+        };
+        let quals = [&qualification];
+        let work = run_pool(
+            &worker,
+            &quals,
+            &mut cancel,
+            &pool,
+            |_| {},
+            on_step,
+            predict,
+        );
+        tokio::time::timeout(Duration::from_secs(20), work)
+            .await
+            .expect("the pool did not end")
+            .unwrap();
+        // The second task was leased by the claim already sent, and went straight back.
+        assert_eq!(predictions.load(Ordering::Acquire), 1);
+        assert_eq!(server.failures(), ["cancelled"]);
+    }
+
+    #[tokio::test]
+    async fn a_lease_that_arrives_after_a_pause_is_handed_straight_back() {
+        use crate::native_predictor::{run_pool, Pool};
+        let server = FakeServer::start();
+        let device = server.enrol();
+        let worker = server.session(&device).await.unwrap();
+        let qualification = server.qualification(&worker).await;
+        server.queue(&device, 1);
+        let (_keep, mut cancel) = tokio::sync::watch::channel(false);
+        // Wanted when the claim is sent, paused by the time it is answered.
+        let asked = AtomicUsize::new(0);
+        let pool = Pool {
+            slots: &|| None,
+            keep_claiming: &|| asked.fetch_add(1, Ordering::AcqRel) == 0,
+            abandon: &|| {},
+        };
+        let predictions = AtomicUsize::new(0);
+        let predict = |_, _, _| async {
+            predictions.fetch_add(1, Ordering::AcqRel);
+            Ok(serde_json::json!({}))
+        };
+        let quals = [&qualification];
+        let on_step = |_| Some(Duration::ZERO);
+        run_pool(
+            &worker,
+            &quals,
+            &mut cancel,
+            &pool,
+            |_| {},
+            on_step,
+            predict,
+        )
+        .await
+        .unwrap();
+        assert_eq!(predictions.load(Ordering::Acquire), 0);
+        assert_eq!(server.failures(), ["cancelled"]);
+        assert!(!server.handled().contains(&"input".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_ends_under_several_tasks_is_reported_as_one_failure() {
+        use crate::native_predictor::pool_with;
+        let server = FakeServer::start();
+        server.offer_concurrent_leases(3);
+        let device = server.enrol();
+        let worker = server.session(&device).await.unwrap();
+        let qualification = server.qualification(&worker).await;
+        server.queue(&device, 3);
+        let (_keep, mut cancel) = tokio::sync::watch::channel(false);
+        let in_hand = AtomicUsize::new(0);
+        let all_in_hand = tokio::sync::Notify::new();
+        // The process ends with three tasks in hand: each prediction fails the same way.
+        let result = pool_with(
+            &worker,
+            &[&qualification],
+            &mut cancel,
+            Some(3),
+            |_| async {
+                if in_hand.fetch_add(1, Ordering::AcqRel) == 2 {
+                    all_in_hand.notify_waiters();
+                } else {
+                    all_in_hand.notified().await;
+                }
+                Err("runtime_process_stopped".into())
+            },
+        )
+        .await;
+        assert_eq!(result, Err("runtime_process_stopped".into()));
+        // The server, which withdraws a model after three failed tasks in a row, hears of one
+        // failure; the other two tasks go straight back in line.
+        // The failure is told first: the server takes the hand-backs after it as part of it.
+        assert_eq!(
+            server.failures(),
+            ["model-unavailable", "cancelled", "cancelled"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_hands_back_every_lease_it_holds() {
+        use crate::native_predictor::pool_with;
+        let server = FakeServer::start();
+        server.offer_concurrent_leases(3);
+        let device = server.enrol();
+        let worker = server.session(&device).await.unwrap();
+        let qualification = server.qualification(&worker).await;
+        server.queue(&device, 3);
+        let (stop, mut cancel) = tokio::sync::watch::channel(false);
+        let predicting = AtomicUsize::new(0);
+        let all_running = tokio::sync::Notify::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            returning_lease(
+                pool_with(
+                    &worker,
+                    &[&qualification],
+                    &mut cancel,
+                    Some(3),
+                    |_| async {
+                        if predicting.fetch_add(1, Ordering::AcqRel) == 2 {
+                            all_running.notify_one();
+                        }
+                        std::future::pending::<Result<serde_json::Value, String>>().await
+                    },
+                ),
+                async {
+                    all_running.notified().await;
+                    "worker_setup_cancelled".to_owned()
+                },
+                &stop,
+                LEASE_RETURN,
+            ),
+        )
+        .await
+        .expect("the stop waited for the tasks");
+        assert_eq!(result, Err("worker_setup_cancelled".into()));
+        assert_eq!(server.failures(), ["cancelled", "cancelled", "cancelled"]);
+    }
+
+    #[test]
+    fn the_number_of_tasks_at_once_follows_the_server_and_this_computers_limits() {
+        const GB: u64 = 1024 * 1024 * 1024;
+        // The processor: one task, or two with eight cores, memory allowing.
+        assert_eq!(local_capacity(false, 4, Some(32 * GB), 2 * GB), 1);
+        assert_eq!(local_capacity(false, 8, Some(32 * GB), 2 * GB), 2);
+        assert_eq!(local_capacity(false, 16, Some(32 * GB), 2 * GB), 2);
+        // A graphics card or neural engine: up to eight, by the memory that is free beside
+        // the models (2 GB of models: half a gigabyte of working memory for each task).
+        assert_eq!(local_capacity(true, 8, Some(32 * GB), 2 * GB), 8);
+        assert_eq!(local_capacity(true, 8, Some(3 * GB), 2 * GB), 2);
+        assert_eq!(local_capacity(true, 8, Some(GB), 2 * GB), 1);
+        // Free memory that can't be read is one task.
+        assert_eq!(local_capacity(true, 8, None, 2 * GB), 1);
+
+        let inventory = serde_json::json!({"workloads":[
+            {"workload":"clip","state":"eligible","concurrency":4},
+            {"workload":"face","state":"eligible","concurrency":2},
+            {"workload":"ocr","state":"eligible"},
+            {"workload":"enrichment","state":"unsupported","concurrency":900},
+        ]});
+        let limits = inventory_concurrency(&inventory);
+        assert_eq!(limits["clip"], 4);
+        // A reply that does not say (an older server) is one; a nonsense number is capped.
+        assert_eq!((limits["ocr"], limits["enrichment"]), (1, 64));
+        let ready = |tasks: &[&str]| tasks.iter().map(|task| task.to_string()).collect();
+        // What the server allows for the ready tasks, capped by this computer...
+        assert_eq!(
+            concurrent_tasks(&limits, &ready(&["clip", "face"]), 8, None),
+            6
+        );
+        assert_eq!(
+            concurrent_tasks(&limits, &ready(&["clip", "face"]), 3, None),
+            3
+        );
+        assert_eq!(concurrent_tasks(&limits, &ready(&["ocr"]), 8, None), 1);
+        // ...and by what it managed since it last ran short of memory.
+        assert_eq!(
+            concurrent_tasks(&limits, &ready(&["clip", "face"]), 8, Some(1)),
+            1
+        );
+
+        // Running short lowers the number; it is not raised by being told a higher one.
+        let progress = quiet();
+        progress.running_at_once(6);
+        progress.lower_capacity(3);
+        progress.lower_capacity(5);
+        assert_eq!(progress.capacity_ceiling(), Some(3));
+        progress.set("working", None);
+        assert_eq!(progress.capacity_ceiling(), Some(3));
+        assert_eq!(progress.status.lock().unwrap().concurrent_tasks, 3);
+    }
+
+    #[test]
+    fn a_runtime_that_ends_is_judged_by_the_tasks_it_had_in_hand() {
+        // The processor's runtime did not start (nothing in hand): never a matter of memory,
+        // whatever the allowance.
+        let mut trouble = RuntimeTrouble::default();
+        assert_eq!(trouble.crashed(0, false, false), AfterCrash::Failing);
+        assert_eq!(trouble.crashed(0, false, true), AfterCrash::Failing);
+        // Several in hand: half as many each time, on the same runtime, down to one.
+        assert_eq!(trouble.crashed(8, false, false), AfterCrash::Fewer(4));
+        assert_eq!(trouble.crashed(4, true, true), AfterCrash::Fewer(2));
+        assert_eq!(trouble.crashed(3, true, true), AfterCrash::Fewer(1));
+        assert_eq!(trouble.crashed(2, true, true), AfterCrash::Fewer(1));
+        // One task in hand on a graphics card: it keeps the work. The same runtime again,
+        // twice, and only the third crash in a row is a failing runtime.
+        assert_eq!(trouble.crashed(1, true, true), AfterCrash::Again(1));
+        assert_eq!(trouble.crashed(1, true, true), AfterCrash::Again(2));
+        assert_eq!(trouble.crashed(1, true, true), AfterCrash::Failing);
+        // After that the count starts again (the card is tried again later).
+        assert_eq!(trouble.crashed(1, true, false), AfterCrash::Again(1));
+        // Its process found gone between tasks is a crash like any other: one of the three.
+        assert_eq!(trouble.crashed(0, true, false), AfterCrash::Again(2));
+        assert_eq!(trouble.crashed(0, true, false), AfterCrash::Failing);
+        // A task finished in between starts that count again too.
+        let mut trouble = RuntimeTrouble::default();
+        assert_eq!(trouble.crashed(1, true, false), AfterCrash::Again(1));
+        assert_eq!(trouble.crashed(1, true, false), AfterCrash::Again(2));
+        // The processor finishing other work in between does not end the row.
+        assert_eq!(trouble.completed(false), (false, false));
+        assert_eq!(trouble.crashed(1, true, false), AfterCrash::Failing);
+        assert_eq!(trouble.crashed(1, true, false), AfterCrash::Again(1));
+        assert_eq!(trouble.completed(true), (false, false));
+        assert_eq!(trouble.crashed(1, true, false), AfterCrash::Again(1));
+        // The processor's runtime crashing does not undo the graphics card's run of
+        // finished tasks; a crash of its own does.
+        let mut trouble = RuntimeTrouble::default();
+        for _ in 1..CLEAN_RUN {
+            assert!(!trouble.completed(true).1);
+        }
+        assert_eq!(trouble.crashed(2, false, false), AfterCrash::Fewer(1));
+        assert!(trouble.completed(true).1);
+        for _ in 1..CLEAN_RUN {
+            assert!(!trouble.completed(true).1);
+        }
+        assert_eq!(trouble.crashed(2, true, false), AfterCrash::Fewer(1));
+        assert!(!trouble.completed(true).1);
+        // The third crash under a task dropped for its own reason is still the runtime
+        // crashing out; a hand-back and a crash code are kept as they are.
+        let out = |crash, code: &str| crashed_out(crash, code.to_owned());
+        let failing = Some(AfterCrash::Failing);
+        assert_eq!(
+            out(failing, "worker_execution_deadline"),
+            "runtime_process_stopped"
+        );
+        assert_eq!(out(failing, "worker_cancelled"), "worker_cancelled");
+        assert_eq!(out(failing, "resource_memory"), "resource_memory");
+        assert_eq!(
+            out(failing, "runtime_prediction_interrupted"),
+            "runtime_prediction_interrupted"
+        );
+        assert_eq!(
+            out(None, "worker_execution_deadline"),
+            "worker_execution_deadline"
+        );
+        // Three acknowledged deadline failures of one model ask to qualify again at the same
+        // moment the third crash is judged: the crash-out is still what the work loop acts on
+        // first (it checks `AfterCrash::Failing` before `requalify`).
+        let (mut trouble, mut strikes) = (RuntimeTrouble::default(), GrantStrikes::default());
+        let mut last = (None, false);
+        for _ in 0..CRASHES_AT_ONE {
+            let requalify = strikes.failed(Some("clip"), "worker_execution_deadline");
+            last = (Some(trouble.crashed(1, true, false)), requalify);
+        }
+        assert_eq!(last, (failing, true));
+        assert_eq!(
+            out(last.0, "worker_execution_deadline"),
+            "runtime_process_stopped"
+        );
+        // A run of the card's own tasks finished in the same pool as its crash is not its
+        // recovery; a crash of the processor's runtime beside it does not undo it.
+        assert!(keeps_recovery(true, None, false));
+        assert!(keeps_recovery(true, None, true));
+        assert!(!keeps_recovery(true, Some(AfterCrash::Again(1)), true));
+        assert!(keeps_recovery(true, Some(AfterCrash::Fewer(1)), false));
+        assert!(!keeps_recovery(false, None, false));
+        // Two in hand when the runtime ended; while the crash was being reported the other
+        // task was dropped for its own deadline. Still judged as two, until work goes on.
+        let (in_hand, step) = (InHand::default(), |step| {
+            crate::native_predictor::TaskStep {
+                model: Some("clip".into()),
+                step,
+                reported: true,
+            }
+        });
+        in_hand.claimed();
+        in_hand.claimed();
+        in_hand.settled(&step(Step::Dropped("worker_execution_deadline".into())));
+        assert_eq!(in_hand.count(), 2);
+        in_hand.claimed();
+        assert_eq!(in_hand.count(), 2);
+        in_hand.settled(&step(Step::Completed));
+        in_hand.settled(&step(Step::Dropped("worker_execution_deadline".into())));
+        assert_eq!(in_hand.count(), 1);
+        in_hand.claimed();
+        in_hand.settled(&step(Step::Completed));
+        assert_eq!(in_hand.count(), 0);
+        // A resting graphics card is owed its next try even when nothing else can run.
+        assert_eq!(rest_left(None), None);
+        let soon = std::time::Instant::now() + Duration::from_secs(60);
+        assert!(rest_left(Some(soon)).is_some_and(|left| left <= Duration::from_secs(60)));
+        assert_eq!(
+            rest_left(Some(std::time::Instant::now())),
+            Some(Duration::ZERO)
+        );
+        // Work the server holds back comes back after its hold, not after the whole rest.
+        let hour = Some(Duration::from_secs(3600));
+        assert_eq!(
+            empty_wait(hour, "desktop_qualification_hold"),
+            Some(refused_task_retry("desktop_qualification_hold"))
+        );
+        assert_eq!(
+            empty_wait(Some(Duration::from_secs(60)), "desktop_qualification_hold"),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(empty_wait(hour, "runtime_output_mismatch"), hour);
+        assert_eq!(empty_wait(None, "desktop_qualification_hold"), None);
+        // The processor's own runtime has nowhere to fall back to. One task at a time from
+        // the start: failing at the first crash, counted by the restarts, as it always was.
+        let mut trouble = RuntimeTrouble::default();
+        assert_eq!(trouble.crashed(1, false, false), AfterCrash::Failing);
+        // At one after stepping down: the same runtime once more, then it is failing; a
+        // task finished in between starts that count again.
+        // Started again at once, with no wait, as it always was.
+        assert_eq!(trouble.crashed(1, false, true), AfterCrash::Once);
+        assert_eq!(trouble.completed(false), (false, false));
+        assert_eq!(trouble.crashed(1, false, true), AfterCrash::Once);
+        assert_eq!(trouble.crashed(1, false, true), AfterCrash::Failing);
+
+        // A long run of finished tasks lets one more run at once; trouble starts the run again.
+        let mut trouble = RuntimeTrouble::default();
+        for _ in 1..CLEAN_RUN {
+            assert_eq!(trouble.completed(false), (false, false));
+        }
+        trouble.refused(false);
+        for _ in 1..CLEAN_RUN {
+            assert_eq!(trouble.completed(false), (false, false));
+        }
+        // Only the processor's tasks: one more at once, and no word on the graphics card.
+        assert_eq!(trouble.completed(false), (true, false));
+        // The graphics card has recovered after as long a run of its own tasks.
+        for _ in 1..CLEAN_RUN {
+            assert!(!trouble.completed(true).1);
+        }
+        assert!(trouble.completed(true).1);
+        // A task of its own dropped in between starts that run again; the processor's does not.
+        for _ in 1..CLEAN_RUN {
+            assert!(!trouble.completed(true).1);
+        }
+        trouble.refused(false);
+        trouble.refused(true);
+        assert!(!trouble.completed(true).1);
+        let progress = quiet();
+        progress.raise_capacity();
+        assert_eq!(progress.capacity_ceiling(), None);
+        progress.lower_capacity(2);
+        progress.raise_capacity();
+        assert_eq!(progress.capacity_ceiling(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn a_crash_under_the_pool_lowers_what_runs_at_once_by_the_tasks_in_hand() {
+        use crate::native_predictor::{run_pool, Pool, TaskStep};
+        // Wired as the work loop wires it: the pool's claims and settled tasks are counted,
+        // and when the pool ends with the runtime's failure the count decides what follows.
+        let crash = |slots: u32, tasks: u32, accelerated: bool| async move {
+            let server = FakeServer::start();
+            server.offer_concurrent_leases(slots.max(2));
+            let device = server.enrol();
+            let worker = server.session(&device).await.unwrap();
+            let qualification = server.qualification(&worker).await;
+            server.queue(&device, tasks);
+            let (_keep, mut cancel) = tokio::sync::watch::channel(false);
+            let (in_hand, started) = (InHand::default(), AtomicUsize::new(0));
+            let all_in_hand = tokio::sync::Notify::new();
+            let room = || Some(slots);
+            let pool = Pool {
+                slots: &room,
+                keep_claiming: &|| true,
+                abandon: &|| {},
+            };
+            // The process ends once every task is in hand: each prediction fails the same way.
+            let predict = |_, _, _| async {
+                if started.fetch_add(1, Ordering::AcqRel) as u32 + 1 == tasks {
+                    all_in_hand.notify_waiters();
+                } else {
+                    all_in_hand.notified().await;
+                }
+                Err("runtime_process_stopped".to_string())
+            };
+            let on_step = |task: TaskStep| {
+                in_hand.settled(&task);
+                Some(Duration::ZERO)
+            };
+            let quals = [&qualification];
+            let ended = run_pool(
+                &worker,
+                &quals,
+                &mut cancel,
+                &pool,
+                |_| in_hand.claimed(),
+                on_step,
+                predict,
             )
             .await;
-        let status = rx.recv().await.unwrap();
-        assert_eq!(status.state, "setup-needs-attention");
-        assert_eq!(status.code.as_deref(), Some("worker_result_refused"));
-        setup.stop().await;
+            assert_eq!(ended, Err("runtime_process_stopped".into()));
+            assert!(runtime_crash("runtime_process_stopped"));
+            let progress = quiet();
+            progress.running_at_once(slots);
+            let mut trouble = RuntimeTrouble::default();
+            let after = after_crash(&mut trouble, &progress, in_hand.count(), accelerated);
+            (in_hand.count(), after, progress.capacity_ceiling())
+        };
+        // Four allowed, three in hand when it ended: one at once from here on, same runtime.
+        assert_eq!(crash(4, 3, true).await, (3, AfterCrash::Fewer(1), Some(1)));
+        // One in hand on a graphics card: nothing lowered, the same runtime again.
+        assert_eq!(crash(4, 1, true).await, (1, AfterCrash::Again(1), None));
+        // One in hand on the processor: a failing runtime, nothing lowered.
+        assert_eq!(crash(1, 1, false).await, (1, AfterCrash::Failing, None));
+    }
+
+    #[tokio::test]
+    async fn a_graphics_card_whose_runtime_dies_under_one_task_keeps_the_work_until_the_third() {
+        use crate::native_predictor::{testing::DyingRuntime, Pool, TaskStep};
+        use crate::provider_selection::tests::{directory, end_rest, plan_on};
+        // The real predictor over a real runtime process that fails under its one task,
+        // three times in a row, judged as the work loop judges it. The second time its
+        // answer only breaks off and the process lingers: the same runtime failing.
+        let runtime = DyingRuntime::build();
+        let manifest = runtime.manifest().to_owned();
+        let data = directory();
+        let mut plan = plan_on(&data, &manifest, "driver-1");
+        assert!(plan.accelerates(&manifest));
+        let server = FakeServer::start();
+        let device = server.enrol();
+        let worker = server.session(&device).await.unwrap();
+        let qualification = server.qualification(&worker).await;
+        let (progress, mut trouble) = (quiet(), RuntimeTrouble::default());
+        let mut judged = Vec::new();
+        for crash in 1..=CRASHES_AT_ONE {
+            runtime.dies(crash != 2);
+            server.queue(&device, 1);
+            let mut predictor = runtime.start("fixture-model", qualification.id());
+            let (_keep, mut cancel) = tokio::sync::watch::channel(false);
+            let claimed = AtomicUsize::new(0);
+            let pool = Pool {
+                slots: &|| None,
+                keep_claiming: &|| claimed.load(Ordering::Acquire) == 0,
+                abandon: &|| {},
+            };
+            let quals = [&qualification];
+            let before = server.claims_received();
+            let ended = predictor
+                .work(
+                    &worker,
+                    &quals,
+                    &mut cancel,
+                    &pool,
+                    |_| {},
+                    |_: TaskStep| {
+                        claimed.fetch_add(1, Ordering::AcqRel);
+                        Some(Duration::ZERO)
+                    },
+                )
+                .await;
+            // Its one task was leased, the prediction broke off, and the predictor (which
+            // then stops every process itself) still names the runtime that died.
+            assert!(server.claims_received() > before);
+            assert_eq!(ended, Err("runtime_prediction_interrupted".into()));
+            assert_eq!(predictor.failed_lane(), Some(manifest.as_str()));
+            assert!(!predictor.is_running().unwrap());
+            // One task in hand (the fixture's model key names no workload, so the claim
+            // is not announced to the caller here).
+            let lane = predictor.failed_lane();
+            judged.push(judge(&mut trouble, &progress, &plan, &ended, None, 1, lane));
+            if crash < CRASHES_AT_ONE {
+                // The graphics card keeps the work, and nothing rests.
+                assert!(plan.accelerates(&manifest) && plan.rest_ends().is_none());
+            }
+        }
+        assert_eq!(
+            judged,
+            [
+                Some(AfterCrash::Again(1)),
+                Some(AfterCrash::Again(2)),
+                Some(AfterCrash::Failing)
+            ]
+        );
+        assert_eq!(progress.capacity_ceiling(), None);
+        // The third: the work loop moves that runtime's work to the processor, with the
+        // reason, and it rests.
+        assert!(plan.demote_runtime(&manifest, "runtime_prediction_interrupted"));
+        assert!(!plan.accelerates(&manifest) && plan.rest_ends().is_some());
+        let next = plan_on(&data, &manifest, "driver-1");
+        assert!(next.rest_ends().is_some() && !next.accelerates(&manifest));
+        assert!(next
+            .providers()
+            .iter()
+            .any(|chosen| chosen.fallback.as_deref() == Some("runtime_prediction_interrupted")));
+        // After the rest the plan made then tries the graphics card again.
+        end_rest(&data);
+        let again = plan_on(&data, &manifest, "driver-1");
+        assert!(again.accelerates(&manifest) && again.rest_ends().is_none());
+        crate::provider_selection::forget(&data);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[tokio::test]
+    async fn claims_for_more_room_back_off_and_a_finished_task_asks_at_once() {
+        use crate::native_predictor::pool_with;
+        let server = FakeServer::start();
+        server.offer_concurrent_leases(2);
+        let device = server.enrol();
+        let worker = server.session(&device).await.unwrap();
+        let qualification = server.qualification(&worker).await;
+        server.queue(&device, 1);
+        let (_keep, mut cancel) = tokio::sync::watch::channel(false);
+        let finished = std::sync::Mutex::new(None);
+        let quals = [&qualification];
+        // One task in hand for a little over three seconds, with room for a second and
+        // nothing more to give: claims at once, then after 1 and 2 seconds (the next would
+        // be 4 seconds on), and one more as soon as the task is done.
+        let steps = pool_with(&worker, &quals, &mut cancel, Some(2), |_| async {
+            tokio::time::sleep(Duration::from_millis(3600)).await;
+            *finished.lock().unwrap() = Some(std::time::Instant::now());
+            Ok(serde_json::json!({}))
+        })
+        .await
+        .unwrap();
+        assert_eq!(steps, [Step::Completed]);
+        let finished = finished.lock().unwrap().unwrap();
+        let times = server.claim_times();
+        // The claim that waited for work, three for more room, the one after the task.
+        assert!(times.len() >= 5, "{times:?}");
+        let gap = |a: usize, b: usize| times[b].duration_since(times[a]).as_millis();
+        assert!((900..1900).contains(&gap(1, 2)), "{}", gap(1, 2));
+        assert!((1900..3400).contains(&gap(2, 3)), "{}", gap(2, 3));
+        // Not four seconds after the last, as the back-off alone would have it.
+        let after = times[4].saturating_duration_since(finished).as_millis();
+        assert!(after < 900, "{after}");
+        assert!(gap(3, 4) < 3900, "{}", gap(3, 4));
+        // The waits the pool uses, in full: 1, 2, 4 and 8 seconds, and never more than 8.
+        let waits: Vec<u64> = (0..7)
+            .map(|empty| crate::native_predictor::refill_wait(empty).as_secs())
+            .collect();
+        assert_eq!(waits, [1, 2, 4, 8, 8, 8, 8]);
+        assert_eq!(crate::native_predictor::refill_wait(u32::MAX).as_secs(), 8);
+    }
+
+    #[tokio::test]
+    async fn the_one_report_of_a_crash_is_sent_again_when_it_does_not_arrive() {
+        use crate::native_predictor::pool_with;
+        let server = FakeServer::start();
+        let device = server.enrol();
+        let worker = server.session(&device).await.unwrap();
+        let qualification = server.qualification(&worker).await;
+        server.queue(&device, 1);
+        server.respond_next(&device, "/fail", 503, serde_json::json!({}));
+        let (_keep, mut cancel) = tokio::sync::watch::channel(false);
+        let quals = [&qualification];
+        let result = pool_with(&worker, &quals, &mut cancel, None, |_| async {
+            Err("runtime_process_stopped".into())
+        })
+        .await;
+        assert_eq!(result, Err("runtime_process_stopped".into()));
+        assert_eq!(server.failures(), ["model-unavailable"]);
+    }
+
+    #[test]
+    fn failed_tasks_are_counted_for_each_model_as_the_server_counts_them() {
+        let (clip, face) = (Some("clip:a"), Some("face:b"));
+        let mut strikes = GrantStrikes::default();
+        // Two failures for one model, with results for another in between: the third still
+        // means the server has withdrawn the first.
+        assert!(!strikes.failed(clip, "worker_execution_deadline"));
+        strikes.completed(face);
+        assert!(!strikes.failed(clip, "server_http_400"));
+        strikes.completed(face);
+        assert!(strikes.failed(clip, "runtime_process_stopped"));
+        // Counted from nothing again after qualifying, and reset by that model's own result.
+        assert!(!strikes.failed(clip, "worker_execution_deadline"));
+        assert!(!strikes.failed(clip, "worker_execution_deadline"));
+        strikes.completed(clip);
+        assert!(!strikes.failed(clip, "worker_execution_deadline"));
+        // What the server does not count is not counted here, nor a step that claimed nothing.
+        for _ in 0..5 {
+            assert!(!strikes.failed(face, "worker_cancelled"));
+            assert!(!strikes.failed(face, "worker_input_invalid"));
+            assert!(!strikes.failed(None, "worker_execution_deadline"));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_the_servers_task_refusals_are_waited_out_as_refused_tasks() {
+        for code in [
+            "desktop_clip_index_changed",
+            "desktop_clip_index_incompatible",
+            "desktop_clip_space_unavailable",
+            "desktop_model_profile_unavailable",
+            "desktop_pool_model_unavailable",
+        ] {
+            assert!(server_task_refusal(code), "{code}");
+        }
+        // This app's own codes stop the worker and say what they mean.
+        for code in [
+            "desktop_protocol_unsupported",
+            "desktop_worker_session_unavailable",
+            "desktop_enrollment_required",
+        ] {
+            assert!(!server_task_refusal(code), "{code}");
+            let attempts = AtomicUsize::new(0);
+            let result = supervise(
+                &quiet(),
+                false,
+                |_| {
+                    attempts.fetch_add(1, Ordering::AcqRel);
+                    async move { Err(code.into()) }
+                },
+                || async { None },
+                ROUTE_POLL,
+            )
+            .await;
+            assert_eq!(result, Err(code.into()));
+            assert_eq!(attempts.load(Ordering::Acquire), 1);
+        }
+        // A timestamp the server refused: waited out and tried again, with the reason shown.
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let seen = statuses.clone();
+        let progress = Progress {
+            notify: Arc::new(move |status: SetupStatus| {
+                seen.lock().unwrap().push((status.state, status.code))
+            }),
+            ..quiet()
+        };
+        let attempts = AtomicUsize::new(0);
+        let result = supervise(
+            &progress,
+            false,
+            |_| {
+                let first = attempts.fetch_add(1, Ordering::AcqRel) == 0;
+                async move {
+                    match first {
+                        true => Err("clock_invalid".into()),
+                        false => Ok(()),
+                    }
+                }
+            },
+            || async { None },
+            ROUTE_POLL,
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            *statuses.lock().unwrap(),
+            [("paused".to_owned(), Some("clock_invalid".to_owned()))]
+        );
+    }
+
+    #[test]
+    fn the_models_to_run_are_compared_by_task_state_and_model_keys() {
+        let current = inventory_fixture();
+        let signature = inventory_signature(&current);
+        assert_eq!(signature.len(), 4);
+        // The same answer, with something new a later server adds and in another order.
+        let mut same = current.clone();
+        same["workloads"].as_array_mut().unwrap().reverse();
+        same["workloads"][0]["somethingNew"] = serde_json::json!(true);
+        assert_eq!(inventory_signature(&same), signature);
+        // Another model for a task.
+        assert_ne!(
+            inventory_signature(&inventory_fixture_with("ViT-B-32__openai")),
+            signature
+        );
+        // A task turned off, and one turned on.
+        let mut disabled = current.clone();
+        disabled["workloads"][1]["state"] = serde_json::json!("disabled");
+        disabled["workloads"][1]["modelKeys"] = serde_json::json!([]);
+        assert_ne!(inventory_signature(&disabled), signature);
+        assert_ne!(
+            inventory_signature(&current),
+            inventory_signature(&disabled)
+        );
+    }
+
+    #[test]
+    fn a_new_field_in_the_inventory_is_ignored_but_a_changed_profile_is_still_refused() {
+        let source = "25b22c16e47a27a2eb50017d838497abce850d11";
+        let mut value = inventory_fixture();
+        value["somethingNew"] = serde_json::json!({"a":1});
+        value["workloads"][0]["somethingNew"] = serde_json::json!("x");
+        let (groups, _) = inventory_profiles(&value, source, "CPUExecutionProvider").unwrap();
+        assert_eq!(groups.len(), 3);
+        // The profile is hashed into its model key: nothing may be added to it.
+        value["workloads"][0]["profiles"][0]["somethingNew"] = serde_json::json!(1);
+        assert!(inventory_profiles(&value, source, "CPUExecutionProvider").is_err());
+    }
+
+    #[test]
+    fn a_refusal_while_qualifying_is_retried_scoped_or_moved_to_the_processor() {
+        use crate::provider_selection::CPU;
+        const CUDA: &str = "CUDAExecutionProvider";
+        for provider in [CPU, CUDA] {
+            // Bookkeeping, and a challenge the server no longer holds: this model again.
+            for code in [
+                "worker_challenge_busy",
+                "worker_qualification_restart",
+                // The same answer every time: asked again a bounded number of times.
+                "worker_challenge_rejected",
+            ] {
+                assert_eq!(refusal(code, provider), Refusal::Again, "{code}");
+            }
+            assert!(!retryable("worker_challenge_rejected"));
+            // The model may have changed: ask the server what to run.
+            for code in [
+                "workload_desktop_model_profile_unavailable",
+                "workload_desktop_model_profile_changed",
+            ] {
+                assert_eq!(refusal(code, provider), Refusal::Models, "{code}");
+            }
+            assert_eq!(
+                refusal("workload_desktop_clip_index_incompatible", provider),
+                Refusal::Task
+            );
+            // A model the server holds back after failed tasks: that task waits out the hold
+            // (five minutes) while the others work, and is then qualified again.
+            assert_eq!(
+                refusal("workload_desktop_qualification_hold", provider),
+                Refusal::Task
+            );
+            assert_eq!(
+                refused_task_retry("workload_desktop_qualification_hold"),
+                Duration::from_secs(330)
+            );
+            assert!(server_task_refusal("desktop_qualification_hold"));
+            // Neither a hold nor another model's index is the provider's doing: the task is
+            // not moved to the processor over it. A changed model still may be.
+            assert!(provider_independent("workload_desktop_qualification_hold"));
+            assert!(provider_independent(
+                "workload_desktop_clip_index_incompatible"
+            ));
+            assert!(!provider_independent(
+                "workload_desktop_model_profile_unavailable"
+            ));
+            assert!(!provider_independent("worker_runtime_unsigned"));
+            assert!(provider_independent(
+                "workload_desktop_clip_space_unavailable"
+            ));
+            assert!(!provider_independent(
+                "workload_desktop_clip_profile_unavailable"
+            ));
+            // Nothing a different provider would change.
+            for code in ["worker_policy_required", "worker_device_refused"] {
+                assert_eq!(refusal(code, provider), Refusal::Stop, "{code}");
+            }
+        }
+        // The server refused what the GPU runtime sent: the processor runtime is tried, and
+        // only a refusal of that one stops the worker.
+        for code in [
+            "worker_runtime_unsigned",
+            "worker_qualification_report_refused",
+            "server_http_400",
+            "server_http_413",
+        ] {
+            assert_eq!(refusal(code, CUDA), Refusal::Processor, "{code}");
+            assert_eq!(refusal(code, CPU), Refusal::Stop, "{code}");
+        }
+        // Memory or a slow moment is not held against the GPU for the whole runtime epoch.
+        for code in ["runtime_out_of_memory", "runtime_qualification_timeout"] {
+            assert!(crate::provider_selection::passing(code), "{code}");
+        }
+        assert!(!crate::provider_selection::passing(
+            "runtime_output_mismatch"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_stop_hands_the_held_lease_back_as_cancelled() {
+        let server = FakeServer::start();
+        let device = server.enrol();
+        let worker = server.session(&device).await.unwrap();
+        let qualification = server.qualification(&worker).await;
+        server.queue(&device, 1);
+        let (stop, mut cancel) = tokio::sync::watch::channel(false);
+        let predicting = tokio::sync::Notify::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            returning_lease(
+                // The model is in the middle of this task and would never finish.
+                step_with(&worker, &[&qualification], &mut cancel, |_| async {
+                    predicting.notify_one();
+                    std::future::pending::<Result<serde_json::Value, String>>().await
+                }),
+                async {
+                    predicting.notified().await;
+                    "worker_setup_cancelled".to_owned()
+                },
+                &stop,
+                LEASE_RETURN,
+            ),
+        )
+        .await
+        .expect("the stop waited for the task");
+        assert_eq!(result, Err("worker_setup_cancelled".into()));
+        // The server heard at once that the task is free, and why.
+        assert_eq!(server.reports(&device), ["fail"]);
+        assert_eq!(server.failures(), ["cancelled"]);
+    }
+
+    #[tokio::test]
+    async fn a_pause_stops_a_model_download_and_keeps_what_was_received() {
+        let paused = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(false);
+        let download = acquisition(
+            std::future::pending::<Result<(), String>>(),
+            true,
+            || async { Ok(()) },
+            std::future::pending(),
+            async {
+                paused.store(true, Ordering::Release);
+                flag_set(&paused).await
+            },
+            &cancelled,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), download).await;
+        // Ended by the pause, not cancelled: the caller waits and continues the same file.
+        assert_eq!(
+            result.expect("the download ignored the pause"),
+            Err("user_paused".into())
+        );
+        assert!(!cancelled.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_to_issue_a_session_keeps_its_name_and_is_waited_out() {
+        for (status, message, code) in [
+            // Policy-off was a 401 here on older servers and is a 403 now.
+            (
+                401,
+                "desktop_pool_policy_required",
+                "worker_policy_required",
+            ),
+            (
+                403,
+                "desktop_pool_policy_required",
+                "worker_policy_required",
+            ),
+            (403, "desktop_worker_lan_required", "worker_lan_required"),
+        ] {
+            let server = FakeServer::start();
+            let device = server.enrol();
+            let saved = SavedSession::default();
+            server.queue(&device, 1);
+            server.respond_next(
+                &device,
+                "/devices/session",
+                status,
+                serde_json::json!({"message":message}),
+            );
+            let statuses = Arc::new(Mutex::new(Vec::new()));
+            let seen = statuses.clone();
+            let progress = Progress {
+                notify: Arc::new(move |status: SetupStatus| {
+                    seen.lock().unwrap().push((status.state, status.code))
+                }),
+                ..quiet()
+            };
+            let routes = AtomicUsize::new(0);
+            let done = || server.completed(&device) == 1;
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                supervise(
+                    &progress,
+                    false,
+                    |refresh| work(&server, &device, &saved, refresh, &|| {}, &done),
+                    || {
+                        let moved = routes.fetch_add(1, Ordering::AcqRel) > 0;
+                        async move { Some(std::net::IpAddr::from([192, 168, 1, 2 + moved as u8])) }
+                    },
+                    Duration::from_millis(20),
+                ),
+            )
+            .await
+            .expect("the worker stayed parked")
+            .unwrap();
+            // Waited with the reason shown, then set up and worked by itself.
+            assert_eq!(
+                *statuses.lock().unwrap(),
+                [("paused".to_owned(), Some(code.to_owned()))],
+                "{status} {message}"
+            );
+            assert_eq!(server.sessions_issued(&device), 1);
+        }
     }
 
     #[tokio::test]

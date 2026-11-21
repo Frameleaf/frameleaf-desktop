@@ -54,7 +54,11 @@ pub(crate) async fn pair_manager(
     let origin = manager::normalize_manager(&origin)?
         .origin()
         .ascii_serialization();
-    manager::require_encrypted(&origin)?;
+    // A name may have to be looked up (three seconds at most): not on this thread.
+    let checked = origin.clone();
+    tauri::async_runtime::spawn_blocking(move || manager::require_encrypted(&checked))
+        .await
+        .map_err(|_| "manager_unreachable_or_certificate_invalid")??;
     let identity = credentials::foreground_identity(&window)?;
     // Confirm secure writes before sending a Manager password; no plaintext fallback.
     credentials::save("manager-pairing-check", &true)?;

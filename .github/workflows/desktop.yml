@@ -45,7 +45,7 @@ jobs:
       - uses: ./.github/actions/python
       - name: Linux native dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev squashfs-tools
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev squashfs-tools cmake
       - name: Linux ELF relocation tooling
         if: runner.os == 'Linux'
         shell: bash
@@ -70,7 +70,27 @@ jobs:
           { echo "CARGO_HOME=$CARGO_HOME"; echo "RUSTUP_HOME=$RUSTUP_HOME"; } >> "$GITHUB_ENV"
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
           echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+      # Forgejo's Ubuntu runner has no rustup either: the same runner-owned toolchain.
+      - name: Runner-owned rustup on the Forgejo Linux host
+        if: github.server_url != 'https://github.com' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO_HOME="$HOME/.cache/forgejo-runner/cargo"
+          RUSTUP_HOME="$HOME/.cache/forgejo-runner/rustup"
+          export CARGO_HOME RUSTUP_HOME
+          # Jobs of other branches can run on the same host at once: one changes the shared
+          # toolchain at a time, here, and the step after this one leaves it alone.
+          mkdir -p "$(dirname "$RUSTUP_HOME")"
+          flock "$RUSTUP_HOME.lock" sh -eu -c '
+            [ -x "$CARGO_HOME/bin/rustup" ] || curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
+            "$CARGO_HOME/bin/rustup" update stable
+            "$CARGO_HOME/bin/rustup" default stable
+            "$CARGO_HOME/bin/rustup" component add rustfmt clippy'
+          { echo "CARGO_HOME=$CARGO_HOME"; echo "RUSTUP_HOME=$RUSTUP_HOME"; } >> "$GITHUB_ENV"
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - name: Rust stable
+        if: github.server_url == 'https://github.com' || runner.os != 'Linux'
         run: rustup update stable && rustup default stable && rustup component add rustfmt clippy
       - name: Reuse Rust dependencies from successful main checks
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -114,6 +134,13 @@ jobs:
           # Diagnostics cannot grant storage admission; the real profile tests below still enforce it.
           $global:LASTEXITCODE = 0
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+        if: runner.os != 'Linux'
+      # Installed files and folders are never group- or world-writable, and the app refuses
+      # ones that are; Forgejo's Linux host runs jobs with umask 002, so tests set 022 first.
+      # Its /tmp is a RAM disk, which the app refuses as a copy destination: tests use the
+      # job's own temporary folder on disk, as on the Forgejo Mac host.
+      - run: umask 022 && TMPDIR="$RUNNER_TEMP" cargo test --locked --manifest-path src-tauri/Cargo.toml
+        if: runner.os == 'Linux'
       - name: Qualify Windows controller dependencies without ambient runtime paths
         if: runner.os == 'Windows'
         shell: pwsh
@@ -245,8 +272,8 @@ jobs:
   # binaries also load on Debian 12. The check job above stays on Ubuntu 24.04, which the host
   # package qualification needs. The steps before the build are the ones the release runs there.
   linux-package:
-    # Not available on Forgejo, which has no Ubuntu 22.04 runner.
-    if: ${{ github.server_url == 'https://github.com' && !inputs.directory_probe && !inputs.keystore_probe }}
+    # On Forgejo this runs on the Unraid slot labelled ubuntu-22.04 (FL-1699).
+    if: ${{ !inputs.directory_probe && !inputs.keystore_probe }}
     runs-on: ubuntu-22.04
     timeout-minutes: 40
     steps:
@@ -261,8 +288,28 @@ jobs:
         with:
           python-version: '3.12'
       - name: Linux native dependencies
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev squashfs-tools
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev squashfs-tools cmake
+      # Forgejo's Ubuntu runner has no rustup either: the same runner-owned toolchain.
+      - name: Runner-owned rustup on the Forgejo Linux host
+        if: github.server_url != 'https://github.com' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO_HOME="$HOME/.cache/forgejo-runner/cargo"
+          RUSTUP_HOME="$HOME/.cache/forgejo-runner/rustup"
+          export CARGO_HOME RUSTUP_HOME
+          # Jobs of other branches can run on the same host at once: one changes the shared
+          # toolchain at a time, here, and the step after this one leaves it alone.
+          mkdir -p "$(dirname "$RUSTUP_HOME")"
+          flock "$RUSTUP_HOME.lock" sh -eu -c '
+            [ -x "$CARGO_HOME/bin/rustup" ] || curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
+            "$CARGO_HOME/bin/rustup" update stable
+            "$CARGO_HOME/bin/rustup" default stable
+            "$CARGO_HOME/bin/rustup" component add rustfmt clippy'
+          { echo "CARGO_HOME=$CARGO_HOME"; echo "RUSTUP_HOME=$RUSTUP_HOME"; } >> "$GITHUB_ENV"
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - name: Rust stable
+        if: github.server_url == 'https://github.com' || runner.os != 'Linux'
         run: rustup update stable && rustup default stable
       - name: Reuse Rust dependencies from successful main checks
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -273,7 +320,8 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run check
-      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      # As in `check`: the umask an installer would use, and a temporary folder on disk.
+      - run: umask 022 && TMPDIR="$RUNNER_TEMP" cargo test --locked --manifest-path src-tauri/Cargo.toml
       - name: Build unsigned shell smoke-test candidate
         run: npm run desktop:build:shell -- --debug
       - name: Check no Linux binary needs a newer C library than Ubuntu 22.04 has
@@ -321,7 +369,27 @@ jobs:
           fltmc.exe instances
           # Diagnostics cannot grant storage admission; the real profile tests below still enforce it.
           $global:LASTEXITCODE = 0
+      # Forgejo's Ubuntu runner has no rustup either: the same runner-owned toolchain.
+      - name: Runner-owned rustup on the Forgejo Linux host
+        if: github.server_url != 'https://github.com' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO_HOME="$HOME/.cache/forgejo-runner/cargo"
+          RUSTUP_HOME="$HOME/.cache/forgejo-runner/rustup"
+          export CARGO_HOME RUSTUP_HOME
+          # Jobs of other branches can run on the same host at once: one changes the shared
+          # toolchain at a time, here, and the step after this one leaves it alone.
+          mkdir -p "$(dirname "$RUSTUP_HOME")"
+          flock "$RUSTUP_HOME.lock" sh -eu -c '
+            [ -x "$CARGO_HOME/bin/rustup" ] || curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
+            "$CARGO_HOME/bin/rustup" update stable
+            "$CARGO_HOME/bin/rustup" default stable
+            "$CARGO_HOME/bin/rustup" component add rustfmt clippy'
+          { echo "CARGO_HOME=$CARGO_HOME"; echo "RUSTUP_HOME=$RUSTUP_HOME"; } >> "$GITHUB_ENV"
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - name: Rust stable
+        if: github.server_url == 'https://github.com' || runner.os != 'Linux'
         run: rustup update stable && rustup default stable
       - name: Qualify private directory admission and long physical paths
         shell: pwsh
@@ -393,7 +461,27 @@ jobs:
       - name: Linux native dependencies and Secret Service
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev dbus-x11 gnome-keyring
+      # Forgejo's Ubuntu runner has no rustup either: the same runner-owned toolchain.
+      - name: Runner-owned rustup on the Forgejo Linux host
+        if: github.server_url != 'https://github.com' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO_HOME="$HOME/.cache/forgejo-runner/cargo"
+          RUSTUP_HOME="$HOME/.cache/forgejo-runner/rustup"
+          export CARGO_HOME RUSTUP_HOME
+          # Jobs of other branches can run on the same host at once: one changes the shared
+          # toolchain at a time, here, and the step after this one leaves it alone.
+          mkdir -p "$(dirname "$RUSTUP_HOME")"
+          flock "$RUSTUP_HOME.lock" sh -eu -c '
+            [ -x "$CARGO_HOME/bin/rustup" ] || curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
+            "$CARGO_HOME/bin/rustup" update stable
+            "$CARGO_HOME/bin/rustup" default stable
+            "$CARGO_HOME/bin/rustup" component add rustfmt clippy'
+          { echo "CARGO_HOME=$CARGO_HOME"; echo "RUSTUP_HOME=$RUSTUP_HOME"; } >> "$GITHUB_ENV"
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - name: Rust stable
+        if: github.server_url == 'https://github.com' || runner.os != 'Linux'
         run: rustup update stable && rustup default stable
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:

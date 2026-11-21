@@ -339,11 +339,23 @@ pub fn normalize_manager(value: &str) -> Result<url::Url, String> {
 /// HTTP would carry its password across networks the owner does not control.
 pub fn require_encrypted(origin: &str) -> Result<(), String> {
     let url = normalize_manager(origin)?;
-    let local = url.host().is_some_and(crate::connection::is_local_network);
-    if url.scheme() == "http" && !local {
-        return Err("manager_https_required".into());
+    // Local by its shape, or a name that leads home (`nas.fritz.box`): connections to such a
+    // name are held to home addresses by this module's client.
+    if url.scheme() == "http" {
+        plain_http_manager(crate::connection::home_server(&url))?;
     }
     Ok(())
+}
+/// Whether a Manager may be reached over plain HTTP, from where its address leads.
+pub(crate) fn plain_http_manager(leads: crate::connection::Leads) -> Result<(), String> {
+    match leads {
+        crate::connection::Leads::Home => Ok(()),
+        // The name can't be found right now: a network problem, not a reason for HTTPS.
+        crate::connection::Leads::Unknown => {
+            Err("manager_unreachable_or_certificate_invalid".into())
+        }
+        crate::connection::Leads::Elsewhere => Err("manager_https_required".into()),
+    }
 }
 fn canonical_origin(value: &str) -> Result<String, String> {
     let url = normalize_manager(value)?;
@@ -386,8 +398,16 @@ pub fn manager_client(
     if normalize_manager(origin)?.scheme() == "http" && (pem.is_some() || approved.is_some()) {
         return Err("manager_http_certificate_invalid".into());
     }
+    // A Manager reached over plain HTTP by a name (one just paired, or a saved one after a
+    // restart) is held to home addresses from here on.
+    crate::connection::hold_plain_http_name(&normalize_manager(origin)?);
     let mut builder = Client::builder()
+        // And connected to directly: a proxy would look the name up itself and be handed the
+        // password or the grant's proof.
+        .proxy(crate::transport::server_proxy())
         .redirect(reqwest::redirect::Policy::none())
+        // A Manager reached over plain HTTP by name is connected to at home addresses only.
+        .dns_resolver(std::sync::Arc::new(crate::connection::HomeResolver))
         .retry(reqwest::retry::never())
         .timeout(Duration::from_secs(30))
         .user_agent(concat!("FrameleafDesktop/", env!("CARGO_PKG_VERSION")));
