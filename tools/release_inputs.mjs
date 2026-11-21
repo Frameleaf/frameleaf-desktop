@@ -58,7 +58,7 @@ export function releaseMatrix(platforms) {
 const noForgejoRunner = {
   "macos-aarch64": "Forgejo's only Mac runner is the owner's own Mac, not a disposable machine to sign, notarize and qualify a release on",
   "macos-x86_64": "Forgejo has no Intel Mac runner",
-  "linux-x86_64": "Forgejo has no Ubuntu 22.04 runner (Linux builds need its glibc 2.35)",
+  // linux-x86_64 builds on the Unraid slot labelled ubuntu-22.04 (FL-1699).
   "linux-aarch64": "Forgejo has no Ubuntu 22.04 Arm runner (Linux builds need its glibc 2.35)",
 };
 /** Why each selected target cannot build on Forgejo: `stage` is "runtime" (factory packs) or "installer". */

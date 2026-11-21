@@ -9,9 +9,10 @@ permissions: {}
 
 jobs:
   issue-key:
-    # GitHub pull requests only; Forgejo only mirrors branches.
+    # On Forgejo this runs on the mirror of each GitHub pull request, which carries its title and body
+    # (github-bridge on Unraid, FL-1699); the result is posted back to the GitHub pull request.
     name: Jira Issue Key
-    if: ${{ github.server_url == 'https://github.com' && (github.repository == 'Frameleaf/frameleaf-desktop') }}
+    if: ${{ github.repository == 'Frameleaf/frameleaf-desktop' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read

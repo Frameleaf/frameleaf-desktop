@@ -662,8 +662,13 @@ The Library 1.2.4 packages were made before this:
   controller `045568dc0bbbe5a582516e83b2d4f11b4122a381cb91a6d29c778aff128b5cc7`
   and manifest `b3ce270798e290f89505e554dee9be0fd3006a49af11fe3bf5d0025dde5d7a74`.
 - Windows x64: only the unsigned 1.2.4 installer exists. A signed one needs the
-  Windows chain above once signing is configured; until then release Windows
-  with `companion_run_ids=none` or leave Windows out.
+  Windows chain above once signing is configured. Until then Windows is released
+  with `companion_run_ids=none`, as every release so far (owner decision for 0.1.7,
+  2026-11-20: "Ship as before"): the Windows installer and its CUDA and OpenVINO
+  packs are staged as usual, no Windows companion package is added, and the
+  release notes say so. Azure signing on Forgejo would need a client secret,
+  since Forgejo cannot issue the GitHub OIDC token `windows-compiled-host.yml`
+  uses.
 
 ### Staging: one draft per tag
 
@@ -853,7 +858,7 @@ validation; macOS and Linux ship without it.
      -f companion_run_ids=<ubuntu-host-qualification run>
    gh workflow run release.yml --repo Frameleaf/frameleaf-desktop --ref main \
      -f tag=v<version> -f platforms=windows -f runtime_run_id=<factory run> \
-     -f companion_run_ids=<windows-compiled-host run>   # needs step 1
+     -f companion_run_ids=none   # no signed Windows companion yet (Reusing a companion package)
    ```
 
    A run that selects several platforms takes their run ids comma-separated.
@@ -900,16 +905,29 @@ retained DMG after acceptance.
 
 ## Releasing from Forgejo
 
-CI runs on the self-hosted Forgejo at https://code.heroapps.ca/Frameleaf/frameleaf-desktop. **Release
-signing and publishing stay on GitHub** (owner, 2026-11-18): the release keys
-(`DESKTOP_RELEASE_ED25519_PRIVATE_KEY` for runtime packs, `TAURI_SIGNING_PRIVATE_KEY` for updates,
-and the Apple set) live only in GitHub's `desktop-release` environment and are not copied to
-Forgejo. `factory-runtime.yml`, `installer-candidates.yml`, `release.yml` and the host signing
-workflows are run on GitHub, and GitHub keeps git, tags and the releases the app downloads from.
+CI and the release chain run on the self-hosted Forgejo at
+https://code.heroapps.ca/Frameleaf/frameleaf-desktop (owner, 2026-11-19). GitHub Actions is no longer
+used, and the keys in its `desktop-release` environment cannot be read back, so Forgejo holds its
+own copies as repository secrets:
 
-The release workflows can also run on Forgejo, but that path is off: they skip there unless the
-repository variable `DESKTOP_RELEASE_ON_FORGEJO` is `true`, and it is not set. Turning it on would
-also need the keys above on Forgejo. For reference, if that ever changes:
+- `TAURI_SIGNING_PRIVATE_KEY`: the original updater key (key id `6FC9088C9E7444A4`, the one
+  pinned in `src-tauri/tauri.conf.json`), so installed apps keep updating in place. It has no
+  password. The owner's copy is the login keychain item `app.frameleaf.desktop.updater-signing`.
+- `DESKTOP_RELEASE_ED25519_PRIVATE_KEY`: the runtime-pack key `desktop-release-2026-11`, made on
+  2026-11-19 because `desktop-release-2026-10` was lost with GitHub. Both stay in
+  `runtime/release-trust.json` and in Library's `server/resources/desktop/release-trust.json`.
+  Library must carry the new key before a pack signed with it ships. An installed app trusts the
+  new key only once it updates to a release that lists it, which the updater key above still
+  delivers. The owner's copy is the keychain item `app.frameleaf.desktop.runtime-signing` (base64
+  of the PKCS8 PEM; decode it before use).
+- Pull requests stay on GitHub, but their checks come from Forgejo. `github-bridge` on Unraid
+  (`/mnt/shaganappi/appdata/forgejo/github-bridge`) runs once a minute: it fast-forwards Forgejo
+  `main` to GitHub's, pushes each open same-repository pull request's branch to Forgejo and opens a
+  mirror pull request there (fork pull requests are never run: the runners are host-mode slots and
+  the owner's machines), and posts each Forgejo job back to GitHub as a commit status named
+  `Forgejo / <workflow> / <job>`. Posting needs a GitHub token in that folder's `github-token` file.
+- The repository variable `DESKTOP_RELEASE_ON_FORGEJO` is `true`. GitHub keeps git tags and the
+  releases the app downloads from, written with `GH_PUBLISH_TOKEN`.
 
 - Forgejo has no environment approval, so that variable stands in for the `desktop-release` gate.
   The draft release on GitHub is written with the organization secret `GH_PUBLISH_TOKEN`.
@@ -918,6 +936,8 @@ also need the keys above on Forgejo. For reference, if that ever changes:
   runs and their artifacts from Forgejo through `tools/forgejo_gh.mjs`. If the job token cannot
   read them, add a repository secret `RUNS_READ_TOKEN` with read access to the repository.
 - A target runs only where Forgejo has a runner it can safely use (`forgejoTargetProblems` in
-  `tools/release_inputs.mjs`). Today that is Windows only (runtime packs and the unsigned
-  installers): there is no Intel Mac or Ubuntu 22.04 runner, and the one Mac runner is the
-  owner's own Mac.
+  `tools/release_inputs.mjs`). Today that is Windows (runtime packs and the unsigned installers)
+  and Linux x86_64, which builds on the Unraid CI slot labelled `ubuntu-22.04` (slot 5, a host-mode
+  slot built from `ghcr.io/catthehacker/ubuntu:runner-22.04`). There is no Intel Mac or Arm Linux
+  runner, and the one Mac runner is the owner's own Mac, so macOS and `linux-aarch64` cannot be
+  released until such runners exist; choose `linux-x86_64` rather than `linux`.

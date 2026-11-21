@@ -272,8 +272,8 @@ jobs:
   # binaries also load on Debian 12. The check job above stays on Ubuntu 24.04, which the host
   # package qualification needs. The steps before the build are the ones the release runs there.
   linux-package:
-    # Not available on Forgejo, which has no Ubuntu 22.04 runner.
-    if: ${{ github.server_url == 'https://github.com' && !inputs.directory_probe && !inputs.keystore_probe }}
+    # On Forgejo this runs on the Unraid slot labelled ubuntu-22.04 (FL-1699).
+    if: ${{ !inputs.directory_probe && !inputs.keystore_probe }}
     runs-on: ubuntu-22.04
     timeout-minutes: 40
     steps:
