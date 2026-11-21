@@ -271,9 +271,10 @@ lease".
   reported `model-unavailable` first, and only then are the others handed back `cancelled`, so the server's
   count toward withdrawing the model goes up by one, not by the number of tasks. If that one
   report does not arrive it is sent once more, and failing that the next task still in hand
-  carries it, so the crash is not counted as nothing. The server
-  protects itself as well: failures of one model from one desktop within 10 seconds of the
-  first count as one.
+  carries it, so the crash is not counted as nothing. This is a
+  requirement on the desktop: the server does not group failures by time or by lease, so three
+  tasks each reported as failed are three failures and withdraw the model (see Grant
+  withdrawal).
 - **The heartbeat starts at the claim**, and runs while the task's input is fetched as well as
   while the model works. Inputs of several tasks are downloaded side by side.
 - **Each lease is its own.** Its own input, heartbeat, result and failure. A failure, a refused
@@ -340,10 +341,38 @@ revision's key. `task.qualificationId` is the desktop's current qualification fo
   or the model refuses that one input, `model-unavailable` when its runtime process stopped, and
   `inference-failed` otherwise. Pause (the person's own) lets the task in hand finish first.
 - `cancelled` puts the task straight back in line and does not count toward the three failures
-  after which the task itself fails. The other three codes each count.
-- **Grant withdrawal.** After three `inference-failed` or `model-unavailable` in a row from one
-  worker session for one model (a result in between resets the count; `cancelled` and
-  `input-invalid` do not count), the server withdraws that model from the desktop: its
+  after which the task itself fails, for the first five times one task is handed back (by any
+  computers). A task the server takes back itself when it withdraws a model is recorded as
+  handed back too, and counts toward those five. A further `cancelled` for that task is recorded as
+  a failed attempt, and the task fails at its third failed attempt. The other three codes each
+  count.
+- **Grant withdrawal.** The server counts, per computer and model, failures
+  (`inference-failed`, `model-unavailable`). Every one counts; `input-invalid` does not. At the
+  third it withdraws that model from the desktop. A result the server accepts starts the count
+  again, and so does an hour without a failure.
+  - **One crash is one failure, because of what the desktop reports.** When its runtime dies
+    with several tasks in hand, the desktop reports `model-unavailable` for one of them and
+    `cancelled` for the rest. The server does not group failures by time or by lease: three
+    tasks each reported as failed are three failures and withdraw the model. The tasks handed
+    back by a crash, with no new lease of that model in between, are part of its one failure
+    and are not counted as a hand-back. The order of the reports does not matter: a crash is
+    one failure and no hand-back either way. A second `model-unavailable` is a second
+    failure.
+  - **Handing work back.** `cancelled` puts the task straight back in line and is not a
+    failure. Hand-backs with no new lease of that model taken in between are one hand-back,
+    below the five and above them, so a stop, pause or crash with any number of leases counts
+    once. Five hand-backs of one model are tolerated in a window of 600 seconds, fixed from the
+    first hand-back; each further one in that window counts as a failure, so a computer that
+    only ever hands work back loses the model at the eighth. An accepted result, or the end of
+    the window, starts the hand-back count again. A lease the server made while the connection
+    was closing, and takes back itself, counts as a hand-back too. The desktop hands work back
+    on Stop, sign-out, a library switch, quitting, a pause for power or network, waking from
+    sleep, a crash (all but one of the tasks in hand), and for a lease that arrives after it
+    stopped claiming. Each is one hand-back, and none of them comes five times in ten minutes
+    in normal use. The person's own Pause hands nothing back: the tasks in hand are finished
+    and reported, and only a lease that arrives after the pause goes back.
+
+  When a model is withdrawn: its
   qualification is deleted, `claim` returns nothing for it and
   `GET /worker/qualifications/{id}` answers `401 desktop_qualification_invalid`. The desktop's
   other tasks of that model in hand go back to the queue at once: their leases end (heartbeat
@@ -354,11 +383,15 @@ revision's key. `task.qualificationId` is the desktop's current qualification fo
   grant it again. The desktop keeps a count of its own to notice this without being told: for
   each model, the failures it reported as `inference-failed` or `model-unavailable` since that
   model's last result, counting only reports the server acknowledged. At the third it qualifies
-  again. The two counts can differ (the server counts failures within 10 seconds as one, the
-  desktop counts each); when the desktop is early, qualifying again is harmless, and when it is
-  late the withdrawal notice below tells it. The server keeps its count per device and model
-  (a new session does not reset it) and answers that qualification with
-  `409 desktop_qualification_hold` for 5 minutes, which the desktop waits out for that model.
+  again. The two counts can differ (the server also counts hand-backs past the fifth, and its count
+  lapses after an hour without a failure; the desktop counts only the failures it reported); when the desktop is early, the model was not withdrawn and the
+  qualification is simply granted; when it is late the withdrawal notice below tells it. A
+  granted qualification starts the server's count for that model again, failures and
+  hand-backs alike, whether or not the model had been withdrawn: after two counted failures
+  and an early qualification, the next failure is the first, not the third. The server keeps
+  its count per device and model (a new session does not reset it) and, after a withdrawal,
+  answers that qualification with `409 desktop_qualification_hold` for 5 minutes, which the
+  desktop waits out for that model.
 - **Withdrawal notice.** The server's count outlives a desktop's restart, so it can withdraw a
   model the desktop still believes it holds. When the server advertises
   `features.workerWithdrawalNotice`, the desktop adds `"reportWithdrawn": true` to its claim
