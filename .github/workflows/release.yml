@@ -602,8 +602,10 @@ jobs:
           set -euo pipefail
           # A factory run without downloadable packs (macOS) has no such artifacts, and gh refuses
           # a pattern that matches nothing; the step below accepts a release without packs.
-          packs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUNTIME_RUN_ID/artifacts?per_page=100" \
-            --jq '.artifacts[] | select(.expired == false) | .name' | grep -c '^factory-accelerated-' || true)
+          # The listing is read on its own line: if it fails, the step fails, and is not read as "no packs".
+          names=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUNTIME_RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.expired == false) | .name')
+          packs=$(grep -c '^factory-accelerated-' <<< "$names" || true)
           if [[ "$packs" != 0 ]]; then
             gh run download "$RUNTIME_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'factory-accelerated-*' --dir accelerated-packs
           fi
