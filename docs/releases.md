@@ -812,7 +812,7 @@ validation; macOS and Linux ship without it.
    The commit to release is `<commit>`; `node tools/release_inputs.mjs v<version>`
    on it prints the tag.
 4. **Build the runtime packs** on `main`, at or before `<commit>`, with the next
-   epoch ([Runtime epoch](#runtime-epoch): 9), for every platform being
+   epoch ([Runtime epoch](#runtime-epoch): 13), for every platform being
    released. Separate runs per platform are fine; note each run id. A run is
    only accepted by the release when every platform in it succeeded, so build
    Intel by itself until it has succeeded once.
