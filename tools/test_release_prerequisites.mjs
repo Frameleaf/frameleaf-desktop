@@ -8,8 +8,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   checkCatalogueAgainstServer, checkCompanionArtifact, checkCompanionIdentity, checkCompanionWithoutIdentity, checkFactoryArtifacts,
-  checkFactoryEpoch, checkFactoryPack, checkWindowsSigning, companionNote, companionProducers, companionRunIds, companionSummary,
-  latestServerRelease, planCompanions, recordCompanion, windowsSigningVariables,
+  checkFactoryEpoch, checkFactoryPack, checkLinuxTests, checkWindowsSigning, companionNote, companionProducers, companionRunIds, companionSummary,
+  latestServerRelease, linuxTestsJob, planCompanions, recordCompanion, windowsSigningVariables,
 } from "./release_prerequisites.mjs";
 import { HOST_REQUIRED, HOST_ROLES } from "./sign_host_runtime.mjs";
 import { releaseMatrix, releasePlatformChoices } from "./release_inputs.mjs";
@@ -58,6 +58,56 @@ test("Windows release installers are unsigned by design; the companion host keep
   const missing = call(["windows-signing"], { GITHUB_REPOSITORY: repository, ...Object.fromEntries(windowsSigningVariables.map((name) => [name, name.startsWith("AZURE_SIGNING_P") ? "" : "set"])) });
   assert.equal(missing.status, 1);
   assert.match(missing.stderr, /^::error::windows_signing_unconfigured: AZURE_SIGNING_PROFILE is not set\./);
+});
+
+test("a tagged Forgejo release needs desktop.yml's Linux tests to have passed on its exact git tree", async () => {
+  const tree = "a".repeat(40), other = "b".repeat(40);
+  const job = (status, attempt = 1, name = linuxTestsJob) => ({ name, status, attempt });
+  const forgejoApi = (runs, trees, jobs) => async (path) => {
+    if (path.startsWith("actions/runs?")) {
+      assert.match(path, /workflow_id=desktop\.yml/);
+      const page = Number(/page=(\d+)/.exec(path)[1]);
+      return { workflow_runs: runs.slice((page - 1) * 50, page * 50) };
+    }
+    const commit = /^git\/commits\/(.+)$/.exec(path)?.[1];
+    if (commit) {
+      if (!(commit in trees)) throw new Error(`forgejo_gh_http_404: ${path}`);
+      return { commit: { tree: { sha: trees[commit] } } };
+    }
+    return jobs[/^actions\/runs\/(\d+)\/jobs$/.exec(path)[1]];
+  };
+  const run = (id, commit_sha, workflow_id = "desktop.yml") => ({ id, commit_sha, workflow_id });
+
+  // The squash commit's own run was cancelled; its green PR head has the same tree.
+  const squash = forgejoApi([run(9, "squash"), run(8, "head")], { squash: tree, head: tree }, { 9: [job("cancelled")], 8: [job("success"), job("failure", 1, "check (macos-latest)")] });
+  assert.match(await checkLinuxTests(tree, squash), /passed on tree a{40} in desktop\.yml run 8 \(commit head\)/);
+  // A success beyond the first page is found, past a commit Forgejo no longer has.
+  const old = Array.from({ length: 50 }, (_, i) => run(100 + i, "gone"));
+  assert.match(await checkLinuxTests(tree, forgejoApi([...old, run(7, "head")], { head: tree }, { 7: [job("success")] })), /run 7/);
+
+  for (const [name, api] of [
+    ["another tree", forgejoApi([run(1, "c")], { c: other }, { 1: [job("success")] })],
+    ["failed", forgejoApi([run(1, "c")], { c: tree }, { 1: [job("failure")] })],
+    ["skipped by a probe", forgejoApi([run(1, "c")], { c: tree }, { 1: [job("skipped")] })],
+    ["only another job passed", forgejoApi([run(1, "c")], { c: tree }, { 1: [job("success", 1, "check (macos-latest)")] })],
+    ["a re-run failed", forgejoApi([run(1, "c")], { c: tree }, { 1: [job("success", 1), job("failure", 2)] })],
+    ["another workflow", forgejoApi([run(1, "c", "release.yml")], { c: tree }, { 1: [job("success")] })],
+    ["no runs", forgejoApi([], {}, {})],
+  ]) await assert.rejects(checkLinuxTests(tree, api), /^Error: linux_tests_missing: no desktop\.yml run has a successful check \(ubuntu-24\.04\) job/, name);
+
+  // Anything Forgejo cannot answer stops the release.
+  await assert.rejects(checkLinuxTests(tree, async () => { throw new Error("forgejo_gh_http_500: actions/runs"); }), /forgejo_gh_http_500/);
+  await assert.rejects(checkLinuxTests(tree, async () => ({})), /linux_tests_listing_invalid/);
+  await assert.rejects(checkLinuxTests(tree, forgejoApi([run(1, "c")], { c: tree }, { 1: { message: "no" } })), /linux_tests_listing_invalid/);
+  const commitDown = async (path) => { if (path.startsWith("actions/runs?")) return { workflow_runs: [run(1, "c")] }; throw new Error(`forgejo_gh_http_503: ${path}`); };
+  await assert.rejects(checkLinuxTests(tree, commitDown), /forgejo_gh_http_503/);
+  for (const bad of [undefined, "main", "A".repeat(40)]) await assert.rejects(checkLinuxTests(bad, squash), /linux_tests_tree_invalid/);
+
+  // The check is in `prepare`, before the build, for tagged Forgejo runs, and desktop.yml still has the job.
+  const workflow = read(".github/workflows/release.yml");
+  const prepare = workflow.slice(workflow.indexOf("\n  prepare:"), workflow.indexOf("\n  build:"));
+  assert.match(prepare, /if: github\.server_url != 'https:\/\/github\.com' && inputs\.tag != ''\n {8}shell: bash\n {8}run: \|\n {10}set -euo pipefail\n {10}tree=\$\(git rev-parse --verify "\$GITHUB_SHA\^\{tree\}"\)\n.*release_prerequisites\.mjs linux-tests "\$tree"/);
+  assert.match(read(".github/workflows/desktop.yml"), /\n  check:\n[^]*?os: \[macos-latest, windows-latest, ubuntu-24\.04\]/);
 });
 
 test("a factory epoch at or below one already used is refused, and the message says which to use", () => {

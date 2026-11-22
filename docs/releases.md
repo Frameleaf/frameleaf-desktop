@@ -933,6 +933,9 @@ own copies as repository secrets:
 - The repository variable `DESKTOP_RELEASE_ON_FORGEJO` is `true`. GitHub keeps git tags and the
   releases the app downloads from, written with `GH_PUBLISH_TOKEN`.
 
+- The release's Linux build runs as root and skips `cargo test`, so a tagged release is refused in
+  `prepare` until `desktop.yml` has a successful `check (ubuntu-24.04)` job on a commit with the
+  release revision's exact git tree (a squash merge has its green PR head's tree).
 - Forgejo has no environment approval, so that variable stands in for the `desktop-release` gate.
   The draft release on GitHub is written with the organization secret `GH_PUBLISH_TOKEN`.
 - Run ids (`runtime_run_id`, `companion_run_ids`, approvals) are Forgejo's API ids, which a job
