@@ -219,7 +219,9 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: 22
-          cache: npm
+          # Forgejo's Mac and Windows runners are the owner's own machines: there the npm cache is the
+          # user's own folder, and caching it copies all of it out and back over it on every run.
+          cache: ${{ (github.server_url == 'https://github.com' || runner.os == 'Linux') && 'npm' || '' }}
       # On Forgejo's Mac host setup-python would install under /Users/runner: a runner-owned Python.
       - uses: ./.github/actions/python
       - name: Linux native dependencies
@@ -263,6 +265,12 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run check
+      # As in desktop.yml: a Windows test runs the host's pinned Node (tools/build_host_windows_support.py).
+      - name: Use the pinned host Node for actual Windows interop tests
+        if: runner.os == 'Windows'
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '26.11.1'
       # On Forgejo the Linux build runs as root in an Ubuntu 22.04 container on the container's own
       # filesystem, where tests of unreadable files and of the disks the app accepts cannot hold. The
       # same tests run in desktop.yml's `check` on this commit (as an ordinary user, on disk).
