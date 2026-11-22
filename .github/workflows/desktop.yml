@@ -320,8 +320,13 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run check
-      # As in `check`: the umask an installer would use, and a temporary folder on disk.
+      # As in `check`: the umask an installer would use, and a temporary folder on disk. On Forgejo this job
+      # runs as root in an Ubuntu 22.04 container on the container's own filesystem: tests of unreadable
+      # files and of the disks the app accepts cannot hold there. The same tests run in `check` on this
+      # commit (as an ordinary user, on disk); this job keeps what only it proves: the 22.04 package, its
+      # C library floor, and installing and running it.
       - run: umask 022 && TMPDIR="$RUNNER_TEMP" cargo test --locked --manifest-path src-tauri/Cargo.toml
+        if: github.server_url == 'https://github.com'
       - name: Build unsigned shell smoke-test candidate
         run: npm run desktop:build:shell -- --debug
       - name: Check no Linux binary needs a newer C library than Ubuntu 22.04 has
