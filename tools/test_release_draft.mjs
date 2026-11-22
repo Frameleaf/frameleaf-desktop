@@ -234,3 +234,14 @@ test("the release workflow stages through the merge tool and never replaces a pa
   assert.match(workflow, /gh release create "\$RELEASE_TAG" [^\n]*--draft --prerelease/);
   assert.doesNotMatch(workflow, /gh release (?:delete|edit [^\n]*--draft=false)|--latest/);
 });
+
+test("a Windows run adds its unsigned installers to a draft that already has a feed, and cannot start one", () => {
+  const unsigned = { assets: [asset("Frameleaf_1.2.3_x64-setup-unsigned.exe")], manifest: { version: "1.2.3", platforms: {} } };
+  assert.throws(() => merge(null, unsigned), /update_assets_missing/);
+  const first = merge(null, macos());
+  const existing = { assets: [...macos().assets, asset("latest.json", first.manifestText), asset("SHA256SUMS", first.checksums)], manifest: first.manifest };
+  const merged = merge(existing, unsigned);
+  assert.deepEqual(merged.upload, ["Frameleaf_1.2.3_x64-setup-unsigned.exe"]);
+  assert.deepEqual(merged.manifest, first.manifest);
+  assert.match(merged.checksums, /Frameleaf_1\.2\.3_x64-setup-unsigned\.exe/);
+});

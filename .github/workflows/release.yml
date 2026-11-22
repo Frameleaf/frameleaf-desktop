@@ -561,6 +561,7 @@ jobs:
       - name: Verify updater signatures and create this run's manifest
         env:
           RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_PLATFORMS: ${{ inputs.platforms }}
         shell: bash
         run: |
           set -euo pipefail
@@ -570,7 +571,12 @@ jobs:
           const dir = "release-assets";
           const packages = readdirSync(dir).filter(name => /\.(app\.tar\.gz|AppImage|deb|exe|msi)$/.test(name) && !/-unsigned\./.test(name));
           const signatures = Object.fromEntries(packages.map(name => [name, readFileSync(`${dir}/${name}.sig`, "utf8")]));
-          const manifest = updateManifest(process.env.RELEASE_TAG, process.env.GITHUB_REPOSITORY, signatures);
+          // Unsigned Windows installers never enter the update feed, so a Windows run adds nothing to it.
+          // The draft merge still refuses a draft whose feed is empty: release Windows after another platform.
+          const windowsOnly = process.env.RELEASE_PLATFORMS === "windows" && !packages.length;
+          const manifest = windowsOnly
+            ? { version: process.env.RELEASE_TAG.slice(1), platforms: {} }
+            : updateManifest(process.env.RELEASE_TAG, process.env.GITHUB_REPOSITORY, signatures);
           const { plugins: { updater } } = JSON.parse(readFileSync("src-tauri/tauri.conf.json", "utf8"));
           for (const name of packages) verifyUpdaterAsset(`${dir}/${name}`, signatures[name], updater.pubkey, manifest.version);
           writeFileSync(`${process.env.RUNNER_TEMP}/incoming-latest.json`, JSON.stringify(manifest));
