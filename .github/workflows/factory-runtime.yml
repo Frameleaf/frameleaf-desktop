@@ -81,7 +81,11 @@ jobs:
               });
           }
           const delivered = packs.filter((pack) => pack.delivered);
-          for (const [name, include] of [['matrix', packs], ['installer', packs.filter((pack) => !pack.delivered)], ['delivered', delivered]])
+          // Forgejo never starts a job that needs a matrix job with no entries, so `sign` would wait
+          // for ever when nothing is delivered (macOS). `deliver` then gets one placeholder entry,
+          // which its `if` (has_delivered) skips.
+          const deliverJobs = delivered.length ? delivered : [{ os: 'ubuntu-24.04', pack: 'none' }];
+          for (const [name, include] of [['matrix', packs], ['installer', packs.filter((pack) => !pack.delivered)], ['delivered', deliverJobs]])
             appendFileSync(process.env.GITHUB_OUTPUT, `${name}=${JSON.stringify({ include })}\n`);
           appendFileSync(process.env.GITHUB_OUTPUT, `has_delivered=${delivered.length > 0}\n`);
           JS
