@@ -862,6 +862,9 @@ validation; macOS and Linux ship without it.
      -f companion_run_ids=none   # no signed Windows companion yet (Reusing a companion package)
    ```
 
+   Run `windows` after another platform: its unsigned installers are not in the update feed, so a
+   Windows run adds to a draft that already has one and cannot start the draft by itself.
+
    A run that selects several platforms takes their run ids comma-separated.
    `companion_run_ids=none` stages a platform without its companion package,
    which then has to be added to the draft by hand.
