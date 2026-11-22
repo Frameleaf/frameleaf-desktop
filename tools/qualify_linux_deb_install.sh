@@ -73,9 +73,12 @@ for image in "${images[@]}"; do
       [[ $ran -gt 0 ]] || { echo "::error::The package installed no binary in /usr/bin"; exit 1; }
       echo "Installed binaries run in this distribution."
     ')
+  # An interrupted check must not leave the container on a persistent runner.
+  trap 'docker rm --force "$id" > /dev/null 2>&1 || true' EXIT
   status=0
   docker cp "$package" "$id:/tmp/package.deb" && docker start --attach "$id" || status=$?
   docker rm --force "$id" > /dev/null
+  trap - EXIT
   [[ $status == 0 ]] || exit "$status"
   echo '::endgroup::'
 done
