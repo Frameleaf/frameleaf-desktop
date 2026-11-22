@@ -388,8 +388,8 @@ different pack with the same epoch (`runtime_epoch_reused`), so an epoch is
 never used twice for different bytes on one platform, and never goes down.
 
 `runtime/factory-epochs.json` records `highestUsedEpoch`: the highest epoch any
-pack was built with for a release or a draft. It is 8 (the 0.1.6 draft pack; the
-packs built on November 9 for 0.1.5 used 6), so the next epoch to use is **9**. The factory workflow
+pack was built with for a release or a draft. It is 12 (the packs of the published
+0.1.9 release), so the next epoch to use is **13**. The factory workflow
 has no default epoch: `epoch` must be given and must be above the record, and a
 tagged release refuses a pack whose epoch is not above it. Every platform of one
 release uses the same new epoch, in one factory run or several. After the
@@ -399,7 +399,7 @@ with the same epoch reached a draft or a tester needs the next epoch: raise the
 record first.
 
 ```sh
-gh workflow run factory-runtime.yml --ref main -f platforms=all -f epoch=9 -f accelerated=default
+gh workflow run factory-runtime.yml --ref main -f platforms=all -f epoch=13 -f accelerated=default
 ```
 
 The app installs the accelerated manifest in its own store and qualifies each
@@ -812,7 +812,7 @@ validation; macOS and Linux ship without it.
    The commit to release is `<commit>`; `node tools/release_inputs.mjs v<version>`
    on it prints the tag.
 4. **Build the runtime packs** on `main`, at or before `<commit>`, with the next
-   epoch ([Runtime epoch](#runtime-epoch): 9), for every platform being
+   epoch ([Runtime epoch](#runtime-epoch): 13), for every platform being
    released. Separate runs per platform are fine; note each run id. A run is
    only accepted by the release when every platform in it succeeded, so build
    Intel by itself until it has succeeded once.
@@ -823,7 +823,7 @@ validation; macOS and Linux ship without it.
 
    ```sh
    gh workflow run factory-runtime.yml --repo Frameleaf/frameleaf-desktop --ref main \
-     -f platforms=<platforms> -f epoch=9 -f accelerated=default
+     -f platforms=<platforms> -f epoch=13 -f accelerated=default
    ```
 
    With `accelerated=default` a `windows` or `linux` run also builds the CUDA and
