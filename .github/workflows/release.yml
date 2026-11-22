@@ -107,6 +107,14 @@ jobs:
             --jq '.artifacts[] | {name, expired}' > "$RUNNER_TEMP/runtime-artifacts.jsonl"
           node tools/release_prerequisites.mjs factory-artifacts "$RUNNER_TEMP/runtime-artifacts.jsonl" "$RELEASE_PLATFORMS" "$RUNTIME_RUN_ID"
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
+      # The Linux build below skips `cargo test` on Forgejo, so a release needs desktop.yml's result.
+      - name: Require desktop.yml's Linux tests on this exact tree
+        if: github.server_url != 'https://github.com' && inputs.tag != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree=$(git rev-parse --verify "$GITHUB_SHA^{tree}")
+          { echo '### Linux tests'; node tools/release_prerequisites.mjs linux-tests "$tree"; } | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Check every selected pack's source, profile and epoch before anything is built
         env:
           RELEASE_TAG: ${{ inputs.tag }}
@@ -273,7 +281,8 @@ jobs:
           node-version: '26.11.1'
       # On Forgejo the Linux build runs as root in an Ubuntu 22.04 container on the container's own
       # filesystem, where tests of unreadable files and of the disks the app accepts cannot hold. The
-      # same tests run in desktop.yml's `check` on this commit (as an ordinary user, on disk).
+      # same tests run in desktop.yml's `check` (as an ordinary user, on disk), and `prepare` refuses
+      # a tagged release until that job has passed on this commit's git tree.
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
         if: github.server_url == 'https://github.com' || runner.os != 'Linux'
       - uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7

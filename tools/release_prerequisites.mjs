@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { forgejo } from "./forgejo_gh.mjs";
 import { sha256File } from "./release_draft.mjs";
 import { releaseMatrix, validateDispatchRun } from "./release_inputs.mjs";
 import { parseChecksums } from "./release_packaging.mjs";
@@ -37,6 +38,51 @@ export function checkWindowsSigning(environment, repository) {
       "(docs/releases.md, Azure Artifact Signing setup). The other platforms can be released without them.",
     );
   }
+}
+
+// --- Linux tests on Forgejo ------------------------------------------------------------------
+
+export const linuxTestsJob = "check (ubuntu-24.04)";
+
+/**
+ * On Forgejo the release's Linux build runs as root and skips `cargo test`, so a tagged release
+ * needs this job to have passed in desktop.yml on the same git tree. The tree, not the commit: a
+ * squash merge has its green PR head's tree, and desktop.yml cancels superseded runs. Any failed
+ * request stops the release; only a commit Forgejo no longer has is passed over.
+ */
+export async function checkLinuxTests(tree, request = forgejo) {
+  if (typeof tree !== "string" || !/^[a-f0-9]{40}$/.test(tree)) throw new Error("linux_tests_tree_invalid: expected the release revision's git tree");
+  const trees = new Map();
+  const treeOf = async (sha) => {
+    if (!trees.has(sha)) {
+      try { trees.set(sha, (await request(`git/commits/${sha}`))?.commit?.tree?.sha); }
+      catch (error) {
+        if (!String(error.message).startsWith("forgejo_gh_http_404:")) throw error;
+        trees.set(sha, undefined);
+      }
+    }
+    return trees.get(sha);
+  };
+  // ponytail: scans every desktop.yml run when none matches; stop at an age limit if that gets slow.
+  for (let page = 1; ; page++) {
+    const runs = (await request(`actions/runs?workflow_id=desktop.yml&page=${page}&limit=50`))?.workflow_runs;
+    if (!Array.isArray(runs)) throw new Error("linux_tests_listing_invalid: Forgejo did not return a list of desktop.yml runs");
+    if (!runs.length) break;
+    for (const run of runs) {
+      if (run.workflow_id !== "desktop.yml" || await treeOf(run.commit_sha) !== tree) continue;
+      const jobs = await request(`actions/runs/${run.id}/jobs`);
+      if (!Array.isArray(jobs)) throw new Error("linux_tests_listing_invalid: Forgejo did not return a list of jobs");
+      // A re-run replaces the earlier result, so only the latest attempt counts.
+      const named = jobs.filter((job) => job.name === linuxTestsJob);
+      const latest = Math.max(...named.map((job) => job.attempt || 1));
+      if (named.length && named.filter((job) => (job.attempt || 1) === latest).every((job) => job.status === "success"))
+        return `${linuxTestsJob} passed on tree ${tree} in desktop.yml run ${run.id} (commit ${run.commit_sha}).`;
+    }
+  }
+  throw new Error(
+    `linux_tests_missing: no desktop.yml run has a successful ${linuxTestsJob} job for git tree ${tree}. ` +
+    "The release's Linux build does not run these tests on Forgejo. Run desktop.yml on this commit, wait for that job to pass, and start the release again.",
+  );
 }
 
 // --- Runtime epoch ---------------------------------------------------------------------------
@@ -351,6 +397,7 @@ export function companionNote({ attach, manual }) {
 const lines = (path) => readFileSync(path, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
 const commands = {
   "windows-signing": () => checkWindowsSigning(process.env, process.env.GITHUB_REPOSITORY),
+  "linux-tests": async ([tree]) => console.log(await checkLinuxTests(tree)),
   "factory-epoch": ([epoch]) => console.log(checkFactoryEpoch(epoch)),
   "factory-artifacts": ([file, platforms, run]) => checkFactoryArtifacts(lines(file), platforms, run),
   "factory-pack": ([target, directory, tagged]) => {
