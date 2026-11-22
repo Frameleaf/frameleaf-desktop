@@ -321,7 +321,9 @@ jobs:
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         shell: bash
-        run: npm run tauri -- build --config "$GITHUB_WORKSPACE/release-config.json" -- --locked
+        # umask 022: Forgejo's Ubuntu 22.04 container runs jobs with umask 000, and the AppImage keeps
+        # the modes its folders are created with; installed files are never group- or world-writable.
+        run: umask 022 && npm run tauri -- build --config "$GITHUB_WORKSPACE/release-config.json" -- --locked
       - name: Check the app and its AI runtime need no newer macOS than each declares
         if: runner.os == 'macOS'
         shell: bash
@@ -596,7 +598,17 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
           RUNTIME_RUN_ID: ${{ inputs.runtime_run_id }}
         shell: bash
-        run: gh run download "$RUNTIME_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'factory-accelerated-*' --dir accelerated-packs
+        run: |
+          set -euo pipefail
+          # A factory run without downloadable packs (macOS) has no such artifacts, and gh refuses
+          # a pattern that matches nothing; the step below accepts a release without packs.
+          # The listing is read on its own line: if it fails, the step fails, and is not read as "no packs".
+          names=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUNTIME_RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.expired == false) | .name')
+          packs=$(grep -c '^factory-accelerated-' <<< "$names" || true)
+          if [[ "$packs" != 0 ]]; then
+            gh run download "$RUNTIME_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'factory-accelerated-*' --dir accelerated-packs
+          fi
       - name: Verify the downloadable GPU runtime parts and stage them as release files
         shell: bash
         run: |
