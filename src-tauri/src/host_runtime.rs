@@ -276,6 +276,19 @@ impl VerifiedHostRuntime {
             sha256: artifact.sha256.clone(),
         })
     }
+    /// This package's FFmpeg, with the files in its folder read again against the signed list.
+    pub(crate) fn ffmpeg(&self) -> Result<PathBuf, String> {
+        let role = &self.manifest.entry_points.ffmpeg;
+        let folder = Path::new(role)
+            .parent()
+            .ok_or("host_manifest_incompatible")?;
+        for (name, artifact) in &self.manifest.files {
+            if Path::new(name).starts_with(folder) {
+                crate::native_runtime::verify_file(&self.root, name, artifact)?;
+            }
+        }
+        Ok(self.root.join(role))
+    }
     pub fn manager_programs(&self) -> Result<crate::manager_host::Programs<'_>, String> {
         let programs = crate::manager_host::Programs {
             runtime: self,

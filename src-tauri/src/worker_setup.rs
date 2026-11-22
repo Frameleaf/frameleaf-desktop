@@ -957,7 +957,7 @@ async fn wait_for_capacity<F: Future<Output = Result<(), String>>>(
         .await?;
     }
 }
-fn wake_gap(previous: std::time::SystemTime, current: std::time::SystemTime) -> bool {
+pub(crate) fn wake_gap(previous: std::time::SystemTime, current: std::time::SystemTime) -> bool {
     current
         .duration_since(previous)
         .map_or(true, |gap| gap > Duration::from_secs(30))
@@ -1585,7 +1585,6 @@ async fn prepare_on(
 ) -> Result<(), String> {
     use crate::{
         ml_transport::WorkerTransport,
-        native_predictor::Step,
         release_policy::open_runtime_store,
         runtime_store::{private_directory, read_bounded},
         transport,
@@ -1674,6 +1673,44 @@ async fn prepare_on(
         .with_clock_skew(caps.clock_skew_ms)
         .with_withdrawal_notice(caps.features.worker_withdrawal_notice)
         .with_concurrent_leases(several_leases);
+    // FL-1760: video conversions run beside the AI work on the same signed connection, and are
+    // handed back before this returns, because the next setup loads a new one.
+    let ended = AtomicBool::new(false);
+    let signals = crate::transcode_runner::Signals {
+        cancelled: &progress.cancelled,
+        paused: &progress.user_paused,
+        ended: &ended,
+    };
+    let (outcome, ()) = tokio::join!(
+        async {
+            let outcome = serve(
+                &worker,
+                several_leases,
+                installed,
+                attestation,
+                paths.clone(),
+                allow_download,
+                progress.clone(),
+            )
+            .await;
+            ended.store(true, Ordering::Release);
+            outcome
+        },
+        crate::transcode_runner::run(&worker, &saved, &paths.data, signals),
+    );
+    outcome
+}
+/// The AI work of one setup, from its models to its tasks.
+async fn serve(
+    worker: &crate::ml_transport::WorkerTransport,
+    several_leases: bool,
+    installed: crate::runtime_store::InstalledRuntime,
+    attestation: crate::runtime_store::RuntimeAttestation,
+    paths: SetupPaths,
+    allow_download: bool,
+    progress: Progress,
+) -> Result<(), String> {
+    use crate::{native_predictor::Step, transport};
     let (source, provider) = (
         installed.source_revision().to_owned(),
         installed.provider().to_owned(),

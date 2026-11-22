@@ -285,7 +285,7 @@ fn read_exact_at(file: &std::fs::File, mut buffer: &mut [u8], mut at: u64) -> st
 }
 /// Streams `[start, start + len)` from the staged original so parts in flight never sit in memory.
 /// A local read failure marks `stage_failed`, so it is reported as a staging error, not a network one.
-fn part_body(
+pub(crate) fn part_body(
     file: Arc<std::fs::File>,
     start: u64,
     len: u64,

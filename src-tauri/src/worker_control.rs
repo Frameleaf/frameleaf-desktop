@@ -73,6 +73,38 @@ pub(crate) fn save_preference(
 ) -> Result<(), String> {
     credentials::save(&key(saved)?, &preference)
 }
+/// FL-1760: whether this device converts videos for this server and account. Off until chosen.
+fn conversions_key(saved: &SavedConnection) -> Result<String, String> {
+    Ok(key(saved)?.replacen("worker-control-", "worker-conversions-", 1))
+}
+/// Read often by the conversion runner, so the credential store is asked only once.
+static CONVERSIONS: std::sync::Mutex<Option<(String, bool)>> = std::sync::Mutex::new(None);
+pub(crate) fn conversions_enabled(saved: &SavedConnection) -> Result<bool, String> {
+    let key = conversions_key(saved)?;
+    let mut known = CONVERSIONS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some((_, enabled)) = known.as_ref().filter(|(scope, _)| *scope == key) {
+        return Ok(*enabled);
+    }
+    let enabled = credentials::load(&key)?.unwrap_or(false);
+    *known = Some((key, enabled));
+    Ok(enabled)
+}
+// The setting itself arrives with FL-1761.
+#[allow(dead_code)]
+pub(crate) fn save_conversions_enabled(
+    saved: &SavedConnection,
+    enabled: bool,
+) -> Result<(), String> {
+    let key = conversions_key(saved)?;
+    let mut known = CONVERSIONS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    credentials::save(&key, &enabled)?;
+    *known = Some((key, enabled));
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -116,7 +148,11 @@ mod tests {
             mode: "client-worker".into(),
         };
         let original = key(&saved).unwrap();
+        let conversions = conversions_key(&saved).unwrap();
+        assert!(conversions.starts_with("worker-conversions-"));
+        assert_ne!(conversions, original);
         saved.server_id = "server-b".into();
+        assert_ne!(conversions_key(&saved).unwrap(), conversions);
         assert_ne!(key(&saved).unwrap(), original);
         saved.server_id = "server-a".into();
         saved.account_id = "account-b".into();

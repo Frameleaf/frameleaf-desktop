@@ -1382,7 +1382,7 @@ fn pin_profile_leaf(path: &std::path::Path) -> Result<Vec<std::fs::File>, String
 
 /// Re-read an installed package record and verify its controller and signed runtime.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-fn verified(
+pub(crate) fn verified(
     record: &Installation,
 ) -> Result<
     (
