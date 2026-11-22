@@ -321,7 +321,9 @@ jobs:
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         shell: bash
-        run: npm run tauri -- build --config "$GITHUB_WORKSPACE/release-config.json" -- --locked
+        # umask 022: Forgejo's Ubuntu 22.04 container runs jobs with umask 000, and the AppImage keeps
+        # the modes its folders are created with; installed files are never group- or world-writable.
+        run: umask 022 && npm run tauri -- build --config "$GITHUB_WORKSPACE/release-config.json" -- --locked
       - name: Check the app and its AI runtime need no newer macOS than each declares
         if: runner.os == 'macOS'
         shell: bash
