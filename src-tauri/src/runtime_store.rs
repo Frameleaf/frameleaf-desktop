@@ -688,6 +688,9 @@ mod leftover_tests {
         let root = fs::canonicalize(std::env::temp_dir())
             .unwrap()
             .join(format!("frameleaf-leftovers-{}", Uuid::new_v4()));
+        // As the app creates them: Windows refuses a store whose folders lack its private ACL.
+        private_directory(&root).unwrap();
+        private_directory(&root.join("releases")).unwrap();
         let release = root.join("releases").join("a".repeat(64));
         // Past Windows' 260-character limit, as the files such a delete leaves behind are.
         let deep = release
@@ -697,11 +700,6 @@ mod leftover_tests {
         fs::create_dir_all(&deep).unwrap();
         fs::write(deep.join("deep.pyd"), b"left behind").unwrap();
         assert!(deep.join("deep.pyd").as_os_str().len() > 260);
-        #[cfg(unix)]
-        for directory in [root.clone(), root.join("releases")] {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
-        }
         (root, release)
     }
 
