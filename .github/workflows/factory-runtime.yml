@@ -143,7 +143,9 @@ jobs:
           python desktop/tools/build_runtime.py --source source --output candidate --revision "$SOURCE_REVISION" --epoch "$RUNTIME_EPOCH" --profile "$RUNTIME_PROFILE"
           manifests=(manifest.json)
           if [ -f candidate/manifest-accelerated.json ]; then manifests+=(manifest-accelerated.json); fi
-          tar -cf runtime-unsigned.tar -C candidate "${manifests[@]}" payload
+          # COPYFILE_DISABLE: on a Mac whose files carry extended attributes (the owner's Mac), tar
+          # would add a ._ entry beside each file, which the inventory check then refuses.
+          COPYFILE_DISABLE=1 tar -cf runtime-unsigned.tar -C candidate "${manifests[@]}" payload
       - uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: unsigned-runtime-${{ matrix.pack }}
@@ -299,7 +301,9 @@ jobs:
           manifests=(manifest.json manifest.sig)
           if [ -f candidate/manifest-accelerated.json ]; then manifests+=(manifest-accelerated.json manifest-accelerated.sig); fi
           if [ -d candidate/accelerated ]; then manifests+=(accelerated); fi
-          tar -cf runtime.tar -C candidate "${manifests[@]}" payload
+          # COPYFILE_DISABLE: on a Mac whose files carry extended attributes (the owner's Mac), tar
+          # would add a ._ entry beside each file, which the inventory check then refuses.
+          COPYFILE_DISABLE=1 tar -cf runtime.tar -C candidate "${manifests[@]}" payload
       - uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
           name: factory-runtime-${{ matrix.target }}
