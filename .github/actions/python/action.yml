@@ -1,15 +1,16 @@
 name: Python 3.12
 description: >-
-  actions/setup-python, except on Forgejo's Mac host: there setup-python's macOS build installs a
-  system-wide Python package, so uv provides a runner-owned Python 3.12 instead.
+  actions/setup-python, except on Forgejo's Mac and Windows hosts. There setup-python installs a
+  system-wide Python (a package under /Users/runner on macOS; an all-users installer that needs
+  administrator rights on Windows), so uv provides a runner-owned Python 3.12 instead.
 runs:
   using: composite
   steps:
-    - if: github.server_url == 'https://github.com' || runner.os != 'macOS'
+    - if: github.server_url == 'https://github.com' || runner.os == 'Linux'
       uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
       with:
         python-version: '3.12'
-    - if: github.server_url != 'https://github.com' && runner.os == 'macOS'
+    - if: github.server_url != 'https://github.com' && runner.os != 'Linux'
       uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         version: '0.11.2'
@@ -27,3 +28,14 @@ runs:
         ln -sf "$python" "$bin/python3"
         echo "$bin" >> "$GITHUB_PATH"
         "$bin/python" --version
+    - if: github.server_url != 'https://github.com' && runner.os == 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
+        export UV_PYTHON_INSTALL_DIR="${RUNNER_TOOL_CACHE:-$LOCALAPPDATA/forgejo-runner}/uv-python"
+        # --no-bin: nothing is added to the user's own folders on this PC.
+        uv python install --no-bin 3.12
+        python="$(uv python find --managed-python 3.12)"
+        # python.exe only starts beside its own DLLs, so its folder goes on PATH as it is.
+        cygpath --windows "$(dirname "$(cygpath --unix "$python")")" >> "$GITHUB_PATH"
+        "$python" --version
