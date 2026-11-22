@@ -174,6 +174,8 @@ pub(crate) fn ffmpeg_args(
         "-nostdin",
         "-hide_banner",
         "-nostats",
+        "-progress",
+        "pipe:1",
         "-protocol_whitelist",
         "file,pipe",
         "-format_whitelist",
@@ -468,6 +470,7 @@ mod tests {
         };
         let only = text(Pass::Only);
         assert_eq!(only[0], "-nostdin");
+        assert!(only.windows(2).any(|pair| pair == ["-progress", "pipe:1"]));
         let protocols = only
             .iter()
             .position(|a| a == "-protocol_whitelist")

@@ -1,7 +1,7 @@
-//! FL-1760: converts one video at a time for the server, beside the AI worker and off by default.
+//! FL-1760: converts one video at a time for the server, beside the AI worker. The server decides
+//! which computers get work: one it has not enabled is answered with no task.
 //! A job that cannot finish here is handed back and starts from zero wherever it runs next.
 use crate::{
-    connection::SavedConnection,
     host_runtime::VerifiedHostRuntime,
     ml_transport::WorkerTransport,
     package_lease::CodeLease,
@@ -16,11 +16,11 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime},
@@ -79,6 +79,7 @@ struct Task {
     input_options: Vec<String>,
     output_options: Vec<String>,
     two_pass: bool,
+    frame_count: u64,
     source_bytes: u64,
     max_output_bytes: u64,
 }
@@ -97,12 +98,64 @@ struct Job {
     claim_token: String,
     options: Vec<String>,
     two_pass: bool,
+    frame_count: u64,
     source_bytes: u64,
     max_output_bytes: u64,
 }
-impl Job {
-    fn lease(&self) -> String {
-        serde_json::json!({ "claimToken": self.claim_token }).to_string()
+fn heartbeat_payload(claim_token: &str, progress: Option<u8>) -> String {
+    match progress {
+        Some(progress) => {
+            serde_json::json!({ "claimToken": claim_token, "progress": progress }).to_string()
+        }
+        None => serde_json::json!({ "claimToken": claim_token }).to_string(),
+    }
+}
+
+const PROGRESS_UNKNOWN: u8 = u8::MAX;
+/// How far the encode is, 0 to 100 across all its passes. It only rises until it is cleared.
+struct EncodeProgress(AtomicU8);
+impl EncodeProgress {
+    fn new() -> Self {
+        Self(AtomicU8::new(PROGRESS_UNKNOWN))
+    }
+    fn get(&self) -> Option<u8> {
+        Some(self.0.load(Ordering::Acquire)).filter(|value| *value != PROGRESS_UNKNOWN)
+    }
+    fn rise(&self, percent: u8) {
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current == PROGRESS_UNKNOWN || percent > current).then_some(percent)
+            });
+    }
+    fn clear(&self) {
+        self.0.store(PROGRESS_UNKNOWN, Ordering::Release);
+    }
+}
+/// The first of two passes is the lower half and the second the upper, so it never goes back.
+fn overall_percent(pass: Pass, frames: u64, frame_count: u64) -> Option<u8> {
+    if frame_count == 0 {
+        return None;
+    }
+    let done = u128::from(frames.min(frame_count));
+    let total = u128::from(frame_count);
+    Some(match pass {
+        Pass::Only => done * 100 / total,
+        Pass::First => done * 50 / total,
+        Pass::Second => 50 + done * 50 / total,
+    } as u8)
+}
+/// Reads FFmpeg's `-progress` lines until it closes them.
+fn read_progress(reader: impl BufRead, pass: Pass, frame_count: u64, progress: &EncodeProgress) {
+    for line in reader.lines() {
+        let Ok(line) = line else { return };
+        let frames = line.strip_prefix("frame=").map(str::trim);
+        if let Some(percent) = frames
+            .and_then(|frames| frames.parse().ok())
+            .and_then(|frames| overall_percent(pass, frames, frame_count))
+        {
+            progress.rise(percent);
+        }
     }
 }
 /// How a job ended, and so what the server is told.
@@ -136,6 +189,7 @@ fn admit(task: Task) -> Result<Job, (String, String, &'static str)> {
         claim_token: task.claim_token,
         options,
         two_pass: task.two_pass,
+        frame_count: task.frame_count,
         source_bytes: task.source_bytes,
         max_output_bytes: task.max_output_bytes,
     })
@@ -228,14 +282,21 @@ impl Encoder {
     }
 }
 
+/// Checking a whole package is slow, so it is done once for as long as the package stays good.
+static LOCATED: Mutex<Option<Arc<Encoder>>> = Mutex::new(None);
+fn located() -> Option<Arc<Encoder>> {
+    let mut known = LOCATED.lock().unwrap_or_else(|poison| poison.into_inner());
+    if known.is_none() {
+        *known = Encoder::locate().map(Arc::new);
+    }
+    known.clone()
+}
+fn forget_encoder() {
+    *LOCATED.lock().unwrap_or_else(|poison| poison.into_inner()) = None;
+}
+
 async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
     tauri::async_runtime::spawn_blocking(work).await.ok()
-}
-async fn enabled(saved: &SavedConnection) -> bool {
-    let saved = saved.clone();
-    blocking(move || crate::worker_control::conversions_enabled(&saved))
-        .await
-        .is_some_and(|value| value.unwrap_or(false))
 }
 async fn wait(period: Duration, signals: Signals<'_>) {
     let until = tokio::time::Instant::now() + period;
@@ -244,36 +305,21 @@ async fn wait(period: Duration, signals: Signals<'_>) {
     }
 }
 
-pub(crate) async fn run(
-    worker: &WorkerTransport,
-    saved: &SavedConnection,
-    data: &Path,
-    signals: Signals<'_>,
-) {
+pub(crate) async fn run(worker: &WorkerTransport, data: &Path, signals: Signals<'_>) {
     let cleanup = data.to_path_buf();
     let _ = blocking(move || clean_after_crash(&cleanup)).await;
     let root = data.join(FOLDER);
-    let mut encoder = None;
     while !signals.over() {
-        let pause = turn(worker, saved, &root, &mut encoder, signals).await;
+        let pause = turn(worker, &root, signals).await;
         wait(pause, signals).await;
     }
 }
 
-async fn turn(
-    worker: &WorkerTransport,
-    saved: &SavedConnection,
-    root: &Path,
-    encoder: &mut Option<Arc<Encoder>>,
-    signals: Signals<'_>,
-) -> Duration {
-    if signals.stop_work() || !enabled(saved).await {
+async fn turn(worker: &WorkerTransport, root: &Path, signals: Signals<'_>) -> Duration {
+    if signals.stop_work() {
         return CLAIM_EVERY;
     }
-    if encoder.is_none() {
-        *encoder = blocking(Encoder::locate).await.flatten().map(Arc::new);
-    }
-    let Some(ready) = encoder.clone() else {
+    let Some(ready) = blocking(located).await.flatten() else {
         return NO_FFMPEG_RECHECK;
     };
     let admitted = blocking(crate::resource_policy::sample)
@@ -305,18 +351,17 @@ async fn turn(
     };
     let package = ready.clone();
     let Some(Ok((lease, ffmpeg))) = blocking(move || package.ready()).await else {
-        *encoder = None;
+        forget_encoder();
         hand_back(worker, &job.id, &job.claim_token, "cancelled").await;
         return AFTER_ERROR;
     };
-    convert(worker, saved, root, &job, &ffmpeg, signals).await;
+    convert(worker, root, &job, &ffmpeg, signals).await;
     drop(lease);
     Duration::ZERO
 }
 
 async fn convert(
     worker: &WorkerTransport,
-    saved: &SavedConnection,
     root: &Path,
     job: &Job,
     ffmpeg: &Path,
@@ -328,9 +373,10 @@ async fn convert(
         return;
     };
     // The side that loses is dropped here: that ends a transfer and kills the encoder.
+    let progress = Arc::new(EncodeProgress::new());
     let end = tokio::select! {
-        end = work(worker, job, &workspace.0, ffmpeg) => end,
-        end = watch(worker, saved, job, signals) => end,
+        end = work(worker, job, &workspace.0, ffmpeg, &progress) => end,
+        end = watch(worker, job, &progress, signals) => end,
     };
     if let End::HandBack(code) = end {
         hand_back(worker, &job.id, &job.claim_token, code).await;
@@ -371,8 +417,8 @@ fn judge_heartbeat(answer: &Result<bool, String>, since_renewed: Duration) -> Be
 /// Runs for as long as the job may: returns only when it has to stop.
 async fn watch(
     worker: &WorkerTransport,
-    saved: &SavedConnection,
     job: &Job,
+    progress: &EncodeProgress,
     signals: Signals<'_>,
 ) -> End {
     const GIVE_BACK: End = End::HandBack("cancelled");
@@ -380,7 +426,8 @@ async fn watch(
         format!("api/desktop/transcodes/{}/heartbeat", job.id),
         format!("transcode-heartbeat:{}", job.id),
     );
-    let payload = job.lease();
+    // A server from before progress refuses the field: the lease matters more, so it is dropped.
+    let mut send_progress = true;
     let mut renewed = Instant::now();
     let mut beat_due = renewed + HEARTBEAT_EVERY;
     let mut wall = SystemTime::now();
@@ -406,9 +453,8 @@ async fn watch(
         if Instant::now() < beat_due {
             continue;
         }
-        if !enabled(saved).await {
-            return GIVE_BACK;
-        }
+        let percent = progress.get().filter(|_| send_progress);
+        let payload = heartbeat_payload(&job.claim_token, percent);
         let answer = tokio::time::timeout(
             HEARTBEAT_LIMIT,
             worker.transcode_json::<Ack>(&path, &operation, &payload),
@@ -416,6 +462,11 @@ async fn watch(
         .await
         .unwrap_or_else(|_| Err("worker_request_interrupted".into()))
         .map(|ack| ack.accepted);
+        if percent.is_some() && matches!(&answer, Err(code) if code == "server_http_400") {
+            send_progress = false;
+            beat_due = Instant::now();
+            continue;
+        }
         match judge_heartbeat(&answer, renewed.elapsed()) {
             Beat::Renewed => {
                 renewed = Instant::now();
@@ -427,13 +478,20 @@ async fn watch(
     }
 }
 
-async fn work(worker: &WorkerTransport, job: &Job, folder: &Path, ffmpeg: &Path) -> End {
+async fn work(
+    worker: &WorkerTransport,
+    job: &Job,
+    folder: &Path,
+    ffmpeg: &Path,
+    progress: &Arc<EncodeProgress>,
+) -> End {
     let steps = async {
         check_disk(folder, job).await?;
         download(worker, job, &folder.join(INPUT)).await?;
         for pass in passes(job.two_pass) {
-            encode(job, folder, ffmpeg, *pass).await?;
+            encode(job, folder, ffmpeg, *pass, progress).await?;
         }
+        progress.clear();
         upload(worker, job, &folder.join(OUTPUT)).await
     };
     match steps.await {
@@ -546,6 +604,7 @@ struct RunningEncoder {
     child: Child,
     tree: ProcessTree,
     ended: bool,
+    reader: Option<std::thread::JoinHandle<()>>,
 }
 impl Drop for RunningEncoder {
     fn drop(&mut self) {
@@ -583,6 +642,8 @@ fn start_encoder(
     folder: &Path,
     ffmpeg: &Path,
     pass: Pass,
+    frame_count: u64,
+    progress: Arc<EncodeProgress>,
 ) -> Result<RunningEncoder, ()> {
     let args = transcode_args::ffmpeg_args(
         &folder.join(INPUT),
@@ -598,7 +659,7 @@ fn start_encoder(
         .env_clear()
         .env("LANG", "C")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null());
     if let Some(tools) = ffmpeg.parent() {
         command.env("PATH", tools);
@@ -624,14 +685,26 @@ fn start_encoder(
             let _ = fs::write(folder.join(PROCESS_RECORD), raw);
         }
     }
+    let reader = child.stdout.take().map(|stdout| {
+        std::thread::spawn(move || {
+            read_progress(BufReader::new(stdout), pass, frame_count, &progress);
+        })
+    });
     Ok(RunningEncoder {
         child,
         tree,
         ended: false,
+        reader,
     })
 }
 
-async fn encode(job: &Job, folder: &Path, ffmpeg: &Path, pass: Pass) -> Result<(), End> {
+async fn encode(
+    job: &Job,
+    folder: &Path,
+    ffmpeg: &Path,
+    pass: Pass,
+    progress: &Arc<EncodeProgress>,
+) -> Result<(), End> {
     const FAILED: End = End::HandBack("encode-failed");
     let (options, target, program) = (
         job.options.clone(),
@@ -639,10 +712,12 @@ async fn encode(job: &Job, folder: &Path, ffmpeg: &Path, pass: Pass) -> Result<(
         ffmpeg.to_path_buf(),
     );
     // Starting a process and writing its record touch the disk.
-    let mut running = blocking(move || start_encoder(&options, &target, &program, pass))
-        .await
-        .and_then(Result::ok)
-        .ok_or(FAILED)?;
+    let (frame_count, shared) = (job.frame_count, progress.clone());
+    let mut running =
+        blocking(move || start_encoder(&options, &target, &program, pass, frame_count, shared))
+            .await
+            .and_then(Result::ok)
+            .ok_or(FAILED)?;
     let limit = job.max_output_bytes;
     let mut ticks = 0u32;
     let status = loop {
@@ -666,6 +741,10 @@ async fn encode(job: &Job, folder: &Path, ffmpeg: &Path, pass: Pass) -> Result<(
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
+    // Its last lines are in before the next pass, or the upload, moves the figure on.
+    if let Some(reader) = running.reader.take() {
+        let _ = blocking(move || reader.join()).await;
+    }
     let target = folder.to_path_buf();
     if !status.success()
         || blocking(move || over_limit(&target, limit))
@@ -781,6 +860,7 @@ mod tests {
                 .map(String::from)
                 .into(),
             two_pass: false,
+            frame_count: 100,
             source_bytes: 2048,
             max_output_bytes: MIN_OUTPUT_ALLOWANCE,
         }
@@ -907,6 +987,46 @@ mod tests {
         assert_eq!(judge_heartbeat(&down, LEASE), Beat::Lost);
         assert_eq!(refusal("worker_lease_refused"), End::LeaseLost);
         assert_eq!(refusal("server_http_500"), End::HandBack("cancelled"));
+    }
+
+    #[test]
+    fn progress_rises_across_two_passes_and_is_left_out_when_unknown() {
+        assert_eq!(overall_percent(Pass::Only, 25, 100), Some(25));
+        assert_eq!(overall_percent(Pass::Only, 500, 100), Some(100));
+        assert_eq!(overall_percent(Pass::First, 100, 100), Some(50));
+        assert_eq!(overall_percent(Pass::Second, 0, 100), Some(50));
+        assert_eq!(overall_percent(Pass::Second, 100, 100), Some(100));
+        assert_eq!(overall_percent(Pass::Only, u64::MAX, u64::MAX), Some(100));
+        assert_eq!(overall_percent(Pass::Only, 10, 0), None);
+
+        let progress = EncodeProgress::new();
+        assert_eq!(progress.get(), None);
+        let first = "frame=40\nfps=1\nprogress=continue\nframe=N/A\nframe=100\n";
+        read_progress(first.as_bytes(), Pass::First, 100, &progress);
+        assert_eq!(progress.get(), Some(50));
+        read_progress("frame=0\n".as_bytes(), Pass::Second, 100, &progress);
+        assert_eq!(progress.get(), Some(50));
+        read_progress("frame=60\n".as_bytes(), Pass::Second, 100, &progress);
+        assert_eq!(progress.get(), Some(80));
+        read_progress("frame=10\n".as_bytes(), Pass::Second, 100, &progress);
+        assert_eq!(progress.get(), Some(80));
+        progress.clear();
+        assert_eq!(progress.get(), None);
+        read_progress("frame=10\n".as_bytes(), Pass::Only, 0, &progress);
+        assert_eq!(progress.get(), None);
+    }
+
+    #[test]
+    fn a_heartbeat_names_progress_only_when_it_is_known() {
+        let with: serde_json::Value =
+            serde_json::from_str(&heartbeat_payload("token", Some(42))).unwrap();
+        assert_eq!(
+            with,
+            serde_json::json!({"claimToken":"token","progress":42})
+        );
+        let without: serde_json::Value =
+            serde_json::from_str(&heartbeat_payload("token", None)).unwrap();
+        assert_eq!(without, serde_json::json!({"claimToken":"token"}));
     }
 
     #[test]

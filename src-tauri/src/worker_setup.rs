@@ -1696,7 +1696,7 @@ async fn prepare_on(
             ended.store(true, Ordering::Release);
             outcome
         },
-        crate::transcode_runner::run(&worker, &saved, &paths.data, signals),
+        crate::transcode_runner::run(&worker, &paths.data, signals),
     );
     outcome
 }
