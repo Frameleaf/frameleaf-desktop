@@ -42,6 +42,14 @@ impl RuntimeAttestation {
         &self.manifest_sha256
     }
 }
+/// Whether a path exists. Only a confirmed absence is `false`: a lookup that fails proves nothing.
+fn confirmed_present(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err("runtime_store_read_failed".into()),
+    }
+}
 /// A Windows tool limited to 260-character paths deletes a runtime's data but leaves its deepest
 /// files. Without a manifest such a folder can never be loaded, and the accepted epochs live in the
 /// credential store, so clearing it cannot roll anything back. Anything else stays refused, and
@@ -54,11 +62,13 @@ fn clear_partly_deleted_releases(releases: &Path) -> Result<(), String> {
         let plain_directory = fs::symlink_metadata(&path)
             .map_err(|_| "runtime_store_read_failed")?
             .is_dir();
-        let has_manifest = ["manifest.json", "manifest.sig"]
-            .iter()
-            .any(|name| fs::symlink_metadata(path.join(name)).is_ok());
-        if !plain_directory || has_manifest {
+        if !plain_directory {
             return Err(REFUSED.into());
+        }
+        for name in ["manifest.json", "manifest.sig"] {
+            if confirmed_present(&path.join(name))? {
+                return Err(REFUSED.into());
+            }
         }
         leftovers.push(path);
     }
@@ -212,7 +222,7 @@ impl RuntimeStore {
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if fs::symlink_metadata(root.join("active.json")).is_ok() {
+                if confirmed_present(&root.join("active.json"))? {
                     return Err("runtime_epoch_recovery_required".into());
                 }
                 clear_partly_deleted_releases(&root.join("releases"))?;
@@ -742,6 +752,41 @@ mod leftover_tests {
             Some("runtime_epoch_recovery_required")
         );
         assert!(partial.exists() && complete.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_manifest_that_cannot_be_checked_keeps_the_release() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads past the permission this test relies on
+        }
+        let (root, release) = store_with_release();
+        fs::write(release.join("manifest.json"), b"{}").unwrap();
+        fs::set_permissions(&release, fs::Permissions::from_mode(0o000)).unwrap();
+        let opened = open(&root).err();
+        fs::set_permissions(&release, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(opened.as_deref(), Some("runtime_store_read_failed"));
+        assert!(release.join("manifest.json").exists());
+        assert!(!root.join("epoch-authority.json").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_cannot_be_checked_is_not_reported_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (root, release) = store_with_release();
+        fs::set_permissions(&release, fs::Permissions::from_mode(0o000)).unwrap();
+        let checked = confirmed_present(&release.join("manifest.json"));
+        fs::set_permissions(&release, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(checked, Err("runtime_store_read_failed".to_string()));
+        assert_eq!(confirmed_present(&release), Ok(true));
+        assert_eq!(confirmed_present(&release.join("absent")), Ok(false));
         fs::remove_dir_all(root).unwrap();
     }
 
