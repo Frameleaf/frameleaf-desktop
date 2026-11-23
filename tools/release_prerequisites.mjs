@@ -52,15 +52,22 @@ export const linuxTestsJob = "check (ubuntu-24.04)";
  */
 export async function checkLinuxTests(tree, request = forgejo) {
   if (typeof tree !== "string" || !/^[a-f0-9]{40}$/.test(tree)) throw new Error("linux_tests_tree_invalid: expected the release revision's git tree");
-  const trees = new Map();
-  const treeOf = async (sha) => {
-    if (!trees.has(sha)) {
-      try { trees.set(sha, (await request(`git/commits/${sha}`))?.commit?.tree?.sha); }
-      catch (error) {
-        if (!String(error.message).startsWith("forgejo_gh_http_404:")) throw error;
-        trees.set(sha, undefined);
-      }
+  // Forgejo reports a commit's id as its tree's `sha`, so trees are compared by their entries, each
+  // of which names its content by hash: two trees with the same entries are the same tree.
+  const entriesOf = async (reference) => {
+    let listing;
+    try { listing = await request(`git/trees/${reference}?per_page=1000`); }
+    catch (error) {
+      if (!String(error.message).startsWith("forgejo_gh_http_404:")) throw error;
+      return undefined;
     }
+    if (!Array.isArray(listing?.tree) || listing.truncated) throw new Error("linux_tests_listing_invalid: Forgejo did not return a whole git tree");
+    return JSON.stringify(listing.tree.map(({ path, mode, type, sha }) => [path, mode, type, sha]).sort());
+  };
+  const wanted = await entriesOf(tree);
+  const trees = new Map();
+  const sameTree = async (sha) => {
+    if (!trees.has(sha)) trees.set(sha, wanted !== undefined && await entriesOf(sha) === wanted);
     return trees.get(sha);
   };
   // ponytail: scans every desktop.yml run when none matches; stop at an age limit if that gets slow.
@@ -69,7 +76,7 @@ export async function checkLinuxTests(tree, request = forgejo) {
     if (!Array.isArray(runs)) throw new Error("linux_tests_listing_invalid: Forgejo did not return a list of desktop.yml runs");
     if (!runs.length) break;
     for (const run of runs) {
-      if (run.workflow_id !== "desktop.yml" || await treeOf(run.commit_sha) !== tree) continue;
+      if (run.workflow_id !== "desktop.yml" || !await sameTree(run.commit_sha)) continue;
       const jobs = await request(`actions/runs/${run.id}/jobs`);
       if (!Array.isArray(jobs)) throw new Error("linux_tests_listing_invalid: Forgejo did not return a list of jobs");
       // A re-run replaces the earlier result, so only the latest attempt counts.
