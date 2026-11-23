@@ -8,6 +8,7 @@ use crate::{
     process_tree::ProcessTree,
     transcode_args::{self, Pass},
 };
+use futures_util::StreamExt;
 use reqwest::{
     header::{CONTENT_LENGTH, CONTENT_TYPE},
     Method,
@@ -16,11 +17,12 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
+    future::Future,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime},
@@ -43,6 +45,7 @@ const HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
 const HEARTBEAT_RETRY: Duration = Duration::from_secs(5);
 const HEARTBEAT_LIMIT: Duration = Duration::from_secs(25);
 const HAND_BACK_LIMIT: Duration = Duration::from_secs(5);
+const STOP_POLL: Duration = Duration::from_millis(100);
 /// How long the body of one download or upload may take in all, and without a byte arriving.
 const TRANSFER_LIMIT: Duration = Duration::from_secs(12 * 60 * 60);
 const STALL_LIMIT: Duration = Duration::from_secs(60);
@@ -64,6 +67,19 @@ impl Signals<'_> {
     }
     fn stop_work(&self) -> bool {
         self.over() || self.paused.load(Ordering::Acquire)
+    }
+}
+/// `work`'s answer, or `None` as soon as a stop is asked for, whatever `work` is waiting on.
+async fn unless_stopped<T>(signals: Signals<'_>, work: impl Future<Output = T>) -> Option<T> {
+    let stopped = async {
+        while !signals.stop_work() {
+            tokio::time::sleep(STOP_POLL).await;
+        }
+    };
+    tokio::select! {
+        biased;
+        () = stopped => None,
+        answer = work => Some(answer),
     }
 }
 
@@ -328,6 +344,12 @@ async fn turn(worker: &WorkerTransport, root: &Path, signals: Signals<'_>) -> Du
     if !admitted || signals.stop_work() {
         return CLAIM_EVERY;
     }
+    // Seen through here, because the requests of a job can be dropped part way.
+    if worker.maintain_session().await.is_err() {
+        return AFTER_ERROR;
+    }
+    // The lease is counted from before it was asked for, so never later than the server's.
+    let asked = Instant::now();
     let claim = worker
         .transcode_json::<Claim>("api/desktop/transcodes/claim", "transcode-claim", "")
         .await;
@@ -355,7 +377,7 @@ async fn turn(worker: &WorkerTransport, root: &Path, signals: Signals<'_>) -> Du
         hand_back(worker, &job.id, &job.claim_token, "cancelled").await;
         return AFTER_ERROR;
     };
-    convert(worker, root, &job, &ffmpeg, signals).await;
+    convert(worker, root, &job, &ffmpeg, asked + LEASE, signals).await;
     drop(lease);
     Duration::ZERO
 }
@@ -365,6 +387,7 @@ async fn convert(
     root: &Path,
     job: &Job,
     ffmpeg: &Path,
+    lease_ends: Instant,
     signals: Signals<'_>,
 ) {
     let (folder, id) = (root.to_path_buf(), job.id.clone());
@@ -374,10 +397,13 @@ async fn convert(
     };
     // The side that loses is dropped here: that ends a transfer and kills the encoder.
     let progress = Arc::new(EncodeProgress::new());
+    let launches = Arc::new(LaunchGate::new());
     let end = tokio::select! {
-        end = work(worker, job, &workspace.0, ffmpeg, &progress) => end,
-        end = watch(worker, job, &progress, signals) => end,
+        end = work(worker, job, &workspace.0, ffmpeg, &progress, &launches) => end,
+        end = watch(worker, job, &progress, lease_ends, signals) => end,
     };
+    // A launch still under way finishes and is killed before the folder or package is let go.
+    let _ = blocking(move || launches.close()).await;
     if let End::HandBack(code) = end {
         hand_back(worker, &job.id, &job.claim_token, code).await;
     }
@@ -404,14 +430,18 @@ enum Beat {
     Retry,
 }
 /// A server that says no ended the job. One that cannot be reached gets until the lease is out.
-fn judge_heartbeat(answer: &Result<bool, String>, since_renewed: Duration) -> Beat {
+fn judge_heartbeat(answer: &Result<bool, String>, lease_left: Duration) -> Beat {
     match answer {
         Ok(true) => Beat::Renewed,
         Ok(false) => Beat::Lost,
         Err(code) if code == "worker_lease_refused" => Beat::Lost,
-        Err(_) if since_renewed >= LEASE => Beat::Lost,
+        Err(_) if lease_left.is_zero() => Beat::Lost,
         Err(_) => Beat::Retry,
     }
+}
+/// How long one heartbeat may take: never past the lease, and none at all once it is out.
+fn heartbeat_limit(lease_left: Duration) -> Option<Duration> {
+    (!lease_left.is_zero()).then(|| lease_left.min(HEARTBEAT_LIMIT))
 }
 
 /// Runs for as long as the job may: returns only when it has to stop.
@@ -419,6 +449,7 @@ async fn watch(
     worker: &WorkerTransport,
     job: &Job,
     progress: &EncodeProgress,
+    mut lease_ends: Instant,
     signals: Signals<'_>,
 ) -> End {
     const GIVE_BACK: End = End::HandBack("cancelled");
@@ -428,13 +459,16 @@ async fn watch(
     );
     // A server from before progress refuses the field: the lease matters more, so it is dropped.
     let mut send_progress = true;
-    let mut renewed = Instant::now();
-    let mut beat_due = renewed + HEARTBEAT_EVERY;
+    let mut beat_due = (lease_ends - LEASE) + HEARTBEAT_EVERY;
     let mut wall = SystemTime::now();
     let mut seconds = 0u32;
+    let left = |ends: Instant| ends.saturating_duration_since(Instant::now());
     loop {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        if signals.stop_work() {
+        let Some(tick) = heartbeat_limit(left(lease_ends)) else {
+            return End::LeaseLost;
+        };
+        let pause = tokio::time::sleep(tick.min(Duration::from_secs(1)));
+        if unless_stopped(signals, pause).await.is_none() {
             return GIVE_BACK;
         }
         let now = SystemTime::now();
@@ -445,7 +479,11 @@ async fn watch(
         wall = now;
         seconds = seconds.wrapping_add(1);
         if seconds % 5 == 0 {
-            let status = blocking(crate::resource_policy::sample).await;
+            let Some(status) =
+                unless_stopped(signals, blocking(crate::resource_policy::sample)).await
+            else {
+                return GIVE_BACK;
+            };
             if status.is_none_or(|status| status.refusal(KEEP_MEMORY).is_some()) {
                 return GIVE_BACK;
             }
@@ -453,27 +491,35 @@ async fn watch(
         if Instant::now() < beat_due {
             continue;
         }
+        let Some(limit) = heartbeat_limit(left(lease_ends)) else {
+            return End::LeaseLost;
+        };
         let percent = progress.get().filter(|_| send_progress);
         let payload = heartbeat_payload(&job.claim_token, percent);
-        let answer = tokio::time::timeout(
-            HEARTBEAT_LIMIT,
+        let sent = Instant::now();
+        let attempt = tokio::time::timeout(
+            limit,
             worker.transcode_json::<Ack>(&path, &operation, &payload),
-        )
-        .await
-        .unwrap_or_else(|_| Err("worker_request_interrupted".into()))
-        .map(|ack| ack.accepted);
+        );
+        let Some(answer) = unless_stopped(signals, attempt).await else {
+            return GIVE_BACK;
+        };
+        let answer = answer
+            .unwrap_or_else(|_| Err("worker_request_interrupted".into()))
+            .map(|ack| ack.accepted);
         if percent.is_some() && matches!(&answer, Err(code) if code == "server_http_400") {
             send_progress = false;
             beat_due = Instant::now();
             continue;
         }
-        match judge_heartbeat(&answer, renewed.elapsed()) {
+        let lease_left = left(lease_ends);
+        match judge_heartbeat(&answer, lease_left) {
             Beat::Renewed => {
-                renewed = Instant::now();
-                beat_due = renewed + HEARTBEAT_EVERY;
+                lease_ends = sent + LEASE;
+                beat_due = sent + HEARTBEAT_EVERY;
             }
             Beat::Lost => return End::LeaseLost,
-            Beat::Retry => beat_due = Instant::now() + HEARTBEAT_RETRY,
+            Beat::Retry => beat_due = Instant::now() + HEARTBEAT_RETRY.min(lease_left),
         }
     }
 }
@@ -484,12 +530,13 @@ async fn work(
     folder: &Path,
     ffmpeg: &Path,
     progress: &Arc<EncodeProgress>,
+    launches: &Arc<LaunchGate<RunningEncoder>>,
 ) -> End {
     let steps = async {
         check_disk(folder, job).await?;
         download(worker, job, &folder.join(INPUT)).await?;
         for pass in passes(job.two_pass) {
-            encode(job, folder, ffmpeg, *pass, progress).await?;
+            encode(job, folder, ffmpeg, *pass, progress, launches).await?;
         }
         progress.clear();
         upload(worker, job, &folder.join(OUTPUT)).await
@@ -508,16 +555,25 @@ fn passes(two_pass: bool) -> &'static [Pass] {
     }
 }
 
-fn enough_room(available: u64, source: u64, max_output: u64) -> bool {
-    source
-        .checked_add(max_output)
+/// What a job may write besides its source: the output, and for two passes as much again for
+/// their logs. The disk check reserves this and `over_limit` enforces it.
+fn working_room(max_output: u64, two_pass: bool) -> Option<u64> {
+    max_output.checked_mul(if two_pass { 2 } else { 1 })
+}
+fn enough_room(available: u64, source: u64, max_output: u64, two_pass: bool) -> bool {
+    working_room(max_output, two_pass)
+        .and_then(|room| source.checked_add(room))
         .is_some_and(|needed| available >= needed)
 }
 async fn check_disk(folder: &Path, job: &Job) -> Result<(), End> {
     let path = folder.to_path_buf();
     let available = blocking(move || crate::host_storage::available_bytes(&path)).await;
     match available {
-        Some(Ok(bytes)) if enough_room(bytes, job.source_bytes, job.max_output_bytes) => Ok(()),
+        Some(Ok(bytes))
+            if enough_room(bytes, job.source_bytes, job.max_output_bytes, job.two_pass) =>
+        {
+            Ok(())
+        }
         _ => Err(End::HandBack("insufficient-disk")),
     }
 }
@@ -616,9 +672,9 @@ impl Drop for RunningEncoder {
     }
 }
 
-/// Whether the job's own files have grown past what it may write: the output itself, and the
-/// output with its two-pass logs.
-fn over_limit(folder: &Path, limit: u64) -> bool {
+/// Whether the job's own files have grown past what it may write: the output past its limit,
+/// or everything but the source past the room the disk check reserved.
+fn over_limit(folder: &Path, max_output: u64, room: u64) -> bool {
     let Ok(entries) = fs::read_dir(folder) else {
         return false;
     };
@@ -629,12 +685,46 @@ fn over_limit(folder: &Path, limit: u64) -> bool {
             continue;
         }
         let bytes = entry.metadata().map_or(0, |meta| meta.len());
-        if name == OUTPUT && bytes > limit {
+        if name == OUTPUT && bytes > max_output {
             return true;
         }
         total = total.saturating_add(bytes);
     }
-    total > limit.saturating_mul(2)
+    total > room
+}
+
+/// Where a launch on the blocking pool leaves what it started. Dropping the job's future does not
+/// stop that launch, so `close` waits for it and ends whatever nobody came back for.
+struct LaunchGate<T>(Mutex<(bool, Option<T>)>);
+impl<T> LaunchGate<T> {
+    fn new() -> Self {
+        Self(Mutex::new((false, None)))
+    }
+    fn state(&self) -> std::sync::MutexGuard<'_, (bool, Option<T>)> {
+        self.0.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+    /// Starts it unless the gate has closed, holding the gate shut against `close` meanwhile.
+    fn launch(&self, start: impl FnOnce() -> Result<T, ()>) -> bool {
+        let mut state = self.state();
+        if state.0 {
+            return false;
+        }
+        match start() {
+            Ok(started) => {
+                state.1 = Some(started);
+                true
+            }
+            Err(()) => false,
+        }
+    }
+    fn take(&self) -> Option<T> {
+        self.state().1.take()
+    }
+    fn close(&self) {
+        let mut state = self.state();
+        state.0 = true;
+        drop(state.1.take());
+    }
 }
 
 fn start_encoder(
@@ -704,6 +794,7 @@ async fn encode(
     ffmpeg: &Path,
     pass: Pass,
     progress: &Arc<EncodeProgress>,
+    launches: &Arc<LaunchGate<RunningEncoder>>,
 ) -> Result<(), End> {
     const FAILED: End = End::HandBack("encode-failed");
     let (options, target, program) = (
@@ -712,13 +803,18 @@ async fn encode(
         ffmpeg.to_path_buf(),
     );
     // Starting a process and writing its record touch the disk.
-    let (frame_count, shared) = (job.frame_count, progress.clone());
-    let mut running =
-        blocking(move || start_encoder(&options, &target, &program, pass, frame_count, shared))
-            .await
-            .and_then(Result::ok)
-            .ok_or(FAILED)?;
+    let (frame_count, shared, gate) = (job.frame_count, progress.clone(), launches.clone());
+    let launched = blocking(move || {
+        gate.launch(|| start_encoder(&options, &target, &program, pass, frame_count, shared))
+    })
+    .await
+    .unwrap_or(false);
+    if !launched {
+        return Err(FAILED);
+    }
+    let mut running = launches.take().ok_or(FAILED)?;
     let limit = job.max_output_bytes;
+    let room = working_room(limit, job.two_pass).ok_or(FAILED)?;
     let mut ticks = 0u32;
     let status = loop {
         match running.child.try_wait() {
@@ -732,7 +828,7 @@ async fn encode(
         ticks = ticks.wrapping_add(1);
         if ticks % 4 == 0 {
             let target = folder.to_path_buf();
-            if blocking(move || over_limit(&target, limit))
+            if blocking(move || over_limit(&target, limit, room))
                 .await
                 .unwrap_or(true)
             {
@@ -747,7 +843,7 @@ async fn encode(
     }
     let target = folder.to_path_buf();
     if !status.success()
-        || blocking(move || over_limit(&target, limit))
+        || blocking(move || over_limit(&target, limit, room))
             .await
             .unwrap_or(true)
     {
@@ -768,6 +864,50 @@ fn digest(path: &Path) -> std::io::Result<(String, u64)> {
         }
         hasher.update(&buffer[..count]);
         total += count as u64;
+    }
+}
+
+/// When an upload's body last moved. The next chunk is asked for once the last has been written.
+struct UploadActivity {
+    last: Mutex<tokio::time::Instant>,
+    sent: AtomicU64,
+    size: u64,
+}
+impl UploadActivity {
+    fn new(size: u64) -> Self {
+        Self {
+            last: Mutex::new(tokio::time::Instant::now()),
+            sent: AtomicU64::new(0),
+            size,
+        }
+    }
+    fn wrote(&self, bytes: u64) {
+        self.sent.fetch_add(bytes, Ordering::AcqRel);
+        *self
+            .last
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = tokio::time::Instant::now();
+    }
+    /// Ends when the body has not moved for `limit`. Once all of it is out the server may take
+    /// its time checking the file, so only the total limit applies.
+    async fn stalled(&self, limit: Duration) {
+        loop {
+            let last = *self
+                .last
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let due = last + limit;
+            let body_left = self.sent.load(Ordering::Acquire) < self.size;
+            if body_left && tokio::time::Instant::now() >= due {
+                return;
+            }
+            let wake = if body_left {
+                due
+            } else {
+                tokio::time::Instant::now() + limit
+            };
+            tokio::time::sleep_until(wake).await;
+        }
     }
 }
 
@@ -805,19 +945,29 @@ async fn upload(worker: &WorkerTransport, job: &Job, path: &Path) -> Result<(), 
         .await
         .and_then(Result::ok)
         .ok_or(FAILED)?;
-    let body =
-        crate::copy_upload::part_body(Arc::new(file), 0, size, Arc::new(AtomicBool::new(false)));
+    let activity = Arc::new(UploadActivity::new(size));
+    let moved = activity.clone();
+    let chunks =
+        crate::copy_upload::part_stream(Arc::new(file), 0, size, Arc::new(AtomicBool::new(false)))
+            .inspect(move |chunk| {
+                if let Ok(chunk) = chunk {
+                    moved.wrote(chunk.len() as u64);
+                }
+            });
+    let body = reqwest::Body::wrap_stream(chunks);
     // Not signed, and no lock is held: heartbeats keep going while this runs.
-    let response = client
+    let sending = client
         .put(url)
         .timeout(TRANSFER_LIMIT)
         .header("x-frameleaf-transcode-upload", grant.upload_token)
         .header(CONTENT_TYPE, "application/octet-stream")
         .header(CONTENT_LENGTH, size)
         .body(body)
-        .send()
-        .await
-        .map_err(|_| End::HandBack("cancelled"))?;
+        .send();
+    let response = tokio::select! {
+        response = sending => response.map_err(|_| End::HandBack("cancelled"))?,
+        () = activity.stalled(STALL_LIMIT) => return Err(End::HandBack("cancelled")),
+    };
     if !response.status().is_success() {
         let (status, message) = crate::transport::refused(response).await;
         return Err(refusal(&crate::ml_transport::worker_refusal(
@@ -977,14 +1127,14 @@ mod tests {
 
     #[test]
     fn a_lost_lease_stops_the_job_and_an_unreachable_server_gets_until_it_runs_out() {
-        let early = Duration::from_secs(40);
+        let early = Duration::from_secs(80);
         assert_eq!(judge_heartbeat(&Ok(true), early), Beat::Renewed);
         assert_eq!(judge_heartbeat(&Ok(false), early), Beat::Lost);
         let refused = Err("worker_lease_refused".to_string());
         assert_eq!(judge_heartbeat(&refused, early), Beat::Lost);
         let down = Err("worker_request_interrupted".to_string());
         assert_eq!(judge_heartbeat(&down, early), Beat::Retry);
-        assert_eq!(judge_heartbeat(&down, LEASE), Beat::Lost);
+        assert_eq!(judge_heartbeat(&down, Duration::ZERO), Beat::Lost);
         assert_eq!(refusal("worker_lease_refused"), End::LeaseLost);
         assert_eq!(refusal("server_http_500"), End::HandBack("cancelled"));
     }
@@ -1030,10 +1180,124 @@ mod tests {
     }
 
     #[test]
-    fn disk_room_covers_the_source_and_the_largest_output() {
-        assert!(enough_room(30, 10, 20));
-        assert!(!enough_room(29, 10, 20));
-        assert!(!enough_room(u64::MAX, u64::MAX, 1));
+    fn a_heartbeat_never_runs_past_the_lease() {
+        assert_eq!(heartbeat_limit(LEASE), Some(HEARTBEAT_LIMIT));
+        assert_eq!(
+            heartbeat_limit(Duration::from_secs(3)),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(heartbeat_limit(Duration::ZERO), None);
+    }
+
+    #[tokio::test]
+    async fn a_stop_is_seen_while_a_request_is_still_waiting() {
+        let (cancelled, paused, ended) = (
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+        );
+        let signals = Signals {
+            cancelled: &cancelled,
+            paused: &paused,
+            ended: &ended,
+        };
+        assert_eq!(unless_stopped(signals, async { 7 }).await, Some(7));
+        let pause = async {
+            tokio::time::sleep(STOP_POLL).await;
+            paused.store(true, Ordering::Release);
+        };
+        let (answer, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(unless_stopped(signals, std::future::pending::<u8>()), pause)
+        })
+        .await
+        .unwrap();
+        assert_eq!(answer, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_upload_stalls_only_while_body_is_left_and_each_write_resets_it() {
+        let limit = Duration::from_secs(60);
+        let activity = UploadActivity::new(10);
+        tokio::time::advance(Duration::from_secs(59)).await;
+        activity.wrote(4);
+        let waited = tokio::time::Instant::now();
+        activity.stalled(limit).await;
+        assert_eq!(waited.elapsed(), limit);
+
+        // All of it written: the server may take as long as the total limit allows.
+        activity.wrote(6);
+        assert!(tokio::time::timeout(limit * 10, activity.stalled(limit))
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn closing_the_gate_waits_for_a_launch_and_ends_what_it_started() {
+        struct Started(Arc<AtomicBool>);
+        impl Drop for Started {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let ended = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(LaunchGate::new());
+        let (entered, inside) = std::sync::mpsc::channel();
+        let (launching, flag) = (gate.clone(), ended.clone());
+        let launch = std::thread::spawn(move || {
+            launching.launch(|| {
+                entered.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+                Ok(Started(flag))
+            })
+        });
+        inside.recv().unwrap();
+        gate.close();
+        // Back from `close` only once the launch finished and its result was ended.
+        assert!(ended.load(Ordering::Acquire));
+        assert!(launch.join().unwrap());
+        assert!(gate.take().is_none());
+        let mut ran = false;
+        assert!(!gate.launch(|| {
+            ran = true;
+            Err(())
+        }));
+        assert!(!ran);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closing_the_gate_kills_and_reaps_an_encoder_nobody_came_back_for() {
+        use crate::process_tree::{Presence, ProcessIdentity};
+        let gate = LaunchGate::new();
+        let mut pid = 0;
+        assert!(gate.launch(|| {
+            let mut command = Command::new("/bin/sleep");
+            command.arg("30");
+            crate::process_tree::configure(&mut command);
+            let child = command.spawn().map_err(|_| ())?;
+            pid = child.id();
+            let tree = ProcessTree::attach(&child).map_err(|_| ())?;
+            Ok(RunningEncoder {
+                child,
+                tree,
+                ended: false,
+                reader: None,
+            })
+        }));
+        gate.close();
+        assert_eq!(ProcessIdentity::lookup(pid), Presence::Absent);
+    }
+
+    #[test]
+    fn disk_room_covers_everything_the_job_may_write() {
+        assert!(enough_room(30, 10, 20, false));
+        assert!(!enough_room(29, 10, 20, false));
+        // Two passes may write their logs as well as the output.
+        assert!(enough_room(50, 10, 20, true));
+        assert!(!enough_room(49, 10, 20, true));
+        assert!(!enough_room(u64::MAX, u64::MAX, 1, false));
+        assert!(!enough_room(u64::MAX, 0, u64::MAX, true));
+        assert_eq!(working_room(u64::MAX, true), None);
     }
 
     #[test]
@@ -1041,10 +1305,14 @@ mod tests {
         let folder = scratch();
         fs::write(folder.join(INPUT), vec![0; 64]).unwrap();
         fs::write(folder.join(OUTPUT), vec![0; 10]).unwrap();
-        assert!(!over_limit(&folder, 10));
-        assert!(over_limit(&folder, 9));
+        assert!(!over_limit(&folder, 10, 10));
+        assert!(over_limit(&folder, 9, 18));
+        fs::write(folder.join("pass-0.log"), vec![0; 10]).unwrap();
+        // One pass has no room for a log; two have exactly what the disk check reserved.
+        assert!(over_limit(&folder, 10, working_room(10, false).unwrap()));
+        assert!(!over_limit(&folder, 10, working_room(10, true).unwrap()));
         fs::write(folder.join("pass-0.log"), vec![0; 11]).unwrap();
-        assert!(over_limit(&folder, 10));
+        assert!(over_limit(&folder, 10, working_room(10, true).unwrap()));
         fs::remove_dir_all(folder).unwrap();
     }
 }

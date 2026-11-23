@@ -291,7 +291,15 @@ pub(crate) fn part_body(
     len: u64,
     stage_failed: Arc<AtomicBool>,
 ) -> reqwest::Body {
-    let stream = futures_util::stream::try_unfold((start, len), move |(at, left)| {
+    reqwest::Body::wrap_stream(part_stream(file, start, len, stage_failed))
+}
+pub(crate) fn part_stream(
+    file: Arc<std::fs::File>,
+    start: u64,
+    len: u64,
+    stage_failed: Arc<AtomicBool>,
+) -> impl futures_util::Stream<Item = std::io::Result<Vec<u8>>> + Send + Sync + 'static {
+    futures_util::stream::try_unfold((start, len), move |(at, left)| {
         let file = file.clone();
         let stage_failed = stage_failed.clone();
         async move {
@@ -317,8 +325,7 @@ pub(crate) fn part_body(
             let n = chunk.len() as u64;
             Ok::<_, std::io::Error>(Some((chunk, (at + n, left - n))))
         }
-    });
-    reqwest::Body::wrap_stream(stream)
+    })
 }
 async fn pause(delay: Duration, cancelled: &AtomicBool) -> Result<(), String> {
     let until = tokio::time::Instant::now() + delay;

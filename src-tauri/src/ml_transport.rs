@@ -1036,7 +1036,9 @@ impl WorkerTransport {
         worker_json(response, 32 * 1024 * 1024).await
     }
     /// FL-1760: one signed video conversion request, in its turn with the AI worker's. The lock is
-    /// released when this returns, before any body is read.
+    /// released when this returns, before any body is read. These can be dropped part way (a
+    /// stop, a timeout), so they never renew the session: a renewal cut short would lose the
+    /// rotated token. `maintain_session` does that, from callers that see it through.
     pub(crate) async fn transcode_request(
         &self,
         method: Method,
@@ -1046,7 +1048,7 @@ impl WorkerTransport {
         body_limit: Option<std::time::Duration>,
     ) -> Result<Response, String> {
         let mut connection = self.0.lock().await;
-        connection.ensure_current().await?;
+        connection.resync().await?;
         connection
             .request_with_body_limit(method, path, operation, payload, body_limit)
             .await
