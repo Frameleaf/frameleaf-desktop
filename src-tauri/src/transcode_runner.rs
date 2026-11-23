@@ -6,6 +6,7 @@ use crate::{
     ml_transport::WorkerTransport,
     package_lease::CodeLease,
     process_tree::ProcessTree,
+    runtime_store::InstalledFfmpeg,
     transcode_args::{self, Pass},
 };
 use futures_util::StreamExt;
@@ -271,14 +272,33 @@ fn stop_recorded(record: &Path, program: &str) {
     }
 }
 
-/// The signed package's FFmpeg. Helper-only installs have no package, and so no conversions: a
-/// program found on PATH is never used.
-struct Encoder {
-    package: PathBuf,
-    runtime: VerifiedHostRuntime,
+/// A verified FFmpeg: the host package's, or else the installed AI runtime pack's. A program
+/// found on PATH is never used, and with neither of these there are no conversions.
+enum Encoder {
+    Host {
+        package: PathBuf,
+        runtime: Box<VerifiedHostRuntime>,
+    },
+    Pack(Arc<InstalledFfmpeg>),
+}
+/// The program of one job. A pack's goes through its release's epoch check at every launch.
+#[derive(Clone)]
+struct Ffmpeg {
+    path: PathBuf,
+    pack: Option<Arc<InstalledFfmpeg>>,
+}
+impl Ffmpeg {
+    fn launch<T>(&self, start: impl FnOnce(&Path) -> Result<T, ()>) -> Result<T, ()> {
+        match &self.pack {
+            Some(pack) => pack
+                .launch(|| start(&self.path).map_err(|()| "transcode_launch_failed".to_string()))
+                .map_err(|_| ()),
+            None => start(&self.path),
+        }
+    }
 }
 impl Encoder {
-    fn locate() -> Option<Self> {
+    fn locate_host() -> Option<Self> {
         let mut records = crate::host_install::installed().ok()?;
         let library = crate::host_setup::library_package(&records);
         records.sort_by_key(|record| Some(&record.manifest_sha256) != library.as_ref());
@@ -287,30 +307,45 @@ impl Encoder {
             let _lease = CodeLease::acquire_existing(&layout.runtime).ok()?;
             let (layout, runtime) = crate::host_setup::verified(&record).ok()?;
             runtime.ffmpeg().ok()?;
-            Some(Self {
+            Some(Self::Host {
                 package: layout.runtime,
-                runtime,
+                runtime: Box::new(runtime),
             })
         })
     }
-    /// Holds the package still for the job and reads its FFmpeg again.
-    fn ready(&self) -> Result<(CodeLease, PathBuf), String> {
-        let lease = CodeLease::acquire_existing(&self.package)?;
-        Ok((lease, self.runtime.ffmpeg()?))
+    /// Holds its package still for the job and reads its FFmpeg again. A pack's release is
+    /// already held for as long as the worker's setup runs.
+    fn ready(&self) -> Result<(Option<CodeLease>, Ffmpeg), String> {
+        match self {
+            Self::Host { package, runtime } => {
+                let lease = CodeLease::acquire_existing(package)?;
+                let path = runtime.ffmpeg()?;
+                Ok((Some(lease), Ffmpeg { path, pack: None }))
+            }
+            Self::Pack(pack) => {
+                let path = pack.check()?;
+                let pack = Some(pack.clone());
+                Ok((None, Ffmpeg { path, pack }))
+            }
+        }
     }
 }
 
-/// Checking a whole package is slow, so it is done once for as long as the package stays good.
-static LOCATED: Mutex<Option<Arc<Encoder>>> = Mutex::new(None);
-fn located() -> Option<Arc<Encoder>> {
-    let mut known = LOCATED.lock().unwrap_or_else(|poison| poison.into_inner());
-    if known.is_none() {
-        *known = Encoder::locate().map(Arc::new);
+/// Checking a whole package is slow: done once while it stays good, and not again for a while
+/// when there is none, which is the usual answer on a helper-only install.
+static HOST: Mutex<(Option<Arc<Encoder>>, Option<Instant>)> = Mutex::new((None, None));
+fn located_host() -> Option<Arc<Encoder>> {
+    let mut known = HOST.lock().unwrap_or_else(|poison| poison.into_inner());
+    let due = known
+        .1
+        .is_none_or(|checked| checked.elapsed() >= NO_FFMPEG_RECHECK);
+    if known.0.is_none() && due {
+        *known = (Encoder::locate_host().map(Arc::new), Some(Instant::now()));
     }
-    known.clone()
+    known.0.clone()
 }
-fn forget_encoder() {
-    *LOCATED.lock().unwrap_or_else(|poison| poison.into_inner()) = None;
+fn forget_host() {
+    *HOST.lock().unwrap_or_else(|poison| poison.into_inner()) = (None, Some(Instant::now()));
 }
 
 async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
@@ -323,21 +358,33 @@ async fn wait(period: Duration, signals: Signals<'_>) {
     }
 }
 
-pub(crate) async fn run(worker: &WorkerTransport, data: &Path, signals: Signals<'_>) {
+pub(crate) async fn run(
+    worker: &WorkerTransport,
+    data: &Path,
+    pack: Option<InstalledFfmpeg>,
+    signals: Signals<'_>,
+) {
+    let mut pack = pack.map(|ffmpeg| Arc::new(Encoder::Pack(Arc::new(ffmpeg))));
     let cleanup = data.to_path_buf();
     let _ = blocking(move || clean_after_crash(&cleanup)).await;
     let root = data.join(FOLDER);
     while !signals.over() {
-        let pause = turn(worker, &root, signals).await;
+        let pause = turn(worker, &root, &mut pack, signals).await;
         wait(pause, signals).await;
     }
 }
 
-async fn turn(worker: &WorkerTransport, root: &Path, signals: Signals<'_>) -> Duration {
+async fn turn(
+    worker: &WorkerTransport,
+    root: &Path,
+    pack: &mut Option<Arc<Encoder>>,
+    signals: Signals<'_>,
+) -> Duration {
     if signals.stop_work() {
         return CLAIM_EVERY;
     }
-    let Some(ready) = blocking(located).await.flatten() else {
+    let host = blocking(located_host).await.flatten();
+    let Some(ready) = host.or_else(|| pack.clone()) else {
         return NO_FFMPEG_RECHECK;
     };
     let admitted = blocking(crate::resource_policy::sample)
@@ -375,7 +422,11 @@ async fn turn(worker: &WorkerTransport, root: &Path, signals: Signals<'_>) -> Du
     };
     let package = ready.clone();
     let Some(Ok((lease, ffmpeg))) = blocking(move || package.ready()).await else {
-        forget_encoder();
+        // Whichever it was is not offered again: asking for work it cannot do helps nobody.
+        match *ready {
+            Encoder::Host { .. } => forget_host(),
+            Encoder::Pack(_) => *pack = None,
+        }
         hand_back(worker, &job.id, &job.claim_token, "cancelled").await;
         return AFTER_ERROR;
     };
@@ -388,7 +439,7 @@ async fn convert(
     worker: &WorkerTransport,
     root: &Path,
     job: &Job,
-    ffmpeg: &Path,
+    ffmpeg: &Ffmpeg,
     lease_ends: Instant,
     signals: Signals<'_>,
 ) {
@@ -530,7 +581,7 @@ async fn work(
     worker: &WorkerTransport,
     job: &Job,
     folder: &Path,
-    ffmpeg: &Path,
+    ffmpeg: &Ffmpeg,
     progress: &Arc<EncodeProgress>,
     launches: &Arc<LaunchGate<RunningEncoder>>,
 ) -> End {
@@ -793,21 +844,19 @@ fn start_encoder(
 async fn encode(
     job: &Job,
     folder: &Path,
-    ffmpeg: &Path,
+    ffmpeg: &Ffmpeg,
     pass: Pass,
     progress: &Arc<EncodeProgress>,
     launches: &Arc<LaunchGate<RunningEncoder>>,
 ) -> Result<(), End> {
     const FAILED: End = End::HandBack("encode-failed");
-    let (options, target, program) = (
-        job.options.clone(),
-        folder.to_path_buf(),
-        ffmpeg.to_path_buf(),
-    );
+    let (options, target, program) = (job.options.clone(), folder.to_path_buf(), ffmpeg.clone());
     // Starting a process and writing its record touch the disk.
     let (frame_count, shared, gate) = (job.frame_count, progress.clone(), launches.clone());
     let launched = blocking(move || {
-        gate.launch(|| start_encoder(&options, &target, &program, pass, frame_count, shared))
+        gate.launch(|| {
+            program.launch(|path| start_encoder(&options, &target, path, pass, frame_count, shared))
+        })
     })
     .await
     .unwrap_or(false);
@@ -1016,6 +1065,243 @@ mod tests {
             source_bytes: 2048,
             max_output_bytes: MIN_OUTPUT_ALLOWANCE,
         }
+    }
+
+    /// Needs the pinned FFmpeg: `FRAMELEAF_PINNED_MEDIA` is a folder holding its `ffmpeg` and
+    /// `ffprobe`, and `commands.json` with the commands `server/src/utils/media.ts` emits.
+    #[tokio::test]
+    #[ignore = "needs the pinned FFmpeg in FRAMELEAF_PINNED_MEDIA"]
+    async fn the_pinned_ffmpeg_runs_the_servers_commands_and_keeps_to_its_whitelists() {
+        let media = PathBuf::from(std::env::var("FRAMELEAF_PINNED_MEDIA").unwrap());
+        let (ffmpeg, ffprobe) = (media.join("ffmpeg"), media.join("ffprobe"));
+        let commands: serde_json::Value =
+            serde_json::from_slice(&fs::read(media.join("commands.json")).unwrap()).unwrap();
+        let strings = |value: &serde_json::Value| -> Vec<String> {
+            serde_json::from_value(value.clone()).unwrap()
+        };
+        for (name, command) in commands.as_object().unwrap() {
+            transcode_args::validate(
+                &strings(&command["inputOptions"]),
+                &strings(&command["outputOptions"]),
+            )
+            .unwrap_or_else(|_| panic!("{name} refused"));
+        }
+        let root = scratch();
+        let make = |args: &[&str], output: &Path| {
+            let status = Command::new(&ffmpeg)
+                .args(["-hide_banner", "-v", "error", "-nostdin", "-y"])
+                .args(args)
+                .arg(output)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        let (sdr, hdr) = (root.join("sdr.mp4"), root.join("hdr.mp4"));
+        let sources = [
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=1920x1080:rate=24:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=1000:sample_rate=48000:duration=2",
+            "-c:a",
+            "aac",
+            "-ac",
+            "2",
+        ];
+        make(
+            &[
+                &sources[..],
+                &[
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-pix_fmt",
+                    "yuv420p",
+                ],
+            ]
+            .concat(),
+            &sdr,
+        );
+        make(
+            &[
+                &sources[..],
+                &[
+                    "-c:v",
+                    "libx265",
+                    "-preset",
+                    "ultrafast",
+                    "-x265-params",
+                    "log-level=error",
+                    "-pix_fmt",
+                    "yuv420p10le",
+                    "-color_primaries",
+                    "bt2020",
+                    "-color_trc",
+                    "smpte2084",
+                    "-colorspace",
+                    "bt2020nc",
+                ],
+            ]
+            .concat(),
+            &hdr,
+        );
+        for (name, source) in [
+            ("onePass", &sdr),
+            ("onePassCapped", &sdr),
+            ("twoPass", &sdr),
+            ("tonemap", &hdr),
+        ] {
+            let command = &commands[name];
+            let two_pass = command["twoPass"].as_bool().unwrap();
+            assert_eq!(two_pass, name == "twoPass");
+            let job = Job {
+                id: Uuid::new_v4().to_string(),
+                claim_token: Uuid::new_v4().to_string(),
+                options: transcode_args::validate(&[], &strings(&command["outputOptions"]))
+                    .unwrap(),
+                two_pass,
+                frame_count: 48,
+                source_bytes: fs::metadata(source).unwrap().len(),
+                max_output_bytes: MIN_OUTPUT_ALLOWANCE,
+            };
+            let workspace = Workspace::create(&root.join("jobs"), &job.id).unwrap();
+            fs::copy(source, workspace.0.join(INPUT)).unwrap();
+            let progress = Arc::new(EncodeProgress::new());
+            let launches = Arc::new(LaunchGate::new());
+            for pass in passes(two_pass) {
+                let program = Ffmpeg {
+                    path: ffmpeg.clone(),
+                    pack: None,
+                };
+                encode(&job, &workspace.0, &program, *pass, &progress, &launches)
+                    .await
+                    .unwrap_or_else(|end| panic!("{name}: {end:?}"));
+                let expected = if *pass == Pass::First { 50 } else { 100 };
+                assert_eq!(progress.get(), Some(expected), "{name}");
+            }
+            let probed = Command::new(&ffprobe)
+                .args([
+                    "-v",
+                    "error",
+                    "-show_streams",
+                    "-show_format",
+                    "-of",
+                    "json",
+                ])
+                .arg(workspace.0.join(OUTPUT))
+                .output()
+                .unwrap();
+            assert!(probed.status.success(), "{name}");
+            let facts: serde_json::Value = serde_json::from_slice(&probed.stdout).unwrap();
+            let stream = |kind: &str| {
+                facts["streams"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|stream| stream["codec_type"] == kind)
+                    .unwrap_or_else(|| panic!("{name}: no {kind}"))
+                    .clone()
+            };
+            let (video, audio) = (stream("video"), stream("audio"));
+            assert_eq!(video["codec_name"], "h264", "{name}");
+            assert_eq!(
+                (&video["width"], &video["height"]),
+                (&1280.into(), &720.into())
+            );
+            // The server's tone map asks for full range (`r=pc`), which H.264 reports as yuvj420p.
+            let picture = if name == "tonemap" {
+                "yuvj420p"
+            } else {
+                "yuv420p"
+            };
+            assert_eq!(video["pix_fmt"], picture, "{name}");
+            assert_eq!(audio["codec_name"], "aac", "{name}");
+            assert_eq!(audio["channels"], 2, "{name}");
+            let duration: f64 = facts["format"]["duration"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!((1.9..=2.2).contains(&duration), "{name}: {duration}");
+            if name == "tonemap" {
+                assert_eq!(video["color_transfer"], "bt709", "tone mapped");
+                assert_eq!(video["color_primaries"], "bt709", "tone mapped");
+            }
+        }
+
+        // The builder's own command line, on inputs that try to reach outside the job.
+        let options =
+            transcode_args::validate(&[], &strings(&commands["onePass"]["outputOptions"])).unwrap();
+        let output = root.join("refused.mp4");
+        let run = |args: Vec<std::ffi::OsString>| {
+            Command::new(&ffmpeg)
+                .args(args)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap()
+        };
+        let built = |input: &Path| {
+            transcode_args::ffmpeg_args(input, &output, &root.join("log"), &options, Pass::Only)
+        };
+        let segment = root.join("segment.ts");
+        make(
+            &["-i", sdr.to_str().unwrap(), "-c", "copy", "-f", "mpegts"],
+            &segment,
+        );
+        let playlist = root.join("reads-a-file.m3u8");
+        fs::write(
+            &playlist,
+            "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nsegment.ts\n#EXT-X-ENDLIST\n",
+        )
+        .unwrap();
+        // Proves the playlist is a real attack: with the format list taken out, it opens.
+        let control = run(built(&playlist)
+            .into_iter()
+            .collect::<Vec<_>>()
+            .chunks(1)
+            .map(|arg| arg[0].clone())
+            .scan(false, |skip, arg| {
+                let drop = *skip || arg == "-format_whitelist";
+                *skip = arg == "-format_whitelist";
+                Some((!drop).then_some(arg))
+            })
+            .flatten()
+            .flat_map(|arg| {
+                if arg == "-i" {
+                    vec!["-allowed_extensions".into(), "ALL".into(), arg]
+                } else {
+                    vec![arg]
+                }
+            })
+            .collect());
+        assert!(
+            control.status.success() && fs::metadata(&output).is_ok_and(|meta| meta.len() > 0),
+            "the playlist should read its segment without the list"
+        );
+        fs::remove_file(&output).unwrap();
+        let concat = root.join("reads-a-file.ffconcat");
+        fs::write(&concat, "ffconcat version 1.0\nfile 'segment.ts'\n").unwrap();
+        for input in [&playlist, &concat] {
+            let refused = run(built(input));
+            assert!(!refused.status.success(), "{input:?}");
+            assert!(!output.exists(), "{input:?}");
+        }
+        for url in [
+            "http://127.0.0.1:9/video.mp4",
+            "https://127.0.0.1:9/video.mp4",
+            "tcp://127.0.0.1:9",
+            "data:text/plain;base64,AAAA",
+        ] {
+            let refused = run(built(Path::new(url)));
+            let said = String::from_utf8_lossy(&refused.stderr);
+            assert!(!refused.status.success(), "{url}");
+            assert!(said.contains("not on whitelist"), "{url}: {said}");
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

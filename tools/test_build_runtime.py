@@ -1,5 +1,6 @@
 import hashlib
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -56,6 +57,133 @@ class RuntimeBuilderTests(unittest.TestCase):
             staged.parent.rmdir()
             with self.assertRaisesRegex(builder.BuildError, "digest_mismatch"):
                 builder.stage_qwen_binary(source, "0" * 64, site, notices, "macos")
+
+    def ffmpeg_component(self, root, executable="ffmpeg"):
+        media = root / "component/media"
+        media.mkdir(parents=True)
+        files = {}
+        for name in (executable, "ffprobe", builder.FFMPEG_LICENSE):
+            (media / name).write_text("synthetic " + name)
+            files[name] = {"sha256": builder.sha256(media / name), "bytes": 1}
+        report = {
+            "qualification": "passed",
+            "version": "8.1.3-1",
+            "archive": {"checksum": "sha256:" + "a" * 64},
+            "sourceLockfileSha256": "b" * 64,
+            "entryPoints": {"ffmpeg": executable, "ffprobe": "ffprobe"},
+            "files": files,
+        }
+        (root / "component/qualification.json").write_text(json.dumps(report))
+        return root / "component", report
+
+    def test_pack_ffmpeg_is_the_qualified_file_with_its_licence_in_the_signed_inventory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            component, report = self.ffmpeg_component(root)
+            payload = root / "payload"
+            payload.mkdir()
+            receipt = builder.stage_ffmpeg(component, payload, "macos")
+            inventory = builder.inventory(payload)
+            self.assertEqual(set(inventory), {"media-tools/ffmpeg", "media-tools/FFMPEG-LICENSE.txt"})
+            self.assertEqual(inventory["media-tools/ffmpeg"]["sha256"], report["files"]["ffmpeg"]["sha256"])
+            self.assertTrue((payload / "media-tools/ffmpeg").stat().st_mode & 0o100)
+            self.assertEqual(receipt["archiveSha256"], "a" * 64)
+            self.assertEqual(receipt["version"], "8.1.3-1")
+
+    def test_pack_reads_a_nested_entry_point_and_stages_it_where_the_runtime_looks(self):
+        for system, executable in (("macos", "ffmpeg"), ("windows", "ffmpeg.exe")):
+            with self.subTest(system=system), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                component, report = self.ffmpeg_component(root, executable)
+                nested = component / "media/portable/bin" / executable
+                nested.parent.mkdir(parents=True)
+                (component / "media" / executable).rename(nested)
+                entry = f"portable/bin/{executable}"
+                report["files"][entry] = report["files"].pop(executable)
+                report["entryPoints"]["ffmpeg"] = entry
+                (component / "qualification.json").write_text(json.dumps(report))
+                payload = root / "payload"
+                payload.mkdir()
+                receipt = builder.stage_ffmpeg(component, payload, system)
+                self.assertEqual(receipt["entryPoint"], f"media-tools/{executable}")
+                inventory = builder.inventory(payload)
+                self.assertEqual(
+                    set(inventory),
+                    {f"media-tools/{executable}", "media-tools/FFMPEG-LICENSE.txt"},
+                )
+                self.assertEqual(
+                    inventory[f"media-tools/{executable}"]["sha256"],
+                    report["files"][entry]["sha256"],
+                )
+
+    def test_pack_refuses_a_nested_entry_point_that_changed_escapes_or_is_another_program(self):
+        for fault in ("changed", "escape", "other-name", "linked-folder"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                component, report = self.ffmpeg_component(root)
+                nested = component / "media/bin/ffmpeg"
+                nested.parent.mkdir()
+                (component / "media/ffmpeg").rename(nested)
+                entry = "bin/ffmpeg"
+                report["files"][entry] = report["files"].pop("ffmpeg")
+                if fault == "changed":
+                    nested.write_text("another program")
+                elif fault == "escape":
+                    entry = "../ffmpeg"
+                    report["files"][entry] = report["files"]["bin/ffmpeg"]
+                elif fault == "other-name":
+                    nested.rename(nested.with_name("ffprobe"))
+                    entry = "bin/ffprobe"
+                    report["files"][entry] = report["files"]["bin/ffmpeg"]
+                else:
+                    moved = component / "media/elsewhere"
+                    nested.parent.rename(moved)
+                    nested.parent.symlink_to(moved)
+                report["entryPoints"]["ffmpeg"] = entry
+                (component / "qualification.json").write_text(json.dumps(report))
+                payload = root / "payload"
+                payload.mkdir()
+                with self.assertRaisesRegex(builder.BuildError, "runtime_(ffmpeg|link|path)"):
+                    builder.stage_ffmpeg(component, payload, "macos")
+
+    def test_windows_pack_takes_the_exe(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            component, _ = self.ffmpeg_component(root, "ffmpeg.exe")
+            payload = root / "payload"
+            payload.mkdir()
+            builder.stage_ffmpeg(component, payload, "windows")
+            self.assertTrue((payload / "media-tools/ffmpeg.exe").is_file())
+
+    def test_pack_refuses_ffmpeg_that_failed_changed_or_is_a_link(self):
+        for fault in ("failed", "changed", "link", "no-licence", "other-entry"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                component, report = self.ffmpeg_component(root)
+                binary = component / "media/ffmpeg"
+                if fault == "failed":
+                    report["qualification"] = "failed"
+                elif fault == "changed":
+                    binary.write_text("another program")
+                elif fault == "link":
+                    binary.unlink()
+                    binary.symlink_to(component / "media/ffprobe")
+                elif fault == "no-licence":
+                    del report["files"][builder.FFMPEG_LICENSE]
+                else:
+                    report["entryPoints"]["ffmpeg"] = "bin/ffmpeg"
+                (component / "qualification.json").write_text(json.dumps(report))
+                payload = root / "payload"
+                payload.mkdir()
+                with self.assertRaisesRegex(builder.BuildError, "runtime_(ffmpeg|link)"):
+                    builder.stage_ffmpeg(component, payload, "macos")
+
+    def test_only_the_packs_an_installer_carries_hold_ffmpeg(self):
+        profiles = json.loads(
+            (Path(__file__).parent.parent / "runtime/profiles.json").read_text()
+        )["profiles"]
+        self.assertLessEqual(builder.FFMPEG_PROFILES, set(profiles))
+        self.assertEqual(builder.FFMPEG_PROFILES, {"cpu-ort", "coreml-ort"})
 
     def test_windows_qwen_pack_requires_the_owned_loopback_module(self):
         with tempfile.TemporaryDirectory() as temporary:

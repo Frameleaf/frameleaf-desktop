@@ -24,7 +24,7 @@ pub struct RuntimeStore {
     installation_id: String,
 }
 pub struct InstalledRuntime {
-    runtime: VerifiedRuntime,
+    runtime: Arc<VerifiedRuntime>,
     lease: Arc<File>,
     epochs: Arc<dyn crate::runtime_epochs::EpochAuthority>,
     installation_id: String,
@@ -380,7 +380,7 @@ impl RuntimeStore {
         }
         self.epochs.check(&self.installation_id, &runtime)?;
         Ok(Some(InstalledRuntime {
-            runtime,
+            runtime: Arc::new(runtime),
             lease,
             epochs: self.epochs.clone(),
             installation_id: self.installation_id.clone(),
@@ -525,6 +525,33 @@ impl RuntimeStore {
             })
     }
 }
+/// FL-1760: a release's FFmpeg, started under the same epoch check as its sidecars.
+pub(crate) struct InstalledFfmpeg {
+    ffmpeg: crate::native_runtime::PackFfmpeg,
+    runtime: Arc<VerifiedRuntime>,
+    epochs: Arc<dyn crate::runtime_epochs::EpochAuthority>,
+    installation_id: String,
+}
+impl InstalledFfmpeg {
+    /// The program, read again against the signed list, from a release still allowed to run.
+    /// The read is outside the authority's lock, which other launches wait on.
+    pub(crate) fn check(&self) -> Result<PathBuf, String> {
+        self.epochs.check(&self.installation_id, &self.runtime)?;
+        self.ffmpeg.check()
+    }
+    /// Runs `start` under the authority's lock. `start` only spawns the process, so the lock
+    /// covers the launch and not the encode that follows.
+    pub(crate) fn launch<T>(&self, start: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let (mut start, mut started) = (Some(start), None);
+        self.epochs
+            .with_current(&self.installation_id, &self.runtime, &mut || {
+                let start = start.take().ok_or("runtime_epoch_operation_repeated")?;
+                started = Some(start()?);
+                Ok(())
+            })?;
+        started.ok_or_else(|| "runtime_epoch_operation_missing".into())
+    }
+}
 impl InstalledRuntime {
     fn checked<T>(&self, mut operation: impl FnMut() -> Result<T, String>) -> Result<T, String> {
         let mut result = None;
@@ -546,6 +573,16 @@ impl InstalledRuntime {
     }
     pub fn provider(&self) -> &str {
         self.runtime.provider()
+    }
+    /// FL-1760: this release's FFmpeg, if it has one, holding the release in place.
+    pub(crate) fn ffmpeg(&self) -> Option<InstalledFfmpeg> {
+        let ffmpeg = self.runtime.ffmpeg()?.holding(self.lease.clone());
+        Some(InstalledFfmpeg {
+            ffmpeg,
+            runtime: self.runtime.clone(),
+            epochs: self.epochs.clone(),
+            installation_id: self.installation_id.clone(),
+        })
     }
     pub fn start_sidecar(
         &self,
@@ -684,6 +721,118 @@ mod leftover_tests {
         let key = SigningKey::from_bytes(&[42; 32]).verifying_key();
         RuntimeStore::new(root, vec![key], 1, Arc::new(Authority))
     }
+    /// Refuses as the real authority does, from the real record of accepted epochs.
+    #[derive(Default)]
+    struct RecordingAuthority {
+        accepted: std::sync::Mutex<crate::runtime_epochs::RuntimeEpochs>,
+        inside: std::sync::atomic::AtomicBool,
+    }
+    impl crate::runtime_epochs::EpochAuthority for RecordingAuthority {
+        fn installation_id(&self) -> Result<String, String> {
+            Ok("7b0d3c1e-5a4f-4e6b-9c2d-1f0e8a7b6c5d".into())
+        }
+        fn with_current(
+            &self,
+            _: &str,
+            runtime: &VerifiedRuntime,
+            operation: &mut dyn FnMut() -> Result<(), String>,
+        ) -> Result<(), String> {
+            use std::sync::atomic::Ordering;
+            let accepted = self.accepted.lock().unwrap();
+            accepted.check(runtime)?;
+            self.inside.store(true, Ordering::SeqCst);
+            let result = operation();
+            self.inside.store(false, Ordering::SeqCst);
+            result
+        }
+        fn activate(
+            &self,
+            _: &str,
+            _: &VerifiedRuntime,
+            publish: &mut dyn FnMut() -> Result<(), String>,
+        ) -> Result<(), String> {
+            publish()
+        }
+    }
+    fn signed_release(payload: &Path, epoch: u64) -> VerifiedRuntime {
+        use ed25519_dalek::Signer;
+        use sha2::{Digest, Sha256};
+        let name = if cfg!(windows) {
+            "media-tools/ffmpeg.exe"
+        } else {
+            "media-tools/ffmpeg"
+        };
+        fs::create_dir_all(payload.join("media-tools")).unwrap();
+        let mut files = serde_json::Map::new();
+        for (file, bytes) in [("python", b"interpreter".as_slice()), (name, b"encoder")] {
+            fs::write(payload.join(file), bytes).unwrap();
+            files.insert(
+                file.into(),
+                serde_json::json!({
+                    "sha256": format!("{:x}", Sha256::digest(bytes)),
+                    "bytes": bytes.len(),
+                }),
+            );
+        }
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 1, "protocolVersion": 1, "epoch": epoch,
+            "platform": std::env::consts::OS, "architecture": std::env::consts::ARCH,
+            "provider": "CPUExecutionProvider", "python": "python",
+            "sourceRevision": "a".repeat(40), "files": files,
+        }))
+        .unwrap();
+        let key = SigningKey::from_bytes(&[42; 32]);
+        let signature = key.sign(&raw).to_bytes();
+        VerifiedRuntime::verify(payload, &raw, &signature, &[key.verifying_key()], 1).unwrap()
+    }
+
+    #[test]
+    fn every_pack_ffmpeg_launch_passes_the_epoch_check_and_a_refused_release_never_starts() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("frameleaf-pack-epochs-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("old")).unwrap();
+        fs::create_dir_all(root.join("new")).unwrap();
+        let old = Arc::new(signed_release(&root.join("old"), 2));
+        let newer = signed_release(&root.join("new"), 3);
+        let authority = Arc::new(RecordingAuthority::default());
+        let installed = InstalledFfmpeg {
+            ffmpeg: old.ffmpeg().unwrap(),
+            runtime: old.clone(),
+            epochs: authority.clone(),
+            installation_id: "7b0d3c1e-5a4f-4e6b-9c2d-1f0e8a7b6c5d".into(),
+        };
+        assert!(installed.check().unwrap().ends_with(if cfg!(windows) {
+            "ffmpeg.exe"
+        } else {
+            "ffmpeg"
+        }));
+
+        // The first pass: started with the authority's lock held, and let go once it returns.
+        let starts = AtomicU32::new(0);
+        let start = || {
+            assert!(authority.inside.load(Ordering::SeqCst));
+            starts.fetch_add(1, Ordering::SeqCst);
+            Ok(7)
+        };
+        assert_eq!(installed.launch(start), Ok(7));
+        assert!(!authority.inside.load(Ordering::SeqCst));
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        let failed: Result<(), _> = installed.launch(|| Err("did_not_start".to_string()));
+        assert_eq!(failed.unwrap_err(), "did_not_start");
+
+        // A newer release is admitted between the passes: the second pass never starts.
+        authority.accepted.lock().unwrap().admit(&newer).unwrap();
+        assert_eq!(
+            installed.launch(start).unwrap_err(),
+            "runtime_epoch_rollback"
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(installed.check().unwrap_err(), "runtime_epoch_rollback");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn store_with_release() -> (PathBuf, PathBuf) {
         let root = fs::canonicalize(std::env::temp_dir())
             .unwrap()

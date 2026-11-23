@@ -430,6 +430,11 @@ def dependency_indexes(system: str, architecture: str) -> list[str]:
 
 
 QWEN_LLAMA_REVISION = "7fe450e19305b828c199d602c23a8337aaa1f03b"
+# FL-1760: the packs an installer carries also hold FFmpeg, for video conversions on computers
+# without the host package. The packs delivered on demand sit beside one of these.
+FFMPEG_PROFILES = frozenset({"cpu-ort", "coreml-ort"})
+FFMPEG_FOLDER = "media-tools"
+FFMPEG_LICENSE = "FFMPEG-LICENSE.txt"
 
 
 def stage_qwen_binary(source: Path, expected: str, site: Path, notices: Path, system: str) -> Path:
@@ -459,6 +464,55 @@ def stage_qwen_binary(source: Path, expected: str, site: Path, notices: Path, sy
     destination.chmod(0o755)
     shutil.copyfile(license_file, notices / "llama.cpp-LICENSE.txt")
     return destination
+
+
+def qualified_ffmpeg(source: Path, revision: str, work: Path) -> Path:
+    """The source's pinned FFmpeg, downloaded, verified and qualified as for the host package."""
+    from build_host_ffmpeg import build as build_ffmpeg
+
+    component = work / "ffmpeg-component"
+    build_ffmpeg(source, revision, component)
+    return component
+
+
+def stage_ffmpeg(component: Path, payload: Path, system: str) -> dict:
+    """Only the encoder and its licence text, each still the file that was qualified."""
+    executable = "ffmpeg.exe" if system == "windows" else "ffmpeg"
+    try:
+        report = json.loads((component / "qualification.json").read_text())
+        files = report["files"]
+        # Where the archive keeps it may be nested; where the runtime looks for it is fixed.
+        entry = relative(report["entryPoints"]["ffmpeg"])
+        if report["qualification"] != "passed" or Path(entry).name != executable:
+            raise KeyError("qualification")
+        sources = {executable: entry, FFMPEG_LICENSE: FFMPEG_LICENSE}
+        expected = {name: files[item]["sha256"] for name, item in sources.items()}
+        receipt = {
+            "version": report["version"],
+            "archiveSha256": report["archive"]["checksum"].removeprefix("sha256:"),
+            "sourceLockfileSha256": report["sourceLockfileSha256"],
+            "inputSha256": expected[executable],
+            "entryPoint": f"{FFMPEG_FOLDER}/{executable}",
+        }
+        for item in sources.values():
+            path = component / "media" / item
+            for parent in Path(item).parents:
+                if parent != Path(".") and not stat.S_ISDIR(
+                    regular(component / "media" / parent).st_mode
+                ):
+                    raise KeyError(item)
+            if not stat.S_ISREG(regular(path).st_mode):
+                raise KeyError(item)
+    except (FileNotFoundError, KeyError, TypeError, ValueError) as error:
+        raise BuildError("runtime_ffmpeg_component_invalid") from error
+    destination = payload / FFMPEG_FOLDER
+    destination.mkdir()
+    for name, digest in expected.items():
+        shutil.copyfile(component / "media" / sources[name], destination / name)
+        if sha256(destination / name) != digest:
+            raise BuildError("runtime_ffmpeg_digest_mismatch")
+    (destination / executable).chmod(0o755)
+    return receipt
 
 
 def build(
@@ -775,6 +829,11 @@ def build(
             (notices / third_party.name).write_bytes(
                 git_blob(git, source, revision, "licenses/THIRD-PARTY-NOTICES.md", env)
             )
+        ffmpeg_receipt = None
+        if profile_name in FFMPEG_PROFILES:
+            ffmpeg_receipt = stage_ffmpeg(
+                qualified_ffmpeg(source, revision, work), payload, system
+            )
         receipt = {
             "schemaVersion": 1,
             "sourceRepository": "Frameleaf/frameleaf-app",
@@ -792,6 +851,7 @@ def build(
             else [],
             # What this target installs instead of the version the source locks.
             **({"targetPins": pins} if pins else {}),
+            **({"ffmpeg": ffmpeg_receipt} if ffmpeg_receipt else {}),
         }
         qwen_relative = None
         if qwen is not None:
@@ -828,6 +888,13 @@ def build(
             or not {profile["provider"], CPU_PROVIDER} <= set(smoke["providers"])
         ):
             raise BuildError("runtime_relocation_failed")
+        if ffmpeg_receipt:
+            # From its final place, like the interpreter above.
+            banner = run([payload / ffmpeg_receipt["entryPoint"], "-version"], cwd=work, env=smoke_env)
+            if not banner.startswith(
+                "ffmpeg version " + ffmpeg_receipt["version"].rsplit("-", 1)[0]
+            ):
+                raise BuildError("runtime_ffmpeg_version_mismatch")
         if qwen_relative is not None:
             version = subprocess.run(
                 [payload / qwen_relative, "--version"], cwd=work, env=smoke_env,
@@ -891,6 +958,8 @@ def build(
 
 
 def main() -> None:
+    # The FFmpeg builder imports this file by name: one module, so one BuildError.
+    sys.modules.setdefault("build_runtime", sys.modules[__name__])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)

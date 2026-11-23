@@ -1684,6 +1684,7 @@ async fn prepare_on(
         paused: &progress.user_paused,
         ended: &ended,
     };
+    let pack_ffmpeg = installed.ffmpeg();
     let (outcome, ()) = tokio::join!(
         async {
             let outcome = serve(
@@ -1700,11 +1701,12 @@ async fn prepare_on(
             ended.store(true, Ordering::Release);
             outcome
         },
-        crate::transcode_runner::run(&worker, &paths.data, signals),
+        crate::transcode_runner::run(&worker, &paths.data, pack_ffmpeg, signals),
     );
     outcome
 }
 /// The AI work of one setup, from its models to its tasks.
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     worker: &crate::ml_transport::WorkerTransport,
     several_leases: bool,
