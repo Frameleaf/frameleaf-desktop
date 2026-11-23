@@ -42,6 +42,41 @@ impl RuntimeAttestation {
         &self.manifest_sha256
     }
 }
+/// Whether a path exists. Only a confirmed absence is `false`: a lookup that fails proves nothing.
+fn confirmed_present(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err("runtime_store_read_failed".into()),
+    }
+}
+/// A Windows tool limited to 260-character paths deletes a runtime's data but leaves its deepest
+/// files. Without a manifest such a folder can never be loaded, and the accepted epochs live in the
+/// credential store, so clearing it cannot roll anything back. Anything else stays refused, and
+/// nothing is removed unless every entry qualifies.
+fn clear_partly_deleted_releases(releases: &Path) -> Result<(), String> {
+    const REFUSED: &str = "runtime_epoch_recovery_required";
+    let mut leftovers = Vec::new();
+    for entry in fs::read_dir(releases).map_err(|_| "runtime_store_read_failed")? {
+        let path = entry.map_err(|_| "runtime_store_read_failed")?.path();
+        let plain_directory = fs::symlink_metadata(&path)
+            .map_err(|_| "runtime_store_read_failed")?
+            .is_dir();
+        if !plain_directory {
+            return Err(REFUSED.into());
+        }
+        for name in ["manifest.json", "manifest.sig"] {
+            if confirmed_present(&path.join(name))? {
+                return Err(REFUSED.into());
+            }
+        }
+        leftovers.push(path);
+    }
+    for path in leftovers {
+        fs::remove_dir_all(path).map_err(|_| REFUSED)?;
+    }
+    Ok(())
+}
 pub(crate) struct Staging(PathBuf);
 impl Staging {
     /// Acquire cleanup ownership only after exclusive creation; admission failures clean up our root.
@@ -187,14 +222,10 @@ impl RuntimeStore {
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if fs::symlink_metadata(root.join("active.json")).is_ok()
-                    || fs::read_dir(root.join("releases"))
-                        .map_err(|_| "runtime_store_read_failed")?
-                        .next()
-                        .is_some()
-                {
+                if confirmed_present(&root.join("active.json"))? {
                     return Err("runtime_epoch_recovery_required".into());
                 }
+                clear_partly_deleted_releases(&root.join("releases"))?;
                 write_new(
                     &binding,
                     &serde_json::to_vec(&identity).map_err(|_| "runtime_epoch_binding_invalid")?,
@@ -619,5 +650,158 @@ mod private_directory_tests {
         assert!(create_private_directory(&root).is_err());
         assert_eq!(fs::read(&file).unwrap(), b"retain owned bytes");
         private_directory(&root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod leftover_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    struct Authority;
+    impl crate::runtime_epochs::EpochAuthority for Authority {
+        fn installation_id(&self) -> Result<String, String> {
+            Ok("7b0d3c1e-5a4f-4e6b-9c2d-1f0e8a7b6c5d".into())
+        }
+        fn with_current(
+            &self,
+            _: &str,
+            _: &VerifiedRuntime,
+            operation: &mut dyn FnMut() -> Result<(), String>,
+        ) -> Result<(), String> {
+            operation()
+        }
+        fn activate(
+            &self,
+            _: &str,
+            _: &VerifiedRuntime,
+            publish: &mut dyn FnMut() -> Result<(), String>,
+        ) -> Result<(), String> {
+            publish()
+        }
+    }
+    fn open(root: &Path) -> Result<RuntimeStore, String> {
+        let key = SigningKey::from_bytes(&[42; 32]).verifying_key();
+        RuntimeStore::new(root, vec![key], 1, Arc::new(Authority))
+    }
+    fn store_with_release() -> (PathBuf, PathBuf) {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("frameleaf-leftovers-{}", Uuid::new_v4()));
+        // As the app creates them: Windows refuses a store whose folders lack its private ACL.
+        private_directory(&root).unwrap();
+        private_directory(&root.join("releases")).unwrap();
+        let release = root.join("releases").join("a".repeat(64));
+        // Past Windows' 260-character limit, as the files such a delete leaves behind are.
+        let deep = release
+            .join("payload/python")
+            .join("d".repeat(120))
+            .join("e".repeat(120));
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("deep.pyd"), b"left behind").unwrap();
+        assert!(deep.join("deep.pyd").as_os_str().len() > 260);
+        (root, release)
+    }
+
+    // Windows tools limited to 260-character paths delete a runtime's data but leave its deepest files.
+    #[test]
+    fn files_left_by_a_partial_delete_are_cleared_and_the_store_opens() {
+        let (root, release) = store_with_release();
+        open(&root).unwrap();
+        assert!(!release.exists());
+        assert!(root.join("epoch-authority.json").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_release_that_still_has_its_manifest_is_never_cleared() {
+        for name in ["manifest.json", "manifest.sig"] {
+            let (root, release) = store_with_release();
+            fs::write(release.join(name), b"{}").unwrap();
+            assert_eq!(
+                open(&root).err().as_deref(),
+                Some("runtime_epoch_recovery_required")
+            );
+            assert!(release.join("payload/python").exists());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_active_pointer_without_a_binding_stays_refused() {
+        let (root, release) = store_with_release();
+        fs::write(root.join("active.json"), b"{}").unwrap();
+        assert_eq!(
+            open(&root).err().as_deref(),
+            Some("runtime_epoch_recovery_required")
+        );
+        assert!(release.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nothing_is_cleared_when_any_release_is_complete() {
+        let (root, partial) = store_with_release();
+        let complete = root.join("releases").join("b".repeat(64));
+        fs::create_dir_all(&complete).unwrap();
+        fs::write(complete.join("manifest.json"), b"{}").unwrap();
+        assert_eq!(
+            open(&root).err().as_deref(),
+            Some("runtime_epoch_recovery_required")
+        );
+        assert!(partial.exists() && complete.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_manifest_that_cannot_be_checked_keeps_the_release() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads past the permission this test relies on
+        }
+        let (root, release) = store_with_release();
+        fs::write(release.join("manifest.json"), b"{}").unwrap();
+        fs::set_permissions(&release, fs::Permissions::from_mode(0o000)).unwrap();
+        let opened = open(&root).err();
+        fs::set_permissions(&release, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(opened.as_deref(), Some("runtime_store_read_failed"));
+        assert!(release.join("manifest.json").exists());
+        assert!(!root.join("epoch-authority.json").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_cannot_be_checked_is_not_reported_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (root, release) = store_with_release();
+        fs::set_permissions(&release, fs::Permissions::from_mode(0o000)).unwrap();
+        let checked = confirmed_present(&release.join("manifest.json"));
+        fs::set_permissions(&release, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(checked, Err("runtime_store_read_failed".to_string()));
+        assert_eq!(confirmed_present(&release), Ok(true));
+        assert_eq!(confirmed_present(&release.join("absent")), Ok(false));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_in_releases_is_refused_and_its_target_kept() {
+        let (root, release) = store_with_release();
+        let outside = root.with_extension("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::remove_dir_all(&release).unwrap();
+        std::os::unix::fs::symlink(&outside, &release).unwrap();
+        assert_eq!(
+            open(&root).err().as_deref(),
+            Some("runtime_epoch_recovery_required")
+        );
+        assert!(outside.exists());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 }
