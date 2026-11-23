@@ -1153,8 +1153,16 @@ mod tests {
             .concat(),
             &hdr,
         );
-        // An app data path as Windows gives it: not canonical, with a space and a non-ASCII letter.
-        let plain = std::env::temp_dir().join(format!("frameleaf job é {}", Uuid::new_v4()));
+        // A job path with a space and a non-ASCII letter. On Windows it stays as the OS spells it,
+        // not canonical; elsewhere the temp folder can sit behind a link (`/var` on macOS), which
+        // job folders refuse, as they would for an app data folder.
+        let temp = std::env::temp_dir();
+        let temp = if cfg!(windows) {
+            temp
+        } else {
+            temp.canonicalize().unwrap()
+        };
+        let plain = temp.join(format!("frameleaf job é {}", Uuid::new_v4()));
         fs::create_dir_all(&plain).unwrap();
         for (name, source, jobs) in [
             ("onePass", &sdr, &root),
