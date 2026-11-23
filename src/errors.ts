@@ -351,6 +351,7 @@ const families: readonly (readonly [WorkerReason | '', string, string])[] = [
   ['restart', 'The AI runtime stopped answering in the middle of a task. The task went back to your server and Frameleaf starts the runtime again by itself.', 'runtime_prediction_interrupted'],
   ['', 'The AI runtime returned a result Frameleaf could not use, so the task went back to your server.', 'runtime_prediction_invalid'],
   ['', 'The AI model could not process one item, so it went back to your server. Other items continue.', 'runtime_prediction_refused'],
+  ['', 'Your server asked for video settings this computer does not accept, so the video went back to your server. Other videos continue.', 'transcode_options_refused'],
   ['', 'The AI runtime stopped three times in a row on this computer, so AI processing was stopped. Close other apps to free memory, then try again. If it keeps stopping, install Frameleaf again.', 'runtime_crash_loop'],
   ['restart', 'Another copy of Frameleaf is using the AI files on this computer. Close it, then try again.', 'runtime_store_busy runtime_store_lock_failed'],
   ['', 'Frameleaf’s AI folder on this computer is not private to your account, so it was not used. Photos remain available. If this keeps happening, contact Frameleaf support.', 'runtime_store_directory_not_private runtime_store_directory_exists runtime_store_path_invalid runtime_store_lock_invalid runtime_store_privacy_inventory_limit'],
