@@ -1706,6 +1706,7 @@ async fn prepare_on(
     outcome
 }
 /// The AI work of one setup, from its models to its tasks.
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     worker: &crate::ml_transport::WorkerTransport,
     several_leases: bool,

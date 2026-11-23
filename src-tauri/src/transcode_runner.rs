@@ -277,7 +277,7 @@ fn stop_recorded(record: &Path, program: &str) {
 enum Encoder {
     Host {
         package: PathBuf,
-        runtime: VerifiedHostRuntime,
+        runtime: Box<VerifiedHostRuntime>,
     },
     Pack(PackFfmpeg),
 }
@@ -293,7 +293,7 @@ impl Encoder {
             runtime.ffmpeg().ok()?;
             Some(Self::Host {
                 package: layout.runtime,
-                runtime,
+                runtime: Box::new(runtime),
             })
         })
     }
