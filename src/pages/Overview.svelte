@@ -48,16 +48,24 @@
   let packBusy = $state(false);
   const packView = $derived(acceleratedPackView(pack, setup?.providers, formatBytes, code => explainError(code)));
   let alive = true;
-  onMount(() => {
-    let unlisten: UnlistenFn | undefined;
+  // App keeps this one component across My computer and AI processing, so the offer follows
+  // `section` rather than the mount: the app usually opens on My computer.
+  $effect(() => {
+    if (!native || section !== 'ai') return;
+    let shown = true;
     let unlistenPack: UnlistenFn | undefined;
-    if (native && section === 'ai') void (async () => {
+    void (async () => {
       try {
-        unlistenPack = await listen<AcceleratedPack>('accelerated-pack', event => { if (alive) pack = event.payload; });
-        if (!alive) { unlistenPack(); return; }
-        pack = await invoke<AcceleratedPack>('accelerated_pack_status');
+        unlistenPack = await listen<AcceleratedPack>('accelerated-pack', event => { if (shown) pack = event.payload; });
+        if (!shown) { unlistenPack(); return; }
+        const status = await invoke<AcceleratedPack>('accelerated_pack_status');
+        if (shown) pack = status;
       } catch { /* the offer is best-effort: AI processing does not depend on it */ }
     })();
+    return () => { shown = false; unlistenPack?.(); };
+  });
+  onMount(() => {
+    let unlisten: UnlistenFn | undefined;
     if (native) void (async () => {
       try {
         unlisten = await listen<CopyJob>('photo-import', event => { if (alive && event.payload.sourceId === consent?.id) job = event.payload; });
@@ -66,7 +74,7 @@
         if (consent?.registered) job = await invoke<CopyJob | null>('photo_import_status').catch(() => null);
       } catch { /* the summary is best-effort */ }
     })();
-    return () => { alive = false; unlisten?.(); unlistenPack?.(); };
+    return () => { alive = false; unlisten?.(); };
   });
 
   async function packAction(action: 'download' | 'decline' | 'cancel' | 'retry-provider') {
