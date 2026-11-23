@@ -547,6 +547,12 @@ impl InstalledRuntime {
     pub fn provider(&self) -> &str {
         self.runtime.provider()
     }
+    /// FL-1760: this release's FFmpeg, if it has one, holding the release in place.
+    pub(crate) fn ffmpeg(&self) -> Option<crate::native_runtime::PackFfmpeg> {
+        self.runtime
+            .ffmpeg()
+            .map(|ffmpeg| ffmpeg.holding(self.lease.clone()))
+    }
     pub fn start_sidecar(
         &self,
         cache: &Path,

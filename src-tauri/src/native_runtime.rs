@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Artifact {
     pub(crate) sha256: String,
@@ -258,8 +258,54 @@ impl VerifiedRuntime {
     pub fn source_revision(&self) -> &str {
         &self.manifest.source_revision
     }
+    /// FL-1760: this pack's FFmpeg, when its signed list has one. Packs released before it don't.
+    pub(crate) fn ffmpeg(&self) -> Option<PackFfmpeg> {
+        PackFfmpeg::from_files(&self.root, &self.manifest.files)
+    }
     fn check_files(&self) -> Result<(), String> {
         verify_files(&self.root, &self.manifest.files)
+    }
+}
+
+const FFMPEG_FOLDER: &str = "media-tools";
+/// The encoder of a verified pack. The manifest gains no field for it, so apps already released
+/// still accept a pack that carries it.
+pub(crate) struct PackFfmpeg {
+    root: PathBuf,
+    executable: String,
+    files: BTreeMap<String, Artifact>,
+    /// Keeps the release from being replaced while this is in use.
+    lease: Option<std::sync::Arc<File>>,
+}
+impl PackFfmpeg {
+    fn from_files(root: &Path, files: &BTreeMap<String, Artifact>) -> Option<Self> {
+        let name = if cfg!(windows) {
+            "ffmpeg.exe"
+        } else {
+            "ffmpeg"
+        };
+        let executable = format!("{FFMPEG_FOLDER}/{name}");
+        files.contains_key(&executable).then(|| Self {
+            root: root.to_path_buf(),
+            executable,
+            files: files
+                .iter()
+                .filter(|(name, _)| Path::new(name).starts_with(FFMPEG_FOLDER))
+                .map(|(name, artifact)| (name.clone(), artifact.clone()))
+                .collect(),
+            lease: None,
+        })
+    }
+    pub(crate) fn holding(mut self, lease: std::sync::Arc<File>) -> Self {
+        self.lease = Some(lease);
+        self
+    }
+    /// The program to run, with its folder read again against the signed list.
+    pub(crate) fn check(&self) -> Result<PathBuf, String> {
+        for (name, artifact) in &self.files {
+            verify_file(&self.root, name, artifact)?;
+        }
+        Ok(self.root.join(relative(&self.executable)?))
     }
 }
 
@@ -1258,6 +1304,54 @@ fn validate_report(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pack_without_ffmpeg_has_none_and_one_with_it_is_read_against_its_signed_list() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("frameleaf-pack-ffmpeg-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("media-tools")).unwrap();
+        let name = if cfg!(windows) {
+            "media-tools/ffmpeg.exe"
+        } else {
+            "media-tools/ffmpeg"
+        };
+        let listed = |bytes: &[u8]| Artifact {
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            bytes: bytes.len() as u64,
+        };
+        fs::write(root.join(name), b"encoder").unwrap();
+        fs::write(root.join("media-tools/FFMPEG-LICENSE.txt"), b"licence").unwrap();
+        fs::write(root.join("python"), b"interpreter").unwrap();
+
+        // Every pack released so far: a stray file the manifest does not list counts for nothing.
+        let released = BTreeMap::from([("python".to_string(), listed(b"interpreter"))]);
+        assert!(PackFfmpeg::from_files(&root, &released).is_none());
+
+        let mut files = released;
+        files.insert(name.to_string(), listed(b"encoder"));
+        files.insert(
+            "media-tools/FFMPEG-LICENSE.txt".to_string(),
+            listed(b"licence"),
+        );
+        let ffmpeg = PackFfmpeg::from_files(&root, &files).unwrap();
+        assert_eq!(ffmpeg.files.len(), 2);
+        assert_eq!(ffmpeg.check().unwrap(), root.join(name));
+
+        fs::write(root.join("media-tools/FFMPEG-LICENSE.txt"), b"licencf").unwrap();
+        assert_eq!(ffmpeg.check().unwrap_err(), "runtime_artifact_changed");
+        fs::write(root.join("media-tools/FFMPEG-LICENSE.txt"), b"licence").unwrap();
+        fs::write(root.join(name), b"encodes").unwrap();
+        assert_eq!(ffmpeg.check().unwrap_err(), "runtime_artifact_changed");
+        fs::remove_file(root.join(name)).unwrap();
+        assert!(ffmpeg.check().is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("python"), root.join(name)).unwrap();
+            assert!(ffmpeg.check().is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn names_the_known_answer_failure() {
         let failed = || String::from("runtime_qualification_failed");
