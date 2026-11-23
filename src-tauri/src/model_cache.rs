@@ -66,6 +66,68 @@ pub(crate) fn verify_file(
     }
     Ok(())
 }
+type RememberedFiles = std::sync::Mutex<
+    std::collections::HashMap<(PathBuf, String), crate::native_runtime::FileStamp>,
+>;
+/// Kept in memory only, so each launch of the app hashes every model file at least once.
+static VERIFIED_FILES: std::sync::LazyLock<RememberedFiles> =
+    std::sync::LazyLock::new(Default::default);
+
+/// `verify_file` for a model file already in place: the three CLIP keys share their files, and
+/// setting up again in the same launch needs no second hash unless the file's metadata changed.
+pub(crate) fn verify_file_once(
+    path: &Path,
+    bytes: u64,
+    sha256: &str,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    verify_file_remembered(
+        &VERIFIED_FILES,
+        path,
+        bytes,
+        sha256,
+        cancel,
+        std::time::SystemTime::now(),
+    )
+    .map(|_| ())
+}
+/// Returns whether the file was hashed. `now` is read before hashing, so a change during the
+/// hash is not trusted.
+fn verify_file_remembered(
+    remembered: &RememberedFiles,
+    path: &Path,
+    bytes: u64,
+    sha256: &str,
+    cancel: &AtomicBool,
+    now: std::time::SystemTime,
+) -> Result<bool, String> {
+    use crate::native_runtime::{absolute_directory, FileStamp};
+    check_cancel(cancel)?;
+    let key = (path.to_path_buf(), sha256.to_owned());
+    let before = FileStamp::read(path).filter(|stamp| stamp.bytes() == bytes);
+    {
+        let mut known = remembered.lock().unwrap_or_else(|error| error.into_inner());
+        if before.is_some()
+            && known.get(&key) == before.as_ref()
+            && path
+                .parent()
+                .is_some_and(|parent| absolute_directory(parent).is_ok())
+        {
+            return Ok(false);
+        }
+        known.remove(&key);
+    }
+    verify_file(path, bytes, sha256, cancel)?;
+    if let Some(before) = before {
+        if before.settled(now) && FileStamp::read(path).as_ref() == Some(&before) {
+            remembered
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(key, before);
+        }
+    }
+    Ok(true)
+}
 fn partial_path(path: &Path, sha256: &str) -> PathBuf {
     path.with_file_name(format!(".download-{sha256}"))
 }
@@ -697,7 +759,7 @@ async fn prepare_once(
         check_cancel(cancel)?;
         let path = model.join(name);
         if complete {
-            verify_file(
+            verify_file_once(
                 &path,
                 *bytes,
                 plan.hashes[name].as_str().ok_or("model_plan_invalid")?,
@@ -797,6 +859,39 @@ async fn prepare_once(
         fs::rename(&candidate, &active).map_err(|_| "model_cache_publish_failed")?;
     }
     Ok(active)
+}
+
+#[cfg(test)]
+mod remembered_file_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn a_model_file_is_hashed_once_until_it_changes() {
+        let root = std::env::temp_dir().join(format!("frameleaf-model-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("model.onnx");
+        fs::write(&path, b"weights").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(b"weights"));
+        let known = RememberedFiles::default();
+        let cancel = AtomicBool::new(false);
+        let later = || SystemTime::now() + Duration::from_secs(60);
+        let check = || verify_file_remembered(&known, &path, 7, &sha256, &cancel, later());
+        assert_eq!(check(), Ok(true));
+        assert_eq!(check(), Ok(false));
+        fs::write(&path, b"wrights").unwrap();
+        assert_eq!(check(), Err("model_file_changed".to_owned()));
+        fs::remove_file(&path).unwrap();
+        assert_eq!(check(), Err("model_file_unavailable".to_owned()));
+        let _ = fs::remove_dir_all(&root);
+    }
 }
 
 #[cfg(test)]

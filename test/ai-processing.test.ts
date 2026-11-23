@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { processingPlaces, queueProgress, queueState, workloadProvider, type AiQueue } from '../src/ai-processing.ts';
 
@@ -6,6 +7,14 @@ const run: AiQueue = {
   name: 'smartSearch', state: 'running', isPaused: false,
   active: 1, waiting: 5, processed: 4, total: 10,
 };
+
+test('the GPU offer loads when AI processing is opened from My computer, which shares its component', () => {
+  const read = (path: string) => readFileSync(new URL(path, import.meta.url), 'utf8');
+  assert.match(read('../src/App.svelte'), /page === 'overview' \|\| page === 'ai'\}\s*<Overview [^\n]*section=\{page === 'ai' \? 'ai' : 'all'\}/);
+  const overview = read('../src/pages/Overview.svelte');
+  assert.match(overview, /\$effect\(\(\) => \{\s*if \(!native \|\| section !== 'ai'\) return;[\s\S]{0,400}invoke<AcceleratedPack>\('accelerated_pack_status'\)/);
+  assert.doesNotMatch(overview, /onMount\(\(\) => \{[^}]*section === 'ai'/);
+});
 
 test('reports finished jobs for the current Library run, and keeps unavailable counts unknown', () => {
   assert.deepEqual(queueProgress(run), { finished: '4 of 10 finished', counts: '1 running · 5 waiting', percent: 40 });

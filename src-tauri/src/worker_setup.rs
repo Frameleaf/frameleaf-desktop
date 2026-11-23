@@ -1593,6 +1593,8 @@ async fn prepare_on(
     os_supported?;
     progress.update(|status| status.models = None);
     progress.set("preparing-runtime", None);
+    let mut timing = crate::startup_timing::StartupTiming::new();
+    let runtime_began = std::time::Instant::now();
     let cancelled = progress.cancelled.clone();
     let (data, bundle) = (paths.data.clone(), paths.bundle.clone());
     let (installed, attestation) = tauri::async_runtime::spawn_blocking(move || {
@@ -1654,6 +1656,7 @@ async fn prepare_on(
     })
     .await
     .map_err(|_| "runtime_preparation_failed")??;
+    timing.phase("runtime_verification", runtime_began);
     let client = transport::client()?;
     let caps = cancellable(
         transport::capabilities(&client, &saved),
@@ -1691,6 +1694,7 @@ async fn prepare_on(
                 paths.clone(),
                 allow_download,
                 progress.clone(),
+                timing,
             )
             .await;
             ended.store(true, Ordering::Release);
@@ -1709,6 +1713,7 @@ async fn serve(
     paths: SetupPaths,
     allow_download: bool,
     progress: Progress,
+    mut timing: crate::startup_timing::StartupTiming,
 ) -> Result<(), String> {
     use crate::{native_predictor::Step, transport};
     let (source, provider) = (
@@ -1776,6 +1781,7 @@ async fn serve(
         .build()
         .map_err(|_| "network_client_unavailable")?;
     // Complete acquisition before requesting short-lived nonces.
+    let models_began = std::time::Instant::now();
     let mut caches = Vec::new();
     for profile in &profiles {
         let count = counted.insert(profile.cache_identity());
@@ -1821,6 +1827,8 @@ async fn serve(
         .map_err(|code| disk_shortfall(code, &paths.data.join("models"), profile.cache_bytes()))?;
         caches.push(cache);
     }
+    // Includes any download: a launch with nothing to fetch measures verification alone.
+    timing.phase("model_files", models_began);
     let mut failures = TaskFailures::default();
     let mut refusals = 0u32;
     let mut strikes = GrantStrikes::default();
@@ -1940,6 +1948,8 @@ async fn serve(
                     let fixture = challenge.fixture().to_vec();
                     let scratch = paths.data.join("scratch");
                     let provider = profile.provider().to_owned();
+                    let test_name = format!("model_test:{workload}:{provider}");
+                    let test_began = std::time::Instant::now();
                     let clock = WakeClock::new();
                     let ((runtime, qualified), interrupted) = monitored_preparation(
                         move |cancel| {
@@ -1952,6 +1962,7 @@ async fn serve(
                         &progress.cancelled,
                     )
                     .await?;
+                    timing.phase(test_name, test_began);
                     installed = runtime;
                     check_cancel(&progress.cancelled)?;
                     if clock.observe(std::time::SystemTime::now()) {
@@ -2059,6 +2070,7 @@ async fn serve(
                     })
                     .collect();
                 let scratch = paths.data.join("scratch");
+                let comparison_began = std::time::Instant::now();
                 let clock = WakeClock::new();
                 let ((runtime, cpu_ms), interrupted) = monitored_preparation(
                     move |cancel| {
@@ -2091,6 +2103,7 @@ async fn serve(
                     &progress.cancelled,
                 )
                 .await?;
+                timing.phase(format!("gpu_comparison:{workload}"), comparison_began);
                 installed = runtime;
                 check_cancel(&progress.cancelled)?;
                 // FD-64: a pause for power, memory or sleep measured nothing. Wait it out and
@@ -2208,6 +2221,7 @@ async fn serve(
             };
             let scratch = paths.data.join("scratch");
             let cache = cache.clone();
+            let start_began = std::time::Instant::now();
             let (runtime, proofs, mut predictor) =
                 tauri::async_runtime::spawn_blocking(move || {
                     let reservation =
@@ -2230,6 +2244,13 @@ async fn serve(
                 .map_err(|_| "runtime_start_failed")??;
             installed = runtime;
             prepared = proofs;
+            timing.phase("runtime_start", start_began);
+            let (timing_data, timing_report) =
+                (paths.data.clone(), timing.report(&paths.app_version));
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                crate::startup_timing::save(&timing_data, &timing_report)
+            })
+            .await;
             check_cancel(&progress.cancelled)?;
             // The tasks that are ready get at least as long to work as it took to get here,
             // before a refused task is offered again and everything is checked once more:
