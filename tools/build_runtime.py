@@ -435,6 +435,12 @@ QWEN_LLAMA_REVISION = "7fe450e19305b828c199d602c23a8337aaa1f03b"
 FFMPEG_PROFILES = frozenset({"cpu-ort", "coreml-ort"})
 FFMPEG_FOLDER = "media-tools"
 FFMPEG_LICENSE = "FFMPEG-LICENSE.txt"
+FFMPEG_GPL = "FFMPEG-GPL-3.0.txt"
+FFMPEG_SOURCE = "FFMPEG-SOURCE.txt"
+# COPYING.GPLv3 of the source commit below, kept in this repository so no build downloads it.
+FFMPEG_GPL_SHA256 = "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903"
+# A new FFmpeg version stops the build until its exact source commit is recorded here.
+FFMPEG_SOURCE_COMMITS = {"8.1.3-1": "253db2a7b0a8045c54ce68ce33d7f601229b1822"}
 
 
 def stage_qwen_binary(source: Path, expected: str, site: Path, notices: Path, system: str) -> Path:
@@ -475,8 +481,31 @@ def qualified_ffmpeg(source: Path, revision: str, work: Path) -> Path:
     return component
 
 
+def ffmpeg_source_notice(version: str, archive_sha256: str) -> bytes:
+    commit = FFMPEG_SOURCE_COMMITS.get(version)
+    if commit is None:
+        raise BuildError("runtime_ffmpeg_source_unpinned")
+    repository = "https://github.com/jellyfin/jellyfin-ffmpeg"
+    return (
+        f"This folder holds an unmodified build of Jellyfin FFmpeg {version}, licensed under the\n"
+        f"GNU General Public License, version 3 or later. The full text is in {FFMPEG_GPL}.\n\n"
+        f"FFmpeg source and build scripts: {repository}/tree/{commit}\n"
+        "The build scripts at that commit name the source of each bundled library.\n"
+        f"Upstream release: {repository}/releases/tag/v{version}\n"
+        f"SHA-256 of the upstream archive this build came from: {archive_sha256}\n"
+    ).encode()
+
+
+def write_ffmpeg_notices(folder: Path, version: str, archive_sha256: str) -> None:
+    text = (Path(__file__).parent.parent / "runtime/ffmpeg-GPL-3.0.txt").read_bytes()
+    if hashlib.sha256(text).hexdigest() != FFMPEG_GPL_SHA256:
+        raise BuildError("runtime_ffmpeg_licence_changed")
+    (folder / FFMPEG_GPL).write_bytes(text)
+    (folder / FFMPEG_SOURCE).write_bytes(ffmpeg_source_notice(version, archive_sha256))
+
+
 def stage_ffmpeg(component: Path, payload: Path, system: str) -> dict:
-    """Only the encoder and its licence text, each still the file that was qualified."""
+    """Only the encoder and its licence notices, each still the file that was qualified."""
     executable = "ffmpeg.exe" if system == "windows" else "ffmpeg"
     try:
         report = json.loads((component / "qualification.json").read_text())
@@ -485,11 +514,19 @@ def stage_ffmpeg(component: Path, payload: Path, system: str) -> dict:
         entry = relative(report["entryPoints"]["ffmpeg"])
         if report["qualification"] != "passed" or Path(entry).name != executable:
             raise KeyError("qualification")
-        sources = {executable: entry, FFMPEG_LICENSE: FFMPEG_LICENSE}
+        notices = (FFMPEG_LICENSE, FFMPEG_GPL, FFMPEG_SOURCE)
+        sources = {executable: entry, **{name: name for name in notices}}
         expected = {name: files[item]["sha256"] for name, item in sources.items()}
+        archive = report["archive"]["checksum"].removeprefix("sha256:")
+        if (
+            expected[FFMPEG_GPL] != FFMPEG_GPL_SHA256
+            or expected[FFMPEG_SOURCE]
+            != hashlib.sha256(ffmpeg_source_notice(report["version"], archive)).hexdigest()
+        ):
+            raise KeyError("notices")
         receipt = {
             "version": report["version"],
-            "archiveSha256": report["archive"]["checksum"].removeprefix("sha256:"),
+            "archiveSha256": archive,
             "sourceLockfileSha256": report["sourceLockfileSha256"],
             "inputSha256": expected[executable],
             "entryPoint": f"{FFMPEG_FOLDER}/{executable}",
