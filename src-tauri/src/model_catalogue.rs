@@ -663,7 +663,7 @@ pub(crate) fn shared_cache(
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<std::path::PathBuf, String> {
     use crate::{
-        model_cache::{check_cancel, verify_file},
+        model_cache::{check_cancel, verify_file, verify_file_once},
         runtime_store::{private_directory, Staging},
     };
     use std::{fs, path::PathBuf};
@@ -720,7 +720,7 @@ pub(crate) fn shared_cache(
     private_directory(root)?;
     if active.exists() {
         let verified = files.iter().try_for_each(|(relative, (_, bytes, hash))| {
-            verify_file(&active.join(relative), *bytes, hash, cancel)
+            verify_file_once(&active.join(relative), *bytes, hash, cancel)
         });
         match verified {
             Ok(()) => return Ok(active),

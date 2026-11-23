@@ -66,6 +66,7 @@ mod server_steps;
 mod source_consent;
 mod source_import;
 mod source_metadata;
+mod startup_timing;
 mod transcode_args;
 mod transcode_runner;
 mod transport;
