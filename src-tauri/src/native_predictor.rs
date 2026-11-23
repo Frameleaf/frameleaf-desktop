@@ -735,8 +735,16 @@ where
 /// How much longer than the task's deadline a prediction request itself may run.
 const PREDICTION_TIMEOUT_SLACK: Duration = Duration::from_secs(5);
 
-/// How long every runtime process may take to answer its first health check.
-const READY_DEADLINE: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 15 });
+/// How long a serving process may take to answer its first health check. It answers only once
+/// it has loaded every model it was given. Fifteen seconds stopped a healthy RTX 3060 and Ryzen
+/// 3600X process mid-load every time, and each stop began the whole round of checks again. A
+/// process that exits is still noticed at once, and a stop or pause still ends the wait.
+const SERVING_LOAD_DEADLINE: Duration = Duration::from_secs(5 * 60);
+const READY_DEADLINE: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    SERVING_LOAD_DEADLINE
+};
 
 pub struct NativePredictor {
     /// One process per runtime in use (the processor runtime, an accelerated one, or both).
@@ -1301,6 +1309,11 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_serving_process_has_time_to_load_its_models() {
+        // A single model's check may take 120 seconds; serving loads several before it answers.
+        assert!(SERVING_LOAD_DEADLINE >= Duration::from_secs(240));
+    }
     fn now_ms() -> i64 {
         (OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
     }
