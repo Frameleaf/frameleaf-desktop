@@ -1,11 +1,7 @@
 //! FL-1760: the FFmpeg options a server may ask a desktop to run. They are untrusted, so each flag
 //! and the shape of its value is listed here, from what the server's `utils/media.ts` emits for a
 //! software encode. Anything else refuses the whole command. Paths are only ever chosen here.
-use std::{
-    collections::BTreeSet,
-    ffi::{OsStr, OsString},
-    path::Path,
-};
+use std::{collections::BTreeSet, ffi::OsString, path::Path};
 
 const MAX_OPTIONS: usize = 96;
 /// Containers the library accepts as video. Leaving out `hls`, `concat`, `image2` and the like
@@ -140,12 +136,12 @@ fn value_allowed(flag: &str, value: &str) -> Option<bool> {
 /// The server's options, checked. A software command has no input options at all.
 pub(crate) fn validate(input: &[String], output: &[String]) -> Result<Vec<String>, String> {
     let refused = || "transcode_options_refused".to_string();
-    if !input.is_empty() || output.len() > MAX_OPTIONS || output.len() % 2 != 0 {
+    if !input.is_empty() || output.len() > MAX_OPTIONS || !output.len().is_multiple_of(2) {
         return Err(refused());
     }
     let mut seen = BTreeSet::new();
     let mut maps = 0;
-    for pair in output.chunks_exact(2) {
+    for pair in output.as_chunks::<2>().0 {
         let (flag, value) = (pair[0].as_str(), pair[1].as_str());
         if value_allowed(flag, value) != Some(true) {
             return Err(refused());
@@ -199,7 +195,7 @@ pub(crate) fn ffmpeg_args(
         args.extend(["-f", "null", "-"].map(OsString::from));
     } else {
         args.extend(["-f", "mp4"].map(OsString::from));
-        args.push(<&OsStr>::from(output.as_os_str()).to_owned());
+        args.push(output.as_os_str().to_owned());
     }
     args
 }
