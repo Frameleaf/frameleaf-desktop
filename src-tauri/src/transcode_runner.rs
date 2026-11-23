@@ -1073,7 +1073,11 @@ mod tests {
     #[ignore = "needs the pinned FFmpeg in FRAMELEAF_PINNED_MEDIA"]
     async fn the_pinned_ffmpeg_runs_the_servers_commands_and_keeps_to_its_whitelists() {
         let media = PathBuf::from(std::env::var("FRAMELEAF_PINNED_MEDIA").unwrap());
-        let (ffmpeg, ffprobe) = (media.join("ffmpeg"), media.join("ffprobe"));
+        let suffix = std::env::consts::EXE_SUFFIX;
+        let (ffmpeg, ffprobe) = (
+            media.join(format!("ffmpeg{suffix}")),
+            media.join(format!("ffprobe{suffix}")),
+        );
         let commands: serde_json::Value =
             serde_json::from_slice(&fs::read(media.join("commands.json")).unwrap()).unwrap();
         let strings = |value: &serde_json::Value| -> Vec<String> {
@@ -1149,11 +1153,24 @@ mod tests {
             .concat(),
             &hdr,
         );
-        for (name, source) in [
-            ("onePass", &sdr),
-            ("onePassCapped", &sdr),
-            ("twoPass", &sdr),
-            ("tonemap", &hdr),
+        // A job path with a space and a non-ASCII letter. On Windows it stays as the OS spells it,
+        // not canonical; elsewhere the temp folder can sit behind a link (`/var` on macOS), which
+        // job folders refuse, as they would for an app data folder.
+        let temp = std::env::temp_dir();
+        let temp = if cfg!(windows) {
+            temp
+        } else {
+            temp.canonicalize().unwrap()
+        };
+        let plain = temp.join(format!("frameleaf job é {}", Uuid::new_v4()));
+        fs::create_dir_all(&plain).unwrap();
+        for (name, source, jobs) in [
+            ("onePass", &sdr, &root),
+            ("onePass", &sdr, &plain),
+            ("onePassCapped", &sdr, &root),
+            ("twoPass", &sdr, &root),
+            ("twoPass", &sdr, &plain),
+            ("tonemap", &hdr, &root),
         ] {
             let command = &commands[name];
             let two_pass = command["twoPass"].as_bool().unwrap();
@@ -1168,7 +1185,7 @@ mod tests {
                 source_bytes: fs::metadata(source).unwrap().len(),
                 max_output_bytes: MIN_OUTPUT_ALLOWANCE,
             };
-            let workspace = Workspace::create(&root.join("jobs"), &job.id).unwrap();
+            let workspace = Workspace::create(&jobs.join("jobs"), &job.id).unwrap();
             fs::copy(source, workspace.0.join(INPUT)).unwrap();
             let progress = Arc::new(EncodeProgress::new());
             let launches = Arc::new(LaunchGate::new());
@@ -1236,7 +1253,7 @@ mod tests {
         // The builder's own command line, on inputs that try to reach outside the job.
         let options =
             transcode_args::validate(&[], &strings(&commands["onePass"]["outputOptions"])).unwrap();
-        let output = root.join("refused.mp4");
+        let output = plain.join("refused.mp4");
         let run = |args: Vec<std::ffi::OsString>| {
             Command::new(&ffmpeg)
                 .args(args)
@@ -1245,14 +1262,14 @@ mod tests {
                 .unwrap()
         };
         let built = |input: &Path| {
-            transcode_args::ffmpeg_args(input, &output, &root.join("log"), &options, Pass::Only)
+            transcode_args::ffmpeg_args(input, &output, &plain.join("log"), &options, Pass::Only)
         };
-        let segment = root.join("segment.ts");
+        let segment = plain.join("segment.ts");
         make(
             &["-i", sdr.to_str().unwrap(), "-c", "copy", "-f", "mpegts"],
             &segment,
         );
-        let playlist = root.join("reads-a-file.m3u8");
+        let playlist = plain.join("reads-a-file.m3u8");
         fs::write(
             &playlist,
             "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nsegment.ts\n#EXT-X-ENDLIST\n",
@@ -1283,7 +1300,7 @@ mod tests {
             "the playlist should read its segment without the list"
         );
         fs::remove_file(&output).unwrap();
-        let concat = root.join("reads-a-file.ffconcat");
+        let concat = plain.join("reads-a-file.ffconcat");
         fs::write(&concat, "ffconcat version 1.0\nfile 'segment.ts'\n").unwrap();
         for input in [&playlist, &concat] {
             let refused = run(built(input));
@@ -1301,6 +1318,7 @@ mod tests {
             assert!(!refused.status.success(), "{url}");
             assert!(said.contains("not on whitelist"), "{url}: {said}");
         }
+        fs::remove_dir_all(plain).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
