@@ -284,29 +284,34 @@ pub(crate) fn verify_files(root: &Path, files: &BTreeMap<String, Artifact>) -> R
         return Err("runtime_inventory_mismatch".into());
     }
     for (name, artifact) in files {
-        let path = root.join(relative(name)?);
-        let meta = no_link(&path)?;
-        if !meta.is_file() || meta.len() != artifact.bytes {
+        verify_file(root, name, artifact)?;
+    }
+    Ok(())
+}
+/// One listed file, read again: no link, the listed size and the listed digest.
+pub(crate) fn verify_file(root: &Path, name: &str, artifact: &Artifact) -> Result<(), String> {
+    let path = root.join(relative(name)?);
+    let meta = no_link(&path)?;
+    if !meta.is_file() || meta.len() != artifact.bytes {
+        return Err("runtime_artifact_changed".into());
+    }
+    let mut file = File::open(path).map_err(|_| "runtime_file_unavailable")?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    let mut read = 0;
+    loop {
+        let count = file.read(&mut buffer).map_err(|_| "runtime_read_failed")?;
+        if count == 0 {
+            break;
+        }
+        read += count as u64;
+        if read > artifact.bytes {
             return Err("runtime_artifact_changed".into());
         }
-        let mut file = File::open(path).map_err(|_| "runtime_file_unavailable")?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0u8; 65536];
-        let mut read = 0;
-        loop {
-            let count = file.read(&mut buffer).map_err(|_| "runtime_read_failed")?;
-            if count == 0 {
-                break;
-            }
-            read += count as u64;
-            if read > artifact.bytes {
-                return Err("runtime_artifact_changed".into());
-            }
-            hasher.update(&buffer[..count]);
-        }
-        if read != artifact.bytes || format!("{:x}", hasher.finalize()) != artifact.sha256 {
-            return Err("runtime_artifact_changed".into());
-        }
+        hasher.update(&buffer[..count]);
+    }
+    if read != artifact.bytes || format!("{:x}", hasher.finalize()) != artifact.sha256 {
+        return Err("runtime_artifact_changed".into());
     }
     Ok(())
 }

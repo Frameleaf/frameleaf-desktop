@@ -66,6 +66,8 @@ mod server_steps;
 mod source_consent;
 mod source_import;
 mod source_metadata;
+mod transcode_args;
+mod transcode_runner;
 mod transport;
 mod tray;
 mod updates;
@@ -1012,6 +1014,12 @@ pub fn run() {
             // A sign-out that was cut short before it wiped the Photos data finishes here.
             photo_session::clear_if_owed(app.handle());
             file_manager_import::setup(app.handle());
+            // FL-1760: temp files and any encoder a crash left behind.
+            if let Ok(paths) = worker_paths(app.handle()) {
+                tauri::async_runtime::spawn_blocking(move || {
+                    transcode_runner::clean_after_crash(&paths.data)
+                });
+            }
             // A desktop without a tray (some Linux sessions) still gets the window.
             if let Err(error) = tray::build(app.handle()) {
                 eprintln!("tray unavailable: {error}");

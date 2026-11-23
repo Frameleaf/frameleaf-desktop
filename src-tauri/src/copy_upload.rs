@@ -285,13 +285,21 @@ fn read_exact_at(file: &std::fs::File, mut buffer: &mut [u8], mut at: u64) -> st
 }
 /// Streams `[start, start + len)` from the staged original so parts in flight never sit in memory.
 /// A local read failure marks `stage_failed`, so it is reported as a staging error, not a network one.
-fn part_body(
+pub(crate) fn part_body(
     file: Arc<std::fs::File>,
     start: u64,
     len: u64,
     stage_failed: Arc<AtomicBool>,
 ) -> reqwest::Body {
-    let stream = futures_util::stream::try_unfold((start, len), move |(at, left)| {
+    reqwest::Body::wrap_stream(part_stream(file, start, len, stage_failed))
+}
+pub(crate) fn part_stream(
+    file: Arc<std::fs::File>,
+    start: u64,
+    len: u64,
+    stage_failed: Arc<AtomicBool>,
+) -> impl futures_util::Stream<Item = std::io::Result<Vec<u8>>> + Send + Sync + 'static {
+    futures_util::stream::try_unfold((start, len), move |(at, left)| {
         let file = file.clone();
         let stage_failed = stage_failed.clone();
         async move {
@@ -317,8 +325,7 @@ fn part_body(
             let n = chunk.len() as u64;
             Ok::<_, std::io::Error>(Some((chunk, (at + n, left - n))))
         }
-    });
-    reqwest::Body::wrap_stream(stream)
+    })
 }
 async fn pause(delay: Duration, cancelled: &AtomicBool) -> Result<(), String> {
     let until = tokio::time::Instant::now() + delay;

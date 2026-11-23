@@ -644,6 +644,20 @@ impl Connection {
         operation: &str,
         payload: &str,
     ) -> Result<Response, String> {
+        self.request_with_body_limit(method, path, operation, payload, None)
+            .await
+    }
+    /// `body_limit`: for a response whose body is read after the lock is released, which may take
+    /// far longer than the client's own limit. Its headers must still arrive promptly, because
+    /// the lock is held until they do.
+    async fn request_with_body_limit(
+        &mut self,
+        method: Method,
+        path: &str,
+        operation: &str,
+        payload: &str,
+        body_limit: Option<std::time::Duration>,
+    ) -> Result<Response, String> {
         let expected = self.worker.clone();
         let checkpoint = self.checkpoint;
         let proof = reserve_proof_at(
@@ -667,10 +681,16 @@ impl Connection {
         if method == Method::POST {
             request = request.json(&serde_json::json!({"payload":payload}));
         }
-        let response = request
-            .send()
+        let response = match body_limit {
+            None => request.send().await,
+            Some(limit) => tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                request.timeout(limit).send(),
+            )
             .await
-            .map_err(|_| "worker_request_interrupted")?;
+            .map_err(|_| "worker_request_interrupted")?,
+        }
+        .map_err(|_| "worker_request_interrupted")?;
         if let Some(skew) = transport::clock_skew(&response) {
             self.clock.set(skew);
         }
@@ -1014,6 +1034,47 @@ impl WorkerTransport {
             .await?;
         // Each profile carries its fixture (up to 2 MiB, base64): room for every task's profiles.
         worker_json(response, 32 * 1024 * 1024).await
+    }
+    /// FL-1760: one signed video conversion request, in its turn with the AI worker's. The lock is
+    /// released when this returns, before any body is read. These can be dropped part way (a
+    /// stop, a timeout), so they never renew the session: a renewal cut short would lose the
+    /// rotated token. `maintain_session` does that, from callers that see it through.
+    pub(crate) async fn transcode_request(
+        &self,
+        method: Method,
+        path: &str,
+        operation: &str,
+        payload: &str,
+        body_limit: Option<std::time::Duration>,
+    ) -> Result<Response, String> {
+        let mut connection = self.0.lock().await;
+        connection.resync().await?;
+        connection
+            .request_with_body_limit(method, path, operation, payload, body_limit)
+            .await
+    }
+    pub(crate) async fn transcode_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        operation: &str,
+        payload: &str,
+    ) -> Result<T, String> {
+        let response = self
+            .transcode_request(Method::POST, path, operation, payload, None)
+            .await?;
+        worker_json(response, 256 * 1024).await
+    }
+    /// The client and address for the unsigned upload, which must not hold the lock.
+    pub(crate) async fn transcode_upload_target(
+        &self,
+        path: &str,
+    ) -> Result<(Client, Url), String> {
+        let connection = self.0.lock().await;
+        let url = connection
+            .base
+            .join(path)
+            .map_err(|_| "worker_path_invalid")?;
+        Ok((connection.client.clone(), url))
     }
     pub(crate) async fn maintain_session(&self) -> Result<(), String> {
         self.0.lock().await.ensure_current().await
