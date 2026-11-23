@@ -138,6 +138,8 @@ impl EncodeProgress {
         Some(self.0.load(Ordering::Acquire)).filter(|value| *value != PROGRESS_UNKNOWN)
     }
     fn rise(&self, percent: u8) {
+        // Renamed try_update in Rust 1.95; this crate still supports 1.90.
+        #[allow(deprecated)]
         let _ = self
             .0
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -478,7 +480,7 @@ async fn watch(
         }
         wall = now;
         seconds = seconds.wrapping_add(1);
-        if seconds % 5 == 0 {
+        if seconds.is_multiple_of(5) {
             let Some(status) =
                 unless_stopped(signals, blocking(crate::resource_policy::sample)).await
             else {
@@ -826,7 +828,7 @@ async fn encode(
             Err(_) => return Err(FAILED),
         }
         ticks = ticks.wrapping_add(1);
-        if ticks % 4 == 0 {
+        if ticks.is_multiple_of(4) {
             let target = folder.to_path_buf();
             if blocking(move || over_limit(&target, limit, room))
                 .await

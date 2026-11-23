@@ -1746,7 +1746,7 @@ async fn serve(
     // FD-52: an accelerated runtime beside the processor one, where the app ships one this
     // computer can use. Any fault on that side leaves every workload on the processor.
     let (accelerated, mut plan) =
-        crate::provider_selection::open(&paths, &installed, &worker, groups.clone()).await?;
+        crate::provider_selection::open(&paths, &installed, worker, groups.clone()).await?;
     let mut installed =
         crate::provider_selection::Runtimes::new(installed, attestation, accelerated);
     let profiles: Vec<_> = groups.iter().flatten().cloned().collect();
@@ -2441,7 +2441,7 @@ async fn serve(
                 let grace = LEASE_RETURN + Duration::from_secs(u64::from(at_once.min(8)) - 1);
                 let completed = returning_lease(
                     predictor.work(
-                        &worker,
+                        worker,
                         &accepted,
                         &mut cancel,
                         &pool,
