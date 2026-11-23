@@ -69,10 +69,12 @@ test("a tagged Forgejo release needs desktop.yml's Linux tests to have passed on
       const page = Number(/page=(\d+)/.exec(path)[1]);
       return { workflow_runs: runs.slice((page - 1) * 50, page * 50) };
     }
-    const commit = /^git\/commits\/(.+)$/.exec(path)?.[1];
-    if (commit) {
-      if (!(commit in trees)) throw new Error(`forgejo_gh_http_404: ${path}`);
-      return { commit: { tree: { sha: trees[commit] } } };
+    // As Forgejo answers: the listing's own `sha` is whatever was asked for, a commit included.
+    const reference = /^git\/trees\/([^?]+)/.exec(path)?.[1];
+    if (reference) {
+      const id = reference in trees ? trees[reference] : Object.values(trees).includes(reference) ? reference : null;
+      if (!id) throw new Error(`forgejo_gh_http_404: ${path}`);
+      return { sha: reference, tree: [{ path: "src", mode: "040000", type: "tree", sha: id }] };
     }
     return jobs[/^actions\/runs\/(\d+)\/jobs$/.exec(path)[1]];
   };
@@ -86,7 +88,7 @@ test("a tagged Forgejo release needs desktop.yml's Linux tests to have passed on
   assert.match(await checkLinuxTests(tree, forgejoApi([...old, run(7, "head")], { head: tree }, { 7: [job("success")] })), /run 7/);
 
   for (const [name, api] of [
-    ["another tree", forgejoApi([run(1, "c")], { c: other }, { 1: [job("success")] })],
+    ["another tree", forgejoApi([run(1, "c")], { [tree]: tree, c: other }, { 1: [job("success")] })],
     ["failed", forgejoApi([run(1, "c")], { c: tree }, { 1: [job("failure")] })],
     ["skipped by a probe", forgejoApi([run(1, "c")], { c: tree }, { 1: [job("skipped")] })],
     ["only another job passed", forgejoApi([run(1, "c")], { c: tree }, { 1: [job("success", 1, "check (macos-latest)")] })],
@@ -98,6 +100,9 @@ test("a tagged Forgejo release needs desktop.yml's Linux tests to have passed on
   // Anything Forgejo cannot answer stops the release.
   await assert.rejects(checkLinuxTests(tree, async () => { throw new Error("forgejo_gh_http_500: actions/runs"); }), /forgejo_gh_http_500/);
   await assert.rejects(checkLinuxTests(tree, async () => ({})), /linux_tests_listing_invalid/);
+  let requests = 0;
+  const truncated = async () => { if (requests++) throw new Error("the truncated listing was accepted"); return { tree: [], truncated: true }; };
+  await assert.rejects(checkLinuxTests(tree, truncated), /linux_tests_listing_invalid: Forgejo did not return a whole git tree/);
   await assert.rejects(checkLinuxTests(tree, forgejoApi([run(1, "c")], { c: tree }, { 1: { message: "no" } })), /linux_tests_listing_invalid/);
   const commitDown = async (path) => { if (path.startsWith("actions/runs?")) return { workflow_runs: [run(1, "c")] }; throw new Error(`forgejo_gh_http_503: ${path}`); };
   await assert.rejects(checkLinuxTests(tree, commitDown), /forgejo_gh_http_503/);
