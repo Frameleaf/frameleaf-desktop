@@ -4,9 +4,9 @@
 use crate::{
     host_runtime::VerifiedHostRuntime,
     ml_transport::WorkerTransport,
-    native_runtime::PackFfmpeg,
     package_lease::CodeLease,
     process_tree::ProcessTree,
+    runtime_store::InstalledFfmpeg,
     transcode_args::{self, Pass},
 };
 use futures_util::StreamExt;
@@ -279,7 +279,23 @@ enum Encoder {
         package: PathBuf,
         runtime: Box<VerifiedHostRuntime>,
     },
-    Pack(PackFfmpeg),
+    Pack(Arc<InstalledFfmpeg>),
+}
+/// The program of one job. A pack's goes through its release's epoch check at every launch.
+#[derive(Clone)]
+struct Ffmpeg {
+    path: PathBuf,
+    pack: Option<Arc<InstalledFfmpeg>>,
+}
+impl Ffmpeg {
+    fn launch<T>(&self, start: impl FnOnce(&Path) -> Result<T, ()>) -> Result<T, ()> {
+        match &self.pack {
+            Some(pack) => pack
+                .launch(|| start(&self.path).map_err(|()| "transcode_launch_failed".to_string()))
+                .map_err(|_| ()),
+            None => start(&self.path),
+        }
+    }
 }
 impl Encoder {
     fn locate_host() -> Option<Self> {
@@ -299,13 +315,18 @@ impl Encoder {
     }
     /// Holds its package still for the job and reads its FFmpeg again. A pack's release is
     /// already held for as long as the worker's setup runs.
-    fn ready(&self) -> Result<(Option<CodeLease>, PathBuf), String> {
+    fn ready(&self) -> Result<(Option<CodeLease>, Ffmpeg), String> {
         match self {
             Self::Host { package, runtime } => {
                 let lease = CodeLease::acquire_existing(package)?;
-                Ok((Some(lease), runtime.ffmpeg()?))
+                let path = runtime.ffmpeg()?;
+                Ok((Some(lease), Ffmpeg { path, pack: None }))
             }
-            Self::Pack(ffmpeg) => Ok((None, ffmpeg.check()?)),
+            Self::Pack(pack) => {
+                let path = pack.check()?;
+                let pack = Some(pack.clone());
+                Ok((None, Ffmpeg { path, pack }))
+            }
         }
     }
 }
@@ -340,10 +361,10 @@ async fn wait(period: Duration, signals: Signals<'_>) {
 pub(crate) async fn run(
     worker: &WorkerTransport,
     data: &Path,
-    pack: Option<PackFfmpeg>,
+    pack: Option<InstalledFfmpeg>,
     signals: Signals<'_>,
 ) {
-    let mut pack = pack.map(|ffmpeg| Arc::new(Encoder::Pack(ffmpeg)));
+    let mut pack = pack.map(|ffmpeg| Arc::new(Encoder::Pack(Arc::new(ffmpeg))));
     let cleanup = data.to_path_buf();
     let _ = blocking(move || clean_after_crash(&cleanup)).await;
     let root = data.join(FOLDER);
@@ -418,7 +439,7 @@ async fn convert(
     worker: &WorkerTransport,
     root: &Path,
     job: &Job,
-    ffmpeg: &Path,
+    ffmpeg: &Ffmpeg,
     lease_ends: Instant,
     signals: Signals<'_>,
 ) {
@@ -560,7 +581,7 @@ async fn work(
     worker: &WorkerTransport,
     job: &Job,
     folder: &Path,
-    ffmpeg: &Path,
+    ffmpeg: &Ffmpeg,
     progress: &Arc<EncodeProgress>,
     launches: &Arc<LaunchGate<RunningEncoder>>,
 ) -> End {
@@ -823,21 +844,19 @@ fn start_encoder(
 async fn encode(
     job: &Job,
     folder: &Path,
-    ffmpeg: &Path,
+    ffmpeg: &Ffmpeg,
     pass: Pass,
     progress: &Arc<EncodeProgress>,
     launches: &Arc<LaunchGate<RunningEncoder>>,
 ) -> Result<(), End> {
     const FAILED: End = End::HandBack("encode-failed");
-    let (options, target, program) = (
-        job.options.clone(),
-        folder.to_path_buf(),
-        ffmpeg.to_path_buf(),
-    );
+    let (options, target, program) = (job.options.clone(), folder.to_path_buf(), ffmpeg.clone());
     // Starting a process and writing its record touch the disk.
     let (frame_count, shared, gate) = (job.frame_count, progress.clone(), launches.clone());
     let launched = blocking(move || {
-        gate.launch(|| start_encoder(&options, &target, &program, pass, frame_count, shared))
+        gate.launch(|| {
+            program.launch(|path| start_encoder(&options, &target, path, pass, frame_count, shared))
+        })
     })
     .await
     .unwrap_or(false);
@@ -1154,7 +1173,11 @@ mod tests {
             let progress = Arc::new(EncodeProgress::new());
             let launches = Arc::new(LaunchGate::new());
             for pass in passes(two_pass) {
-                encode(&job, &workspace.0, &ffmpeg, *pass, &progress, &launches)
+                let program = Ffmpeg {
+                    path: ffmpeg.clone(),
+                    pack: None,
+                };
+                encode(&job, &workspace.0, &program, *pass, &progress, &launches)
                     .await
                     .unwrap_or_else(|end| panic!("{name}: {end:?}"));
                 let expected = if *pass == Pass::First { 50 } else { 100 };

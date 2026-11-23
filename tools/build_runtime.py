@@ -481,27 +481,34 @@ def stage_ffmpeg(component: Path, payload: Path, system: str) -> dict:
     try:
         report = json.loads((component / "qualification.json").read_text())
         files = report["files"]
-        expected = {name: files[name]["sha256"] for name in (executable, FFMPEG_LICENSE)}
-        if (
-            report["qualification"] != "passed"
-            or report["entryPoints"]["ffmpeg"] != executable
-        ):
+        # Where the archive keeps it may be nested; where the runtime looks for it is fixed.
+        entry = relative(report["entryPoints"]["ffmpeg"])
+        if report["qualification"] != "passed" or Path(entry).name != executable:
             raise KeyError("qualification")
+        sources = {executable: entry, FFMPEG_LICENSE: FFMPEG_LICENSE}
+        expected = {name: files[item]["sha256"] for name, item in sources.items()}
         receipt = {
             "version": report["version"],
             "archiveSha256": report["archive"]["checksum"].removeprefix("sha256:"),
             "sourceLockfileSha256": report["sourceLockfileSha256"],
             "inputSha256": expected[executable],
+            "entryPoint": f"{FFMPEG_FOLDER}/{executable}",
         }
-        for name in expected:
-            if not stat.S_ISREG(regular(component / "media" / name).st_mode):
-                raise KeyError(name)
+        for item in sources.values():
+            path = component / "media" / item
+            for parent in Path(item).parents:
+                if parent != Path(".") and not stat.S_ISDIR(
+                    regular(component / "media" / parent).st_mode
+                ):
+                    raise KeyError(item)
+            if not stat.S_ISREG(regular(path).st_mode):
+                raise KeyError(item)
     except (FileNotFoundError, KeyError, TypeError, ValueError) as error:
         raise BuildError("runtime_ffmpeg_component_invalid") from error
     destination = payload / FFMPEG_FOLDER
     destination.mkdir()
     for name, digest in expected.items():
-        shutil.copyfile(component / "media" / name, destination / name)
+        shutil.copyfile(component / "media" / sources[name], destination / name)
         if sha256(destination / name) != digest:
             raise BuildError("runtime_ffmpeg_digest_mismatch")
     (destination / executable).chmod(0o755)
@@ -883,8 +890,7 @@ def build(
             raise BuildError("runtime_relocation_failed")
         if ffmpeg_receipt:
             # From its final place, like the interpreter above.
-            name = "ffmpeg.exe" if system == "windows" else "ffmpeg"
-            banner = run([payload / FFMPEG_FOLDER / name, "-version"], cwd=work, env=smoke_env)
+            banner = run([payload / ffmpeg_receipt["entryPoint"], "-version"], cwd=work, env=smoke_env)
             if not banner.startswith(
                 "ffmpeg version " + ffmpeg_receipt["version"].rsplit("-", 1)[0]
             ):

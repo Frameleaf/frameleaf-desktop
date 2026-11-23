@@ -90,6 +90,62 @@ class RuntimeBuilderTests(unittest.TestCase):
             self.assertEqual(receipt["archiveSha256"], "a" * 64)
             self.assertEqual(receipt["version"], "8.1.3-1")
 
+    def test_pack_reads_a_nested_entry_point_and_stages_it_where_the_runtime_looks(self):
+        for system, executable in (("macos", "ffmpeg"), ("windows", "ffmpeg.exe")):
+            with self.subTest(system=system), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                component, report = self.ffmpeg_component(root, executable)
+                nested = component / "media/portable/bin" / executable
+                nested.parent.mkdir(parents=True)
+                (component / "media" / executable).rename(nested)
+                entry = f"portable/bin/{executable}"
+                report["files"][entry] = report["files"].pop(executable)
+                report["entryPoints"]["ffmpeg"] = entry
+                (component / "qualification.json").write_text(json.dumps(report))
+                payload = root / "payload"
+                payload.mkdir()
+                receipt = builder.stage_ffmpeg(component, payload, system)
+                self.assertEqual(receipt["entryPoint"], f"media-tools/{executable}")
+                inventory = builder.inventory(payload)
+                self.assertEqual(
+                    set(inventory),
+                    {f"media-tools/{executable}", "media-tools/FFMPEG-LICENSE.txt"},
+                )
+                self.assertEqual(
+                    inventory[f"media-tools/{executable}"]["sha256"],
+                    report["files"][entry]["sha256"],
+                )
+
+    def test_pack_refuses_a_nested_entry_point_that_changed_escapes_or_is_another_program(self):
+        for fault in ("changed", "escape", "other-name", "linked-folder"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                component, report = self.ffmpeg_component(root)
+                nested = component / "media/bin/ffmpeg"
+                nested.parent.mkdir()
+                (component / "media/ffmpeg").rename(nested)
+                entry = "bin/ffmpeg"
+                report["files"][entry] = report["files"].pop("ffmpeg")
+                if fault == "changed":
+                    nested.write_text("another program")
+                elif fault == "escape":
+                    entry = "../ffmpeg"
+                    report["files"][entry] = report["files"]["bin/ffmpeg"]
+                elif fault == "other-name":
+                    nested.rename(nested.with_name("ffprobe"))
+                    entry = "bin/ffprobe"
+                    report["files"][entry] = report["files"]["bin/ffmpeg"]
+                else:
+                    moved = component / "media/elsewhere"
+                    nested.parent.rename(moved)
+                    nested.parent.symlink_to(moved)
+                report["entryPoints"]["ffmpeg"] = entry
+                (component / "qualification.json").write_text(json.dumps(report))
+                payload = root / "payload"
+                payload.mkdir()
+                with self.assertRaisesRegex(builder.BuildError, "runtime_(ffmpeg|link|path)"):
+                    builder.stage_ffmpeg(component, payload, "macos")
+
     def test_windows_pack_takes_the_exe(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
