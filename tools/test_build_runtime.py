@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -86,6 +87,7 @@ class RuntimeBuilderTests(unittest.TestCase):
             inventory = builder.inventory(payload)
             self.assertEqual(set(inventory), {"media-tools/ffmpeg", "media-tools/FFMPEG-LICENSE.txt"})
             self.assertEqual(inventory["media-tools/ffmpeg"]["sha256"], report["files"]["ffmpeg"]["sha256"])
+            if os.name != "nt":  # Windows has no execute bit
             self.assertTrue((payload / "media-tools/ffmpeg").stat().st_mode & 0o100)
             self.assertEqual(receipt["archiveSha256"], "a" * 64)
             self.assertEqual(receipt["version"], "8.1.3-1")
