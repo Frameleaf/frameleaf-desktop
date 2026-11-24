@@ -102,12 +102,11 @@ export function updateManifest(tag, repository, signatures) {
     AppImage: ["linux", "appimage"],
     deb: ["linux", "deb"],
     exe: ["windows", "nsis"],
-    msi: ["windows", "msi"],
   };
   const platforms = {};
   for (const [name, value] of Object.entries(signatures)) {
     const filename = name.startsWith(`Frameleaf_${version}_`) && name.slice(`Frameleaf_${version}_`.length);
-    const match = filename && /^(aarch64|arm64|amd64|x64)(?:-setup|_en-US)?\.(app\.tar\.gz|AppImage|deb|exe|msi)$/.exec(filename);
+    const match = filename && /^(aarch64|arm64|amd64|x64)(?:-setup(?:-unsigned)?)?\.(app\.tar\.gz|AppImage|deb|exe)$/.exec(filename);
     if (!match) throw new Error(`update_asset_invalid: ${name}`);
     const [, architecture, extension] = match;
     const [os, installer] = formats[extension];
@@ -148,10 +147,12 @@ export function verifyUpdaterAsset(file, signature, publicKey, version) {
 }
 
 // Every target Desktop can update in place. A release that omits one leaves those installs on their current version.
+// Windows updates through NSIS only: it installs per user, so an update needs no administrator prompt. The MSI
+// (Chocolatey's package) is never offered, and MSI installs find no entry and keep updating through Chocolatey.
 export const updateFeedTargets = [
   "darwin-aarch64-app", "darwin-x86_64-app",
   "linux-aarch64-appimage", "linux-aarch64-deb", "linux-x86_64-appimage", "linux-x86_64-deb",
-  "windows-x86_64-msi", "windows-x86_64-nsis",
+  "windows-x86_64-nsis",
 ];
 
 /** Markdown for the workflow summary and draft notes, so an omitted platform is visible before publication. */
@@ -161,7 +162,7 @@ export function updateFeedSummary(manifest) {
   const windows = offered.some((target) => target.startsWith("windows-"));
   const lines = [`### Update feed for ${manifest.version}`, "", `\`latest.json\` offers ${manifest.version} to: ${offered.join(", ")}.`];
   if (!windows) {
-    lines.push("", `**Windows was excluded from the update feed.** This release has no signed Windows installers, so Desktop on Windows will not be offered ${manifest.version} and stays on its installed version until a release includes them.`);
+    lines.push("", `**Windows was excluded from the update feed.** This release has no Windows NSIS installer, so Desktop on Windows will not be offered ${manifest.version} and stays on its installed version until a release includes them.`);
   }
   const others = windows ? missing : missing.filter((target) => !target.startsWith("windows-"));
   if (others.length) lines.push("", `Not in the update feed: ${others.join(", ")}.`);

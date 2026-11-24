@@ -91,10 +91,10 @@
 </script>
 
 <section class="page" aria-labelledby="remote-title">
-  <header class="toolbar">
-    <h1 id="remote-title">Remote access</h1>
+  <header class="toolbar" data-tauri-drag-region>
+    <h1 id="remote-title" data-tauri-drag-region>Remote access</h1>
     <span class="pill {pill.tone}"><i aria-hidden="true"></i>{pill.label}</span>
-    <span class="sp"></span>
+    <span class="sp" data-tauri-drag-region></span>
     <span class="path" aria-label="How this computer is connected: {path.currentLabel}">{#each steps as step (step.key)}<span class:on={step.on}>{step.label}</span>{/each}</span>
     {#if remote && !remote.unavailableReason}
       <button class="toggle" style="margin-left:6px" class:on={!!remote.enabled} role="switch" aria-checked={!!remote.enabled} aria-label="Remote access" disabled={saving || !native} onclick={() => update({ enabled: !remote?.enabled }, remote?.enabled ? 'Remote access turned off.' : 'Remote access turned on.')}></button>

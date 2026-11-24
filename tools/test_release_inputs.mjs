@@ -4,7 +4,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { applicationVersions, releaseMatrix, releasePlatformChoices, updateFeedSummary, updateManifest, validateReleaseTag, validateFactoryRun } from "./release_inputs.mjs";
+import { applicationVersions, releaseMatrix, releasePlatformChoices, updateFeedSummary, updateFeedTargets, updateManifest, validateReleaseTag, validateFactoryRun } from "./release_inputs.mjs";
 
 test("release tags must match all application versions", () => {
   assert.equal(validateReleaseTag("v0.1.0", ["0.1.0", "0.1.0", "0.1.0"]), "v0.1.0");
@@ -85,16 +85,15 @@ test("the release summary says plainly when Windows is left out of the update fe
   };
   const withoutWindows = updateFeedSummary(updateManifest("v1.2.3", "Frameleaf/frameleaf-desktop", defaults));
   assert.match(withoutWindows, /^### Update feed for 1\.2\.3\n/);
-  assert.match(withoutWindows, /\*\*Windows was excluded from the update feed\.\*\* This release has no signed Windows installers, so Desktop on Windows will not be offered 1\.2\.3/);
+  assert.match(withoutWindows, /\*\*Windows was excluded from the update feed\.\*\* This release has no Windows NSIS installer, so Desktop on Windows will not be offered 1\.2\.3/);
   assert.doesNotMatch(withoutWindows, /Not in the update feed/);
 
   const all = updateFeedSummary(updateManifest("v1.2.3", "Frameleaf/frameleaf-desktop", {
     ...defaults,
-    "Frameleaf_1.2.3_x64-setup.exe": signature,
-    "Frameleaf_1.2.3_x64_en-US.msi": signature,
+    "Frameleaf_1.2.3_x64-setup-unsigned.exe": signature,
   }));
   assert.doesNotMatch(all, /excluded|Not in the update feed/);
-  assert.match(all, /windows-x86_64-msi, windows-x86_64-nsis\./);
+  assert.match(all, /linux-x86_64-deb, windows-x86_64-nsis\./);
 
   const appleSilicon = updateFeedSummary(updateManifest("v1.2.3", "Frameleaf/frameleaf-desktop", {
     "Frameleaf_1.2.3_aarch64.app.tar.gz": signature,
@@ -103,10 +102,16 @@ test("the release summary says plainly when Windows is left out of the update fe
   assert.match(appleSilicon, /\nNot in the update feed: darwin-x86_64-app, linux-aarch64-appimage, linux-aarch64-deb, linux-x86_64-appimage, linux-x86_64-deb\.\n$/);
 });
 
-test("installers published without a Windows signature can never enter the update feed", () => {
-  for (const name of ["Frameleaf_1.2.3_x64-setup-unsigned.exe", "Frameleaf_1.2.3_x64_en-US-unsigned.msi"]) {
-    assert.throws(() => updateManifest("v1.2.3", "Frameleaf/frameleaf-desktop", { [name]: "c2lnbmF0dXJl" }), /update_asset_invalid/);
-  }
+test("the published NSIS installer updates Windows and the published MSI never enters the feed", () => {
+  const signature = "c2lnbmF0dXJl";
+  const manifest = updateManifest("v1.2.3", "Frameleaf/frameleaf-desktop", { "Frameleaf_1.2.3_x64-setup-unsigned.exe": signature });
+  assert.deepEqual(manifest.platforms, { "windows-x86_64-nsis": {
+    url: "https://github.com/Frameleaf/frameleaf-desktop/releases/download/v1.2.3/Frameleaf_1.2.3_x64-setup-unsigned.exe",
+    signature,
+  } });
+  for (const name of ["Frameleaf_1.2.3_x64_en-US-unsigned.msi", "Frameleaf_1.2.3_x64_en-US.msi"])
+    assert.throws(() => updateManifest("v1.2.3", "Frameleaf/frameleaf-desktop", { [name]: signature }), /update_asset_invalid/);
+  assert.ok(!updateFeedTargets.includes("windows-x86_64-msi"));
 });
 
 // Runtime consumers must reject artifacts from other workflows or untrusted refs.
@@ -144,15 +149,14 @@ test("update manifests match each installed package format to its signed asset",
     "Frameleaf_1.2.3_amd64.AppImage": signature,
     "Frameleaf_1.2.3_amd64.deb": signature,
     "Frameleaf_1.2.3_x64-setup.exe": signature,
-    "Frameleaf_1.2.3_x64_en-US.msi": signature,
   };
   const manifest = updateManifest("v1.2.3", "Frameleaf/frameleaf-desktop", files);
   assert.equal(manifest.version, "1.2.3");
   assert.deepEqual(Object.keys(manifest.platforms).sort(), [
-    "darwin-aarch64-app", "linux-x86_64-appimage", "linux-x86_64-deb", "windows-x86_64-msi", "windows-x86_64-nsis",
+    "darwin-aarch64-app", "linux-x86_64-appimage", "linux-x86_64-deb", "windows-x86_64-nsis",
   ]);
-  assert.deepEqual(manifest.platforms["windows-x86_64-msi"], {
-    url: "https://github.com/Frameleaf/frameleaf-desktop/releases/download/v1.2.3/Frameleaf_1.2.3_x64_en-US.msi",
+  assert.deepEqual(manifest.platforms["windows-x86_64-nsis"], {
+    url: "https://github.com/Frameleaf/frameleaf-desktop/releases/download/v1.2.3/Frameleaf_1.2.3_x64-setup.exe",
     signature,
   });
   assert.throws(() => updateManifest("v1.2.3", "Frameleaf/frameleaf-desktop", {}), /update_assets_missing/);

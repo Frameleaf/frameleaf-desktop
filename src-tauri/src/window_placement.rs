@@ -11,6 +11,14 @@ struct Placement {
     height: f64,
 }
 
+/// Keep in step with the main window's size in tauri.conf.json.
+const DEFAULT: Placement = Placement {
+    x: i32::MIN,
+    y: i32::MIN,
+    width: 1280.,
+    height: 860.,
+};
+
 #[derive(Default)]
 pub(crate) struct WindowPlacement(Mutex<Option<Placement>>);
 
@@ -80,12 +88,11 @@ fn work_area(monitor: &Monitor) -> (i32, i32, u32, u32) {
 
 impl WindowPlacement {
     pub(crate) fn restore(&self, window: &WebviewWindow) {
-        let Some(saved) = path(window.app_handle())
+        // First launch: the default size, centred and fitted to the primary display's work area.
+        let saved = path(window.app_handle())
             .and_then(|file| fs::read(file).ok())
             .and_then(|bytes| serde_json::from_slice::<Placement>(&bytes).ok())
-        else {
-            return;
-        };
+            .unwrap_or(DEFAULT);
         let monitors = window.available_monitors().unwrap_or_default();
         let previous = monitors.iter().find(|monitor| {
             let (left, top, width, height) = work_area(monitor);

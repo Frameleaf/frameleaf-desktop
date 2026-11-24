@@ -143,10 +143,10 @@
 </script>
 
 <section class="page" aria-labelledby="page-title">
-  <header class="toolbar">
-    <h1 id="page-title">{section === 'ai' ? 'AI processing' : 'My computer'}</h1>
+  <header class="toolbar" data-tauri-drag-region>
+    <h1 id="page-title" data-tauri-drag-region>{section === 'ai' ? 'AI processing' : 'My computer'}</h1>
     <span class="pill {section === 'ai' ? worker.pill.tone : connectionPill.tone}"><i aria-hidden="true"></i>{section === 'ai' ? worker.headline : connectionPill.label}</span>
-    <span class="sp"></span>
+    <span class="sp" data-tauri-drag-region></span>
     {#if section === 'ai' && canControl}
       <div class="seg" role="group" aria-label="Worker control">
         <button class:on={control === 'running'} aria-pressed={control === 'running'} disabled={busy || !native} onclick={() => controlWorker('running')}>Running</button>
