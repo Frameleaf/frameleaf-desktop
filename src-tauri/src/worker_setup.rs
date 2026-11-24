@@ -243,7 +243,10 @@ impl Progress {
     }
     fn workload(&self, workload: &str, state: &str, code: Option<String>) {
         let mut statuses = self.status.lock().unwrap().workloads.clone();
-        if let Some(item) = statuses.iter_mut().find(|item| item.workload == workload) {
+        if let Some(item) = statuses
+            .iter_mut()
+            .find(|item| key_workload(&item.workload) == workload)
+        {
             item.state = state.into();
             item.code = code;
         }
@@ -470,6 +473,22 @@ fn provider_independent(code: &str) -> bool {
         || code.starts_with("desktop_clip_index_")
         || code == "desktop_clip_space_unavailable"
 }
+/// FD-31: the inventory names the enrichment work a desktop does `enrichment`; its model keys,
+/// profiles and tasks call it `description`, the only enrichment a desktop runs.
+fn key_workload(inventory: &str) -> &str {
+    if inventory == "enrichment" {
+        "description"
+    } else {
+        inventory
+    }
+}
+/// When the server refused this task, kept under its key name (`description` for the `enrichment` row).
+fn refused_since<'a>(
+    refused_at: &'a std::collections::BTreeMap<String, tokio::time::Instant>,
+    item: &WorkloadStatus,
+) -> Option<&'a tokio::time::Instant> {
+    refused_at.get(key_workload(&item.workload))
+}
 /// How many tasks of each kind the server lets one computer run at once (`concurrency` in the
 /// `/models` reply, from the administrator's Jobs setting). One where the reply does not say.
 fn inventory_concurrency(inventory: &serde_json::Value) -> std::collections::BTreeMap<String, u32> {
@@ -479,7 +498,7 @@ fn inventory_concurrency(inventory: &serde_json::Value) -> std::collections::BTr
         .flatten()
         .filter_map(|entry| {
             let limit = entry["concurrency"].as_u64().unwrap_or(1).clamp(1, 64) as u32;
-            Some((entry["workload"].as_str()?.to_owned(), limit))
+            Some((key_workload(entry["workload"].as_str()?).to_owned(), limit))
         })
         .collect()
 }
@@ -1553,9 +1572,10 @@ pub(crate) fn inventory_profiles(
         if state == "eligible" {
             let expected = match entry.workload.as_str() {
                 "clip" => 3,
-                "ocr" | "face" => 1,
+                "ocr" | "face" | "enrichment" => 1,
                 _ => return Err(invalid()),
             };
+            let prefix = key_workload(&entry.workload);
             if entry.model_keys.len() != expected
                 || entry
                     .model_keys
@@ -1564,9 +1584,9 @@ pub(crate) fn inventory_profiles(
                     .len()
                     != expected
                 || entry.model_keys.iter().any(|key| {
-                    !key.starts_with(&(entry.workload.clone() + ":"))
-                        || key.len() != entry.workload.len() + 65
-                        || !key[entry.workload.len() + 1..]
+                    !key.starts_with(&(prefix.to_owned() + ":"))
+                        || key.len() != prefix.len() + 65
+                        || !key[prefix.len() + 1..]
                             .bytes()
                             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
                 })
@@ -1574,7 +1594,7 @@ pub(crate) fn inventory_profiles(
                 return Err(invalid());
             }
             groups.push(crate::model_catalogue::served_group(
-                &entry.workload,
+                prefix,
                 &entry.model_keys,
                 &entry.profiles,
                 source,
@@ -1891,6 +1911,7 @@ async fn serve(
     // Complete acquisition before requesting short-lived nonces.
     let models_began = std::time::Instant::now();
     let mut caches = Vec::new();
+    let mut unprepared = std::collections::BTreeMap::<String, String>::new();
     for profile in &profiles {
         let count = counted.insert(profile.cache_identity());
         let cache = loop {
@@ -1932,8 +1953,19 @@ async fn serve(
                 result => break result,
             }
         }
-        .map_err(|code| disk_shortfall(code, &paths.data.join("models"), profile.cache_bytes()))?;
-        caches.push(cache);
+        .map_err(|code| disk_shortfall(code, &paths.data.join("models"), profile.cache_bytes()));
+        match cache {
+            Ok(cache) => caches.push(Some(cache)),
+            // FD-31: descriptions are optional and their models are large; a model this computer
+            // could not get (download declined, disk or network) leaves the other tasks to run.
+            Err(code) if profile.model_key().starts_with("description:") => {
+                check_cancel(&progress.cancelled)?;
+                progress.workload("description", "unavailable", Some(code.clone()));
+                unprepared.insert(profile.model_key().to_owned(), code);
+                caches.push(None);
+            }
+            Err(code) => return Err(code),
+        }
     }
     // Includes any download: a launch with nothing to fetch measures verification alone.
     timing.phase("model_files", models_began);
@@ -1975,13 +2007,40 @@ async fn serve(
                     .iter()
                     .position(|item| item.model_key() == profile.model_key())
                     .ok_or("worker_model_binding_invalid")?;
-                group_caches.push(caches[index].clone());
+                let Some(cache) = caches[index].clone() else {
+                    // Its model could not be prepared (above).
+                    let code = unprepared.get(profile.model_key()).cloned();
+                    progress.workload(workload, "unavailable", code);
+                    continue 'workload;
+                };
+                group_caches.push(cache);
                 // One model's qualification, from a new challenge to the accepted record. A
                 // refusal the server clears by itself starts this model again, not the others.
                 let mut rejected = 0u32;
                 let (qualified, accepted) = 'attempt: loop {
-                    let cache = caches[index].clone();
+                    let cache = group_caches[group_caches.len() - 1].clone();
                     check_cancel(&progress.cancelled)?;
+                    // FD-31: a description model's memory floor holds only descriptions. On a
+                    // computer that lacks it now, the other tasks start and descriptions are
+                    // offered again later, as a task the server held back is.
+                    if profile.model_key().starts_with("description:") {
+                        let status =
+                            tauri::async_runtime::spawn_blocking(crate::resource_policy::sample)
+                                .await
+                                .map_err(|_| "resource_status_unavailable")?;
+                        if matches!(
+                            status.refusal(profile.minimum_memory()),
+                            Some("memory_low" | "memory_unknown")
+                        ) {
+                            refused_at.insert(workload.to_owned(), tokio::time::Instant::now());
+                            progress.workload(
+                                workload,
+                                "unavailable",
+                                Some("workload_memory_low".into()),
+                            );
+                            continue 'workload;
+                        }
+                    }
                     wait_for_capacity(profile.minimum_memory(), &progress, || {
                         worker.maintain_session()
                     })
@@ -2096,6 +2155,8 @@ async fn serve(
                                     | "runtime_out_of_memory"
                                     | "runtime_model_missing"
                                     | "runtime_provider_unavailable"
+                                    // FD-31: a runtime without llama.cpp cannot describe; the rest still runs
+                                    | "runtime_qwen_binary_unavailable"
                             ) =>
                         {
                             // Memory another program held, or a slow moment, is not remembered
@@ -2174,7 +2235,7 @@ async fn serve(
                         let index = profiles
                             .iter()
                             .position(|item| item.model_key() == profile.model_key())?;
-                        Some((profile.clone(), caches[index].clone()))
+                        Some((profile.clone(), caches[index].clone()?))
                     })
                     .collect();
                 let scratch = paths.data.join("scratch");
@@ -2417,7 +2478,7 @@ async fn serve(
                     .iter()
                     .filter(|item| item.state == "unavailable")
                     .filter_map(|item| {
-                        Some((refused_at.get(&item.workload)?, item.code.as_deref()?))
+                        Some((refused_since(&refused_at, item)?, item.code.as_deref()?))
                     })
                     .any(|(at, code)| {
                         code.starts_with("workload_") && at.elapsed() >= refused_task_retry(code)
@@ -2475,7 +2536,7 @@ async fn serve(
                     .iter()
                     .filter(|item| item.state == "unavailable")
                     .filter_map(|item| {
-                        Some((refused_at.get(&item.workload)?, item.code.as_deref()?))
+                        Some((refused_since(&refused_at, item)?, item.code.as_deref()?))
                     })
                     .filter(|(_, code)| code.starts_with("workload_"))
                     .map(|(at, code)| (*at + refused_task_retry(code)).max(work_due))
@@ -2941,6 +3002,51 @@ mod tests {
         let mut old = inventory_fixture();
         old["protocolVersion"] = serde_json::json!(1);
         assert!(inventory_profiles(&old, source, "CPUExecutionProvider").is_err());
+    }
+    #[test]
+    fn fd31_an_eligible_enrichment_entry_is_a_description_group() {
+        let source = "25b22c16e47a27a2eb50017d838497abce850d11";
+        let mut profile: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/description-profile.json"))
+                .unwrap();
+        profile["runtimeSourceRevision"] = serde_json::json!(source);
+        let mut value = inventory_fixture();
+        value["workloads"][3] = serde_json::json!({"workload":"enrichment","state":"eligible",
+            "modelNames":["Qwen/Qwen2.5-VL-7B-Instruct"],"modelKeys":[profile["modelKey"]],"profiles":[profile]});
+        let (groups, statuses) =
+            inventory_profiles(&value, source, "CPUExecutionProvider").unwrap();
+        assert_eq!(
+            groups.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![3, 1, 1, 1]
+        );
+        assert!(groups[3][0].model_key().starts_with("description:"));
+        // the row keeps the server's name; progress and limits find it by the key's
+        assert_eq!(statuses[3].workload, "enrichment");
+        assert_eq!(key_workload("enrichment"), "description");
+        assert_eq!(inventory_concurrency(&value).get("description"), Some(&1));
+        // an enrichment key that is not a description, or two of them, is refused
+        let mut other = value.clone();
+        other["workloads"][3]["modelKeys"][0] =
+            serde_json::json!(format!("enrichment:{}", "0".repeat(64)));
+        assert!(inventory_profiles(&other, source, "CPUExecutionProvider").is_err());
+        let mut two = value.clone();
+        two["workloads"][3]["modelKeys"] =
+            serde_json::json!([profile["modelKey"], profile["modelKey"]]);
+        assert!(inventory_profiles(&two, source, "CPUExecutionProvider").is_err());
+    }
+    #[test]
+    fn a_refused_description_is_found_by_its_enrichment_row() {
+        let at = tokio::time::Instant::now();
+        let refused = std::collections::BTreeMap::from([("description".to_string(), at)]);
+        let row = |workload: &str| WorkloadStatus {
+            workload: workload.into(),
+            state: "unavailable".into(),
+            model_names: vec![],
+            code: Some("workload_desktop_qualification_hold".into()),
+        };
+        // descriptions refused while text recognition stays ready: the hold still ends for descriptions
+        assert_eq!(refused_since(&refused, &row("enrichment")), Some(&at));
+        assert_eq!(refused_since(&refused, &row("ocr")), None);
     }
     #[test]
     fn reports_the_first_specific_reason_nothing_qualified() {
@@ -4751,7 +4857,8 @@ mod tests {
         let limits = inventory_concurrency(&inventory);
         assert_eq!(limits["clip"], 4);
         // A reply that does not say (an older server) is one; a nonsense number is capped.
-        assert_eq!((limits["ocr"], limits["enrichment"]), (1, 64));
+        // FD-31: enrichment's limit is kept under the key name of the work a desktop does.
+        assert_eq!((limits["ocr"], limits["description"]), (1, 64));
         let ready = |tasks: &[&str]| tasks.iter().map(|task| task.to_string()).collect();
         // What the server allows for the ready tasks, capped by this computer...
         assert_eq!(

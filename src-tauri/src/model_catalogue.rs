@@ -205,8 +205,21 @@ impl ProfileData {
         ]
         .into_iter()
         .collect();
+        // FD-31: a description runs in the runtime's own llama.cpp process; every other profile is ONNX.
+        let description = self.workload == "description";
+        let mut fields = fields;
+        if description {
+            fields.insert("engine");
+        }
         if object.keys().map(String::as_str).collect::<BTreeSet<_>>() != fields
-            || !matches!(self.workload.as_str(), "clip" | "ocr" | "face")
+            || !matches!(
+                self.workload.as_str(),
+                "clip" | "ocr" | "face" | "description"
+            )
+            || (description
+                && (self.spec["engine"] != "qwen-gguf"
+                    || self.spec["provider"] != "CPUExecutionProvider"
+                    || self.embedding_dimensions.is_some()))
             || !is_digest(&self.runtime_source_revision, 40)
             || self.spec["protocolVersion"] != 1
             || self.spec["modelKey"] != self.model_key
@@ -254,14 +267,21 @@ impl ProfileData {
         }
         let models = self.spec["models"]
             .as_array()
-            .filter(|v| v.len() == if self.workload == "clip" { 1 } else { 2 })
+            .filter(|v| {
+                v.len()
+                    == if self.workload == "clip" || description {
+                        1
+                    } else {
+                        2
+                    }
+            })
             .ok_or_else(invalid)?;
         let model = &models[0];
         let kind = self.spec["fixtureKind"].as_str().ok_or_else(invalid)?;
-        let family = if self.workload == "face" {
-            "facial-recognition"
-        } else {
-            &self.workload
+        let family = match self.workload.as_str() {
+            "face" => "facial-recognition",
+            "description" => DESCRIPTION_TASK,
+            other => other,
         };
         if self.workload == "clip" {
             let model_type = match kind {
@@ -287,6 +307,18 @@ impl ProfileData {
             }
         } else if self.workload == "face" {
             validate_face_entries(&self.spec["entries"], &self.model_name, kind)?;
+        } else if description {
+            let artifacts = model["artifacts"].as_object().ok_or_else(invalid)?;
+            if kind != "image"
+                || model["type"] != "visual"
+                || self.spec["entries"]
+                    != json!({ DESCRIPTION_TASK: { "visual": { "modelName": self.model_name, "options": {} } } })
+                || !["visual/model.gguf", "visual/mmproj.gguf"]
+                    .iter()
+                    .all(|name| artifacts.contains_key(*name))
+            {
+                return Err(invalid());
+            }
         } else {
             validate_ocr_entries(models, &self.spec["entries"], &self.model_name, kind)?;
         }
@@ -362,6 +394,8 @@ impl ProfileData {
             }
         } else if self.workload == "face" {
             validate_face_output(&self.spec["expectedOutput"])?;
+        } else if description {
+            validate_description_output(&self.spec["expectedOutput"])?;
         } else {
             validate_ocr_output(&self.spec["expectedOutput"])?;
         }
@@ -369,7 +403,12 @@ impl ProfileData {
         let output = self.spec["expectedOutput"]
             .as_object()
             .ok_or_else(invalid)?;
-        if kind == "text" {
+        if description {
+            // One sentence, no image size: the binding reports none.
+            if fixture.len() < 24 || fixture[..8] != [137, 80, 78, 71, 13, 10, 26, 10] {
+                return Err(invalid());
+            }
+        } else if kind == "text" {
             if output.len() != 1 || std::str::from_utf8(&fixture).is_err() {
                 return Err(invalid());
             }
@@ -385,6 +424,35 @@ impl ProfileData {
         }
         Ok(())
     }
+}
+/// The native Qwen binding's request and result task (FD-31).
+pub(crate) const DESCRIPTION_TASK: &str = "image-description-tagging";
+/// A description: one bounded factual sentence, every other field empty, as the binding returns it.
+pub(crate) fn validate_description_output(output: &Value) -> Result<(), String> {
+    let empty = json!([]);
+    let result = output[DESCRIPTION_TASK].as_object().ok_or_else(invalid)?;
+    let text = result
+        .get("description")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    if output.as_object().is_none_or(|v| v.len() != 1)
+        || result.len() != 7
+        || text.is_empty()
+        || text.chars().count() > 240
+        || text.trim() != text
+        || text.chars().any(char::is_control)
+        || text.to_lowercase().contains("<think")
+        || text.to_lowercase().contains("</think")
+        || ["people", "objects", "visible_text", "tags"]
+            .iter()
+            .any(|key| result.get(*key) != Some(&empty))
+        || ["environment", "context"]
+            .iter()
+            .any(|key| result.get(*key) != Some(&json!("")))
+    {
+        return Err(invalid());
+    }
+    Ok(())
 }
 fn validate_face_entries(entries: &Value, name: &str, kind: &str) -> Result<(), String> {
     let group = entries["facial-recognition"]
@@ -1384,15 +1452,22 @@ mod tests {
             .collect();
         assert_eq!(twins.len(), 60);
         let expected: Vec<&str> = expected.into_iter().chain(twins).collect();
-        // Epoch 17 appends the server's own AI build as nine smart-search profiles, so that
-        // build is a catalogue identity. No desktop runtime is built from that source and no
-        // desktop is offered them; they parse and build a challenge like any other profile,
-        // and their digests are the server's to pin.
-        const SERVER_AI_SOURCE: &str = "95593fc6887c74a705c85b0ab8c9685c79afb0e4";
-        let (desktop, server_ai) = profiles.split_at(expected.len());
-        assert_eq!(server_ai.len(), 9);
-        for profile in server_ai {
-            assert_eq!(profile.runtime_source_revision, SERVER_AI_SOURCE);
+        // Epochs 17, 18 and 19 each append the server's own AI build as nine smart-search profiles,
+        // so that build is a catalogue identity. No desktop runtime is built from those sources
+        // and no desktop is offered them; they parse and build a challenge like any other
+        // profile, and their digests are the server's to pin.
+        const SERVER_AI_SOURCES: [&str; 3] = [
+            "95593fc6887c74a705c85b0ab8c9685c79afb0e4",
+            "24ea593e19ce160b2e1dd8cdafb0c15ff34240d0",
+            "35d71372c16239db149a0e3f4e3c239a8f42fcd4",
+        ];
+        let (desktop, rest) = profiles.split_at(expected.len());
+        let (server_ai, epoch20) = rest.split_at(27);
+        for (index, profile) in server_ai.iter().enumerate() {
+            assert_eq!(
+                profile.runtime_source_revision,
+                SERVER_AI_SOURCES[index / 9]
+            );
             assert_eq!(profile.workload, "clip");
             assert!(profile
                 .challenge("d621bd72-ad35-4199-95ab-76300756a38e")
@@ -1400,13 +1475,57 @@ mod tests {
         }
         assert!(desktop
             .iter()
-            .all(|profile| profile.runtime_source_revision != SERVER_AI_SOURCE));
-        for (profile, expected) in desktop.iter().zip(expected) {
-            let (spec, _) = profile
-                .challenge("d621bd72-ad35-4199-95ab-76300756a38e")
-                .unwrap();
-            assert_eq!(digest(&spec), expected);
+            .all(|profile| !SERVER_AI_SOURCES.contains(&profile.runtime_source_revision.as_str())));
+        let challenge = |profile: &ProfileData| {
+            digest(
+                &profile
+                    .challenge("d621bd72-ad35-4199-95ab-76300756a38e")
+                    .unwrap()
+                    .0,
+            )
+        };
+        for (profile, expected) in desktop.iter().zip(&expected) {
+            assert_eq!(challenge(profile), *expected);
         }
+        // Epoch 20 (FD-31): the processor twins of b3905b4a under the desktop runtime source that adds
+        // photo descriptions, each with its original's specification and digest, then the Qwen3.5-4B
+        // and Qwen2.5-VL-7B-Instruct description profiles, whose digests are the server's
+        // (desktop-model-catalogue.spec.ts).
+        const RUNTIME_SOURCE: &str = "35ba35dda671b99eb9c027e9168e185c31ebabf1";
+        let originals: Vec<&str> = desktop
+            .iter()
+            .zip(&expected)
+            .filter(|(profile, _)| {
+                profile.runtime_source_revision == "b3905b4aebd22e48a1a3843c2831efcef543336e"
+                    && profile.spec["provider"] == "CPUExecutionProvider"
+            })
+            .map(|(_, digest)| *digest)
+            .collect();
+        assert_eq!(epoch20.len(), originals.len() + 2);
+        for (profile, original) in epoch20.iter().zip(&originals) {
+            assert_eq!(profile.runtime_source_revision, RUNTIME_SOURCE);
+            assert_eq!(challenge(profile), *original);
+        }
+        let descriptions: Vec<_> = epoch20[originals.len()..]
+            .iter()
+            .map(|profile| (profile.model_name.as_str(), challenge(profile)))
+            .collect();
+        assert!(epoch20[originals.len()..]
+            .iter()
+            .all(|profile| profile.workload == "description"));
+        assert_eq!(
+            descriptions,
+            [
+                (
+                    "Qwen3.5-4B",
+                    "41abae7572292327a31bf47a4f9262eadd170b91646c95b7220c3e9c64b472d6".to_owned()
+                ),
+                (
+                    "Qwen2.5-VL-7B-Instruct",
+                    "de56abfb20b6b32791d113beb300deb815ca0c70e5c0191acddca71572c700b6".to_owned()
+                ),
+            ]
+        );
     }
     #[test]
     fn current_profiles_preserve_all_released_bindings_and_select_only_the_qualified_source() {
@@ -1606,5 +1725,47 @@ mod tests {
             parse_catalogue(&raw).unwrap()[index].challenge(id).unwrap(),
             expected
         );
+    }
+
+    #[test]
+    fn fd31_a_description_profile_is_exactly_the_qwen_binding_library_serves() {
+        let raw: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/description-profile.json"))
+                .unwrap();
+        let parse = |value: &Value| {
+            serde_json::from_value::<ProfileData>(value.clone())
+                .map_err(|_| invalid())
+                .and_then(|profile| profile.validate())
+        };
+        parse(&raw).unwrap();
+        let served = ApprovedProfile::from_served(&raw).unwrap();
+        assert!(served
+            .challenge("d621bd72-ad35-4199-95ab-76300756a38e")
+            .is_ok());
+        let changes: [fn(&mut Value); 8] = [
+            |v| {
+                v["spec"].as_object_mut().unwrap().remove("engine");
+            },
+            |v| v["spec"]["engine"] = json!("onnx"),
+            |v| v["spec"]["provider"] = json!("CoreMLExecutionProvider"),
+            |v| {
+                v["spec"]["entries"][DESCRIPTION_TASK]["visual"]["options"] =
+                    json!({"external_prompt": "other"})
+            },
+            |v| v["spec"]["models"][0]["task"] = json!("clip"),
+            |v| v["embeddingDimensions"] = json!(512),
+            |v| v["spec"]["expectedOutput"][DESCRIPTION_TASK]["tags"] = json!(["red"]),
+            |v| v["spec"]["expectedOutput"][DESCRIPTION_TASK]["description"] = json!(""),
+        ];
+        for change in changes {
+            let mut value = raw.clone();
+            change(&mut value);
+            assert!(parse(&value).is_err(), "{value}");
+        }
+        // An ONNX profile never names the Qwen engine.
+        let mut ocr: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/ocr-profile.json")).unwrap();
+        ocr["spec"]["engine"] = json!("qwen-gguf");
+        assert!(parse(&ocr).is_err());
     }
 }
