@@ -323,11 +323,11 @@
 </script>
 
 <section class="page" class:embedded aria-labelledby="manager-title">
-  <header class="toolbar">
+  <header class="toolbar" data-tauri-drag-region>
     {#if onback}<button class="btn quiet" onclick={onback} aria-label="Back to setup"><Icon name="back" />Back</button>{/if}
-    <h1 id="manager-title">{title}</h1>
+    <h1 id="manager-title" data-tauri-drag-region>{title}</h1>
     <span class="pill {serverPill.tone}"><i aria-hidden="true"></i>{serverPill.label}</span>
-    <span class="sp"></span>
+    <span class="sp" data-tauri-drag-region></span>
     {#if manager}
       {#if focus === 'manager'}
         <button class="btn" disabled={busy || active || expired || deviceChanged || !manager.scopes.includes('start')} onclick={() => begin('start')}><Icon name="play" />Start</button>

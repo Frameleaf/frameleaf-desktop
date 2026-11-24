@@ -61,10 +61,10 @@
 </script>
 
 <section class="page" aria-labelledby="cloud-title">
-  <header class="toolbar">
-    <h1 id="cloud-title">Frameleaf Cloud</h1>
+  <header class="toolbar" data-tauri-drag-region>
+    <h1 id="cloud-title" data-tauri-drag-region>Frameleaf Cloud</h1>
     <span class="pill {linkPill.tone}"><i aria-hidden="true"></i>{linkPill.label}</span>
-    <span class="sp"></span>
+    <span class="sp" data-tauri-drag-region></span>
     <button class="btn quiet" disabled={busy || !native} onclick={load}>Refresh</button>
     <button class="btn" disabled={!cloud?.manageUrl || !native} onclick={() => open(cloud?.manageUrl)}><Icon name="open" />Manage on frameleaf.cloud</button>
   </header>

@@ -65,10 +65,10 @@
 </script>
 
 <section class="page" aria-labelledby="wallet-title">
-  <header class="toolbar">
-    <h1 id="wallet-title">AI credit</h1>
+  <header class="toolbar" data-tauri-drag-region>
+    <h1 id="wallet-title" data-tauri-drag-region>AI credit</h1>
     <span class="pill {pill.tone}"><i aria-hidden="true"></i>{pill.label}</span>
-    <span class="sp"></span>
+    <span class="sp" data-tauri-drag-region></span>
     <button class="btn quiet" disabled={busy || !native} onclick={load}>Refresh</button>
     <button class="btn" disabled={!wallet?.topUpUrl || !native} onclick={() => open(wallet?.topUpUrl, 25)}>Add $25</button>
     <button class="btn" disabled={!wallet?.topUpUrl || !native} onclick={() => open(wallet?.topUpUrl, 50)}>Add $50</button>
