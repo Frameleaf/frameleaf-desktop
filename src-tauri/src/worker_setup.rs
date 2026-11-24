@@ -243,7 +243,10 @@ impl Progress {
     }
     fn workload(&self, workload: &str, state: &str, code: Option<String>) {
         let mut statuses = self.status.lock().unwrap().workloads.clone();
-        if let Some(item) = statuses.iter_mut().find(|item| item.workload == workload) {
+        if let Some(item) = statuses
+            .iter_mut()
+            .find(|item| key_workload(&item.workload) == workload)
+        {
             item.state = state.into();
             item.code = code;
         }
@@ -470,6 +473,15 @@ fn provider_independent(code: &str) -> bool {
         || code.starts_with("desktop_clip_index_")
         || code == "desktop_clip_space_unavailable"
 }
+/// FD-31: the inventory names the enrichment work a desktop does `enrichment`; its model keys,
+/// profiles and tasks call it `description`, the only enrichment a desktop runs.
+fn key_workload(inventory: &str) -> &str {
+    if inventory == "enrichment" {
+        "description"
+    } else {
+        inventory
+    }
+}
 /// How many tasks of each kind the server lets one computer run at once (`concurrency` in the
 /// `/models` reply, from the administrator's Jobs setting). One where the reply does not say.
 fn inventory_concurrency(inventory: &serde_json::Value) -> std::collections::BTreeMap<String, u32> {
@@ -479,7 +491,7 @@ fn inventory_concurrency(inventory: &serde_json::Value) -> std::collections::BTr
         .flatten()
         .filter_map(|entry| {
             let limit = entry["concurrency"].as_u64().unwrap_or(1).clamp(1, 64) as u32;
-            Some((entry["workload"].as_str()?.to_owned(), limit))
+            Some((key_workload(entry["workload"].as_str()?).to_owned(), limit))
         })
         .collect()
 }
@@ -1553,9 +1565,10 @@ pub(crate) fn inventory_profiles(
         if state == "eligible" {
             let expected = match entry.workload.as_str() {
                 "clip" => 3,
-                "ocr" | "face" => 1,
+                "ocr" | "face" | "enrichment" => 1,
                 _ => return Err(invalid()),
             };
+            let prefix = key_workload(&entry.workload);
             if entry.model_keys.len() != expected
                 || entry
                     .model_keys
@@ -1564,9 +1577,9 @@ pub(crate) fn inventory_profiles(
                     .len()
                     != expected
                 || entry.model_keys.iter().any(|key| {
-                    !key.starts_with(&(entry.workload.clone() + ":"))
-                        || key.len() != entry.workload.len() + 65
-                        || !key[entry.workload.len() + 1..]
+                    !key.starts_with(&(prefix.to_owned() + ":"))
+                        || key.len() != prefix.len() + 65
+                        || !key[prefix.len() + 1..]
                             .bytes()
                             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
                 })
@@ -1574,7 +1587,7 @@ pub(crate) fn inventory_profiles(
                 return Err(invalid());
             }
             groups.push(crate::model_catalogue::served_group(
-                &entry.workload,
+                prefix,
                 &entry.model_keys,
                 &entry.profiles,
                 source,
@@ -2096,6 +2109,8 @@ async fn serve(
                                     | "runtime_out_of_memory"
                                     | "runtime_model_missing"
                                     | "runtime_provider_unavailable"
+                                    // FD-31: a runtime without llama.cpp cannot describe; the rest still runs
+                                    | "runtime_qwen_binary_unavailable"
                             ) =>
                         {
                             // Memory another program held, or a slow moment, is not remembered
@@ -2941,6 +2956,37 @@ mod tests {
         let mut old = inventory_fixture();
         old["protocolVersion"] = serde_json::json!(1);
         assert!(inventory_profiles(&old, source, "CPUExecutionProvider").is_err());
+    }
+    #[test]
+    fn fd31_an_eligible_enrichment_entry_is_a_description_group() {
+        let source = "25b22c16e47a27a2eb50017d838497abce850d11";
+        let mut profile: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/description-profile.json"))
+                .unwrap();
+        profile["runtimeSourceRevision"] = serde_json::json!(source);
+        let mut value = inventory_fixture();
+        value["workloads"][3] = serde_json::json!({"workload":"enrichment","state":"eligible",
+            "modelNames":["Qwen/Qwen2.5-VL-7B-Instruct"],"modelKeys":[profile["modelKey"]],"profiles":[profile]});
+        let (groups, statuses) =
+            inventory_profiles(&value, source, "CPUExecutionProvider").unwrap();
+        assert_eq!(
+            groups.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![3, 1, 1, 1]
+        );
+        assert!(groups[3][0].model_key().starts_with("description:"));
+        // the row keeps the server's name; progress and limits find it by the key's
+        assert_eq!(statuses[3].workload, "enrichment");
+        assert_eq!(key_workload("enrichment"), "description");
+        assert_eq!(inventory_concurrency(&value).get("description"), Some(&1));
+        // an enrichment key that is not a description, or two of them, is refused
+        let mut other = value.clone();
+        other["workloads"][3]["modelKeys"][0] =
+            serde_json::json!(format!("enrichment:{}", "0".repeat(64)));
+        assert!(inventory_profiles(&other, source, "CPUExecutionProvider").is_err());
+        let mut two = value.clone();
+        two["workloads"][3]["modelKeys"] =
+            serde_json::json!([profile["modelKey"], profile["modelKey"]]);
+        assert!(inventory_profiles(&two, source, "CPUExecutionProvider").is_err());
     }
     #[test]
     fn reports_the_first_specific_reason_nothing_qualified() {
@@ -4751,7 +4797,8 @@ mod tests {
         let limits = inventory_concurrency(&inventory);
         assert_eq!(limits["clip"], 4);
         // A reply that does not say (an older server) is one; a nonsense number is capped.
-        assert_eq!((limits["ocr"], limits["enrichment"]), (1, 64));
+        // FD-31: enrichment's limit is kept under the key name of the work a desktop does.
+        assert_eq!((limits["ocr"], limits["description"]), (1, 64));
         let ready = |tasks: &[&str]| tasks.iter().map(|task| task.to_string()).collect();
         // What the server allows for the ready tasks, capped by this computer...
         assert_eq!(

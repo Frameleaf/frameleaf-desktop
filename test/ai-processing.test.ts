@@ -77,6 +77,8 @@ test('each workload shows the provider the backend chose and why the processor s
   for (const none of [undefined, null, [], [{ workload: 'clip', provider: 'InventedProvider', fallback: null }]])
     assert.equal(workloadProvider(none, 'clip'), '');
   assert.equal(workloadProvider(providers, 'enrichment'), '');
+  // FD-31: the enrichment row shows where its descriptions run
+  assert.equal(workloadProvider([{ workload: 'description', provider: 'CPUExecutionProvider', fallback: null }], 'enrichment'), 'Runs on CPU');
 });
 
 // FD-60: the downloadable GPU pack is offered with its size, never fetched without the person
