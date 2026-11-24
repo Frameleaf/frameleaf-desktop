@@ -482,6 +482,13 @@ fn key_workload(inventory: &str) -> &str {
         inventory
     }
 }
+/// When the server refused this task, kept under its key name (`description` for the `enrichment` row).
+fn refused_since<'a>(
+    refused_at: &'a std::collections::BTreeMap<String, tokio::time::Instant>,
+    item: &WorkloadStatus,
+) -> Option<&'a tokio::time::Instant> {
+    refused_at.get(key_workload(&item.workload))
+}
 /// How many tasks of each kind the server lets one computer run at once (`concurrency` in the
 /// `/models` reply, from the administrator's Jobs setting). One where the reply does not say.
 fn inventory_concurrency(inventory: &serde_json::Value) -> std::collections::BTreeMap<String, u32> {
@@ -2432,7 +2439,7 @@ async fn serve(
                     .iter()
                     .filter(|item| item.state == "unavailable")
                     .filter_map(|item| {
-                        Some((refused_at.get(&item.workload)?, item.code.as_deref()?))
+                        Some((refused_since(&refused_at, item)?, item.code.as_deref()?))
                     })
                     .any(|(at, code)| {
                         code.starts_with("workload_") && at.elapsed() >= refused_task_retry(code)
@@ -2490,7 +2497,7 @@ async fn serve(
                     .iter()
                     .filter(|item| item.state == "unavailable")
                     .filter_map(|item| {
-                        Some((refused_at.get(&item.workload)?, item.code.as_deref()?))
+                        Some((refused_since(&refused_at, item)?, item.code.as_deref()?))
                     })
                     .filter(|(_, code)| code.starts_with("workload_"))
                     .map(|(at, code)| (*at + refused_task_retry(code)).max(work_due))
@@ -2987,6 +2994,20 @@ mod tests {
         two["workloads"][3]["modelKeys"] =
             serde_json::json!([profile["modelKey"], profile["modelKey"]]);
         assert!(inventory_profiles(&two, source, "CPUExecutionProvider").is_err());
+    }
+    #[test]
+    fn a_refused_description_is_found_by_its_enrichment_row() {
+        let at = tokio::time::Instant::now();
+        let refused = std::collections::BTreeMap::from([("description".to_string(), at)]);
+        let row = |workload: &str| WorkloadStatus {
+            workload: workload.into(),
+            state: "unavailable".into(),
+            model_names: vec![],
+            code: Some("workload_desktop_qualification_hold".into()),
+        };
+        // descriptions refused while text recognition stays ready: the hold still ends for descriptions
+        assert_eq!(refused_since(&refused, &row("enrichment")), Some(&at));
+        assert_eq!(refused_since(&refused, &row("ocr")), None);
     }
     #[test]
     fn reports_the_first_specific_reason_nothing_qualified() {

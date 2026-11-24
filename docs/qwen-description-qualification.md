@@ -33,9 +33,10 @@ number is 1, which also makes the web UI asset download fail:
 
 ```sh
 git -C /path/to/llama.cpp config core.abbrev 9
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_USE_PREBUILT_UI=OFF \
-  -DLLAMA_BUILD_NUMBER=11146 -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
-cmake --build build --target llama-server llama-quantize
+cmake -S /path/to/llama.cpp -B /path/to/llama.cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_CURL=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_NUMBER=11146 \
+  -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
+cmake --build /path/to/llama.cpp/build --target llama-server llama-quantize
 ```
 
 The free-space check counts the space macOS frees on demand, as Finder does.
