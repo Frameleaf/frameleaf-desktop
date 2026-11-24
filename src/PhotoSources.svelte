@@ -144,10 +144,10 @@
 </script>
 
 <section class="page" aria-labelledby="photo-sources-heading" aria-busy={busy}>
-  <header class="toolbar">
-    <h1 id="photo-sources-heading">Photo sources</h1>
+  <header class="toolbar" data-tauri-drag-region>
+    <h1 id="photo-sources-heading" data-tauri-drag-region>Photo sources</h1>
     {#if consent}<span class="pill {job ? jobTone : consent.registered ? 'ok' : 'wait'}"><i aria-hidden="true"></i>{job ? jobLabel : consent.registered ? 'Folder registered' : 'Registration pending'}</span>{/if}
-    <span class="sp"></span>
+    <span class="sp" data-tauri-drag-region></span>
     {#if findOneDrive}<button class="btn quiet" disabled={busy || !native || !!consent || blockedConsent} onclick={discover}>Find OneDrive Folders</button>{/if}
     <button class="btn" disabled={busy || !native || !!consent || blockedConsent} onclick={() => choose()}><Icon name="plus" />Add Folder…</button>
   </header>

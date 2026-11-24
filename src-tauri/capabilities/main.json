@@ -8,6 +8,7 @@
   ],
   "permissions": [
     "core:default",
+    "core:window:allow-start-dragging",
     "allow-computer-backup-status",
     "allow-computer-backup-refresh",
     "allow-computer-backup-connect",
