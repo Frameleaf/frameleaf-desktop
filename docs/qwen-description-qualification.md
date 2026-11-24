@@ -70,9 +70,9 @@ approved model catalogue and claim route on both sides. The current inventory an
 admission are unchanged. Installed resource, cancellation, and output-quality checks are
 required on the platforms where the provider will be offered.
 
-## Catalogue profiles (epoch 19)
+## Catalogue profiles (epoch 20)
 
-Library's catalogue epoch 19 has both description profiles for runtime source `35ba35dd`:
+Library's catalogue epoch 20 has both description profiles for runtime source `35ba35dd`:
 - Qwen3.5-4B, from the model mirror's `frameleaf/Qwen3.5-4B` (the pinned unsloth export, revision `90ad97bb`), with an 8 GiB floor.
 - Qwen2.5-VL-7B-Instruct, from `frameleaf/Qwen2.5-VL-7B-Instruct` (the pinned ggml-org export, revision `b58477fc`), with an 11.75 GiB floor.
 

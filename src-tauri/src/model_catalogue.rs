@@ -1452,16 +1452,17 @@ mod tests {
             .collect();
         assert_eq!(twins.len(), 60);
         let expected: Vec<&str> = expected.into_iter().chain(twins).collect();
-        // Epochs 17 and 18 each append the server's own AI build as nine smart-search profiles,
+        // Epochs 17, 18 and 19 each append the server's own AI build as nine smart-search profiles,
         // so that build is a catalogue identity. No desktop runtime is built from those sources
         // and no desktop is offered them; they parse and build a challenge like any other
         // profile, and their digests are the server's to pin.
-        const SERVER_AI_SOURCES: [&str; 2] = [
+        const SERVER_AI_SOURCES: [&str; 3] = [
             "95593fc6887c74a705c85b0ab8c9685c79afb0e4",
             "24ea593e19ce160b2e1dd8cdafb0c15ff34240d0",
+            "35d71372c16239db149a0e3f4e3c239a8f42fcd4",
         ];
         let (desktop, rest) = profiles.split_at(expected.len());
-        let (server_ai, epoch19) = rest.split_at(18);
+        let (server_ai, epoch20) = rest.split_at(27);
         for (index, profile) in server_ai.iter().enumerate() {
             assert_eq!(
                 profile.runtime_source_revision,
@@ -1486,7 +1487,7 @@ mod tests {
         for (profile, expected) in desktop.iter().zip(&expected) {
             assert_eq!(challenge(profile), *expected);
         }
-        // Epoch 19 (FD-31): the processor twins of b3905b4a under the desktop runtime source that adds
+        // Epoch 20 (FD-31): the processor twins of b3905b4a under the desktop runtime source that adds
         // photo descriptions, each with its original's specification and digest, then the Qwen3.5-4B
         // and Qwen2.5-VL-7B-Instruct description profiles, whose digests are the server's
         // (desktop-model-catalogue.spec.ts).
@@ -1500,16 +1501,16 @@ mod tests {
             })
             .map(|(_, digest)| *digest)
             .collect();
-        assert_eq!(epoch19.len(), originals.len() + 2);
-        for (profile, original) in epoch19.iter().zip(&originals) {
+        assert_eq!(epoch20.len(), originals.len() + 2);
+        for (profile, original) in epoch20.iter().zip(&originals) {
             assert_eq!(profile.runtime_source_revision, RUNTIME_SOURCE);
             assert_eq!(challenge(profile), *original);
         }
-        let descriptions: Vec<_> = epoch19[originals.len()..]
+        let descriptions: Vec<_> = epoch20[originals.len()..]
             .iter()
             .map(|profile| (profile.model_name.as_str(), challenge(profile)))
             .collect();
-        assert!(epoch19[originals.len()..]
+        assert!(epoch20[originals.len()..]
             .iter()
             .all(|profile| profile.workload == "description"));
         assert_eq!(
