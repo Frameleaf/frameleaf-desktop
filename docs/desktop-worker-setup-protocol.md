@@ -38,6 +38,8 @@ Owner decisions made during this work, which replace the original design:
   under runtime source `95593fc6887c74a705c85b0ab8c9685c79afb0e4`. Each is a twin of the newest
   processor profile for the same request: the same files, fixture and expected output, with a
   model key of its own. Nothing was removed or changed; the first 162 profiles are as before.
+  Epoch 18 (180 profiles) does the same for the server's next AI build, runtime source
+  `24ea593e19ce160b2e1dd8cdafb0c15ff34240d0`: nine more processor twins, nothing else changed.
 - **No desktop is offered those nine.** No desktop runtime is built or factory-signed from that
   source, and `/models` lists a profile only for the runtime source the desktop reports. The
   desktop parses them like any other profile and never runs them.

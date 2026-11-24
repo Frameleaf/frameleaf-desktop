@@ -1384,15 +1384,21 @@ mod tests {
             .collect();
         assert_eq!(twins.len(), 60);
         let expected: Vec<&str> = expected.into_iter().chain(twins).collect();
-        // Epoch 17 appends the server's own AI build as nine smart-search profiles, so that
-        // build is a catalogue identity. No desktop runtime is built from that source and no
-        // desktop is offered them; they parse and build a challenge like any other profile,
-        // and their digests are the server's to pin.
-        const SERVER_AI_SOURCE: &str = "95593fc6887c74a705c85b0ab8c9685c79afb0e4";
+        // Epochs 17 and 18 each append the server's own AI build as nine smart-search profiles,
+        // so that build is a catalogue identity. No desktop runtime is built from those sources
+        // and no desktop is offered them; they parse and build a challenge like any other
+        // profile, and their digests are the server's to pin.
+        const SERVER_AI_SOURCES: [&str; 2] = [
+            "95593fc6887c74a705c85b0ab8c9685c79afb0e4",
+            "24ea593e19ce160b2e1dd8cdafb0c15ff34240d0",
+        ];
         let (desktop, server_ai) = profiles.split_at(expected.len());
-        assert_eq!(server_ai.len(), 9);
-        for profile in server_ai {
-            assert_eq!(profile.runtime_source_revision, SERVER_AI_SOURCE);
+        assert_eq!(server_ai.len(), 18);
+        for (index, profile) in server_ai.iter().enumerate() {
+            assert_eq!(
+                profile.runtime_source_revision,
+                SERVER_AI_SOURCES[index / 9]
+            );
             assert_eq!(profile.workload, "clip");
             assert!(profile
                 .challenge("d621bd72-ad35-4199-95ab-76300756a38e")
@@ -1400,7 +1406,7 @@ mod tests {
         }
         assert!(desktop
             .iter()
-            .all(|profile| profile.runtime_source_revision != SERVER_AI_SOURCE));
+            .all(|profile| !SERVER_AI_SOURCES.contains(&profile.runtime_source_revision.as_str())));
         for (profile, expected) in desktop.iter().zip(expected) {
             let (spec, _) = profile
                 .challenge("d621bd72-ad35-4199-95ab-76300756a38e")
