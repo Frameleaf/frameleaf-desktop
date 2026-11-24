@@ -132,7 +132,7 @@ jobs:
           tar -xzf "$tool_dir/patchelf.tar.gz" -C "$tool_dir"
           echo "$tool_dir/bin" >> "$GITHUB_PATH"
       # FD-31: the processor pack carries the llama.cpp server its photo descriptions run in. Built here
-      # from the pinned revision, self-contained (static, no Metal, OpenSSL or network fetch) and portable
+      # from the pinned revision, self-contained (static, no Metal, OpenMP, OpenSSL or network fetch) and portable
       # (no host-specific CPU flags); it must report the 9-character commit and build number Library and
       # Desktop require (docs/qwen-description-qualification.md).
       - name: Build the pinned llama-server for photo descriptions
@@ -150,6 +150,9 @@ jobs:
             '-DCMAKE_BUILD_TYPE=Release' '-DBUILD_SHARED_LIBS=OFF' '-DGGML_NATIVE=OFF' '-DGGML_METAL=OFF'
             '-DLLAMA_OPENSSL=OFF' '-DLLAMA_CURL=OFF' '-DLLAMA_USE_PREBUILT_UI=OFF' '-DLLAMA_BUILD_NUMBER=11146'
             '-DLLAMA_BUILD_TESTS=OFF' '-DLLAMA_BUILD_EXAMPLES=OFF'
+            # Only the executable is staged: no OpenMP runtime beside it, and on Windows the static
+            # C runtime (the launcher's PATH is System32 alone).
+            '-DGGML_OPENMP=OFF' '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded'
           )
           "${cmake[@]}" -S "$llama" -B "$llama/build" "${options[@]}"
           "${cmake[@]}" --build "$llama/build" --config Release --target llama-server --parallel 4

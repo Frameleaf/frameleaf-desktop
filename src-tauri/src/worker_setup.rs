@@ -1911,6 +1911,7 @@ async fn serve(
     // Complete acquisition before requesting short-lived nonces.
     let models_began = std::time::Instant::now();
     let mut caches = Vec::new();
+    let mut unprepared = std::collections::BTreeMap::<String, String>::new();
     for profile in &profiles {
         let count = counted.insert(profile.cache_identity());
         let cache = loop {
@@ -1952,8 +1953,19 @@ async fn serve(
                 result => break result,
             }
         }
-        .map_err(|code| disk_shortfall(code, &paths.data.join("models"), profile.cache_bytes()))?;
-        caches.push(cache);
+        .map_err(|code| disk_shortfall(code, &paths.data.join("models"), profile.cache_bytes()));
+        match cache {
+            Ok(cache) => caches.push(Some(cache)),
+            // FD-31: descriptions are optional and their models are large; a model this computer
+            // could not get (download declined, disk or network) leaves the other tasks to run.
+            Err(code) if profile.model_key().starts_with("description:") => {
+                check_cancel(&progress.cancelled)?;
+                progress.workload("description", "unavailable", Some(code.clone()));
+                unprepared.insert(profile.model_key().to_owned(), code);
+                caches.push(None);
+            }
+            Err(code) => return Err(code),
+        }
     }
     // Includes any download: a launch with nothing to fetch measures verification alone.
     timing.phase("model_files", models_began);
@@ -1995,13 +2007,40 @@ async fn serve(
                     .iter()
                     .position(|item| item.model_key() == profile.model_key())
                     .ok_or("worker_model_binding_invalid")?;
-                group_caches.push(caches[index].clone());
+                let Some(cache) = caches[index].clone() else {
+                    // Its model could not be prepared (above).
+                    let code = unprepared.get(profile.model_key()).cloned();
+                    progress.workload(workload, "unavailable", code);
+                    continue 'workload;
+                };
+                group_caches.push(cache);
                 // One model's qualification, from a new challenge to the accepted record. A
                 // refusal the server clears by itself starts this model again, not the others.
                 let mut rejected = 0u32;
                 let (qualified, accepted) = 'attempt: loop {
-                    let cache = caches[index].clone();
+                    let cache = group_caches[group_caches.len() - 1].clone();
                     check_cancel(&progress.cancelled)?;
+                    // FD-31: a description model's memory floor holds only descriptions. On a
+                    // computer that lacks it now, the other tasks start and descriptions are
+                    // offered again later, as a task the server held back is.
+                    if profile.model_key().starts_with("description:") {
+                        let status =
+                            tauri::async_runtime::spawn_blocking(crate::resource_policy::sample)
+                                .await
+                                .map_err(|_| "resource_status_unavailable")?;
+                        if matches!(
+                            status.refusal(profile.minimum_memory()),
+                            Some("memory_low" | "memory_unknown")
+                        ) {
+                            refused_at.insert(workload.to_owned(), tokio::time::Instant::now());
+                            progress.workload(
+                                workload,
+                                "unavailable",
+                                Some("workload_memory_low".into()),
+                            );
+                            continue 'workload;
+                        }
+                    }
                     wait_for_capacity(profile.minimum_memory(), &progress, || {
                         worker.maintain_session()
                     })
@@ -2196,7 +2235,7 @@ async fn serve(
                         let index = profiles
                             .iter()
                             .position(|item| item.model_key() == profile.model_key())?;
-                        Some((profile.clone(), caches[index].clone()))
+                        Some((profile.clone(), caches[index].clone()?))
                     })
                     .collect();
                 let scratch = paths.data.join("scratch");

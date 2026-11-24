@@ -35,11 +35,14 @@ number is 1, which also makes the web UI asset download fail:
 git -C /path/to/llama.cpp config core.abbrev 9
 cmake -S /path/to/llama.cpp -B /path/to/llama.cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DLLAMA_CURL=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_NUMBER=11146 \
-  -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
+  -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+  -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_METAL=OFF -DGGML_OPENMP=OFF -DLLAMA_OPENSSL=OFF
 cmake --build /path/to/llama.cpp/build --target llama-server llama-quantize
 ```
 
-The free-space check counts the space macOS frees on demand, as Finder does.
+The last line makes the `llama-server` a candidate pack copies self-contained and portable, as the
+factory builds it (`.github/workflows/factory-runtime.yml`, which also selects the static C runtime on
+Windows). The free-space check counts the space macOS frees on demand, as Finder does.
 
 The tool verifies the checkpoint files against Git and LFS, then converts to BF16, quantizes to
 Q4_K_M, exports the F16 vision projector, and copies the Apache license. The receipt records the

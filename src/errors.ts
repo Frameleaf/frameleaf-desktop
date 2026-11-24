@@ -399,6 +399,7 @@ const families: readonly (readonly [WorkerReason | '', string, string])[] = [
   ['metered', 'AI processing pauses on metered networks. Photos remain available.', 'metered_network'],
   ['metered', 'Network cost could not be determined. AI processing is paused.', 'network_unknown'],
   ['memory', 'Waiting for enough memory for the selected model. Closing other apps can help.', 'memory_low'],
+  ['memory', 'Photo descriptions need more free memory than this computer has now. Other AI tasks continue, and descriptions are tried again later. Closing other apps can help.', 'workload_memory_low'],
   ['memory', 'Memory status could not be read. AI processing is paused.', 'memory_unknown'],
   ['', 'This computer’s power, network and memory could not be checked. AI processing is paused.', 'status_unavailable resource_status_unavailable'],
   // ---- photo folders and imports ----
