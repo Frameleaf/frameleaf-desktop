@@ -69,10 +69,11 @@ required on the platforms where the provider will be offered.
 
 ## Catalogue profiles (epoch 19)
 
-Library's catalogue epoch 19 has Qwen3.5-4B's profile for runtime source `35ba35dd`, with the model
-mirror's `frameleaf/Qwen3.5-4B` (the pinned unsloth export, revision `90ad97bb`). Library's
-`machine-learning/scripts/add_desktop_description_profiles.py` makes these profiles. Qwen2.5-VL-7B-Instruct
-(mirror revision `b58477fc`) is added by the same script once a computer with 11.75 GiB free qualifies it.
+Library's catalogue epoch 19 has both description profiles for runtime source `35ba35dd`:
+- Qwen3.5-4B, from the model mirror's `frameleaf/Qwen3.5-4B` (the pinned unsloth export, revision `90ad97bb`), with an 8 GiB floor.
+- Qwen2.5-VL-7B-Instruct, from `frameleaf/Qwen2.5-VL-7B-Instruct` (the pinned ggml-org export, revision `b58477fc`), with an 11.75 GiB floor.
+
+Library's `machine-learning/scripts/add_desktop_description_profiles.py` makes these profiles.
 The factory's CPU job builds the pinned `llama-server` (static, portable, no Metal) and passes it to the
 builder below, so every processor pack from that source can describe photos.
 

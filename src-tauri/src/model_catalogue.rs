@@ -1487,8 +1487,9 @@ mod tests {
             assert_eq!(challenge(profile), *expected);
         }
         // Epoch 19 (FD-31): the processor twins of b3905b4a under the desktop runtime source that adds
-        // photo descriptions, each with its original's specification and digest, then Qwen3.5-4B's
-        // description profile, whose digest is the server's (desktop-model-catalogue.spec.ts).
+        // photo descriptions, each with its original's specification and digest, then the Qwen3.5-4B
+        // and Qwen2.5-VL-7B-Instruct description profiles, whose digests are the server's
+        // (desktop-model-catalogue.spec.ts).
         const RUNTIME_SOURCE: &str = "35ba35dda671b99eb9c027e9168e185c31ebabf1";
         let originals: Vec<&str> = desktop
             .iter()
@@ -1499,22 +1500,30 @@ mod tests {
             })
             .map(|(_, digest)| *digest)
             .collect();
-        assert_eq!(epoch19.len(), originals.len() + 1);
+        assert_eq!(epoch19.len(), originals.len() + 2);
         for (profile, original) in epoch19.iter().zip(&originals) {
             assert_eq!(profile.runtime_source_revision, RUNTIME_SOURCE);
             assert_eq!(challenge(profile), *original);
         }
-        let description = epoch19.last().unwrap();
+        let descriptions: Vec<_> = epoch19[originals.len()..]
+            .iter()
+            .map(|profile| (profile.model_name.as_str(), challenge(profile)))
+            .collect();
+        assert!(epoch19[originals.len()..]
+            .iter()
+            .all(|profile| profile.workload == "description"));
         assert_eq!(
-            (
-                description.workload.as_str(),
-                description.model_name.as_str()
-            ),
-            ("description", "Qwen3.5-4B")
-        );
-        assert_eq!(
-            challenge(description),
-            "41abae7572292327a31bf47a4f9262eadd170b91646c95b7220c3e9c64b472d6"
+            descriptions,
+            [
+                (
+                    "Qwen3.5-4B",
+                    "41abae7572292327a31bf47a4f9262eadd170b91646c95b7220c3e9c64b472d6".to_owned()
+                ),
+                (
+                    "Qwen2.5-VL-7B-Instruct",
+                    "de56abfb20b6b32791d113beb300deb815ca0c70e5c0191acddca71572c700b6".to_owned()
+                ),
+            ]
         );
     }
     #[test]
