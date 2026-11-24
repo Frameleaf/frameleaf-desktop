@@ -497,6 +497,10 @@ const START: &[u8] = b"frameleaf-native-start\n";
 /// exactly that while loading, under the loader lock, so the runtime could not even exit: every
 /// Windows runtime start hung importing onnxruntime and qualification timed out. There the pipe
 /// is looked at instead, which returns at once, until the parent's end closes or writes.
+///
+/// On CoreML, onnxruntime's MatMulAddFusion makes Gemm nodes whose weights CoreML stores as program
+/// text: 5.8 GB for the SigLIP2 text model, 462 s to load against a 120 s check. The released
+/// CoreML packs predate the runtime source's own fix, so the app turns the fusion off here.
 const GATE: &str = r#"import os,sys,runpy,threading,signal,time
 expected=b'frameleaf-native-start\n'
 assert sys.stdin.buffer.read(len(expected))==expected
@@ -522,6 +526,12 @@ if sys.argv[0]=='frameleaf-desktop-metal-v1':
     parent,expected_hash,mode=sys.argv[1:4]
     sys.argv=[mode]+sys.argv[4:]
     sys.path.insert(0,parent)
+    import onnxruntime as ort
+    class Session(ort.InferenceSession):
+        def __init__(self,*arguments,**options):
+            options.setdefault('disabled_optimizers',['MatMulAddFusion'])
+            super().__init__(*arguments,**options)
+    ort.InferenceSession=Session
     from frameleaf_desktop_ml.entry import run
     run(mode,expected_hash)
 else:
