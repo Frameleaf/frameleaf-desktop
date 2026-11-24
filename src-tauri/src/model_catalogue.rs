@@ -663,7 +663,7 @@ pub(crate) fn shared_cache(
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<std::path::PathBuf, String> {
     use crate::{
-        model_cache::{check_cancel, verify_file, verify_file_once},
+        model_cache::{check_cancel, check_file},
         runtime_store::{private_directory, Staging},
     };
     use std::{fs, path::PathBuf};
@@ -719,9 +719,9 @@ pub(crate) fn shared_cache(
     let active = root.join(&scope);
     private_directory(root)?;
     if active.exists() {
-        let verified = files.iter().try_for_each(|(relative, (_, bytes, hash))| {
-            verify_file_once(&active.join(relative), *bytes, hash, cancel)
-        });
+        let verified = files
+            .iter()
+            .try_for_each(|(relative, (_, bytes, _))| check_file(&active.join(relative), *bytes));
         match verified {
             Ok(()) => return Ok(active),
             // FD-64: the set links each model file, so a file its cache has since repaired
@@ -740,9 +740,10 @@ pub(crate) fn shared_cache(
         }
     }
     let staging = Staging::create(root.join(format!(".composition-{}", Uuid::new_v4())))?;
-    for (relative, (source, bytes, hash)) in &files {
+    // Each source was hashed when it was downloaded: the set links those files, checked by size.
+    for (relative, (source, bytes, _)) in &files {
         check_cancel(cancel)?;
-        verify_file(source, *bytes, hash, cancel)?;
+        check_file(source, *bytes)?;
         let mut parent = staging.path().to_path_buf();
         for part in relative.parent().ok_or_else(invalid)?.components() {
             parent.push(part);
@@ -751,7 +752,7 @@ pub(crate) fn shared_cache(
         let target = staging.path().join(relative);
         // App-owned immutable weights share disk blocks; verify the published inode again before use.
         fs::hard_link(source, &target).map_err(|_| "worker_cache_publish_failed")?;
-        verify_file(&target, *bytes, hash, cancel)?;
+        check_file(&target, *bytes)?;
     }
     check_cancel(cancel)?;
     fs::rename(staging.path(), &active).map_err(|_| "worker_cache_publish_failed")?;

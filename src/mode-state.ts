@@ -57,10 +57,57 @@ export type WorkerView = {
   pill: { label: string; tone: 'ok' | 'wait' | 'off' | 'bad' };
   /** Tasks this computer finished since AI processing last started, when the backend reports it. */
   finished: string | null;
+  /** While this computer takes work: how many tasks run now, how many may, and what sets that. */
+  atOnce: string | null;
+  /** While a task runs: how fast tasks finish here, and how long the last one took. */
+  pace: string | null;
   /** What the AI runtime said when it last stopped by itself, shown in small text while there is a problem. */
   diagnostic: string | null;
 };
-type WorkerSetup = { state: string; code?: string | null; control?: string; activeWorkload?: string | null; completedTasks?: number | null; detail?: string | null };
+type WorkerSetup = {
+  state: string; code?: string | null; control?: string; activeWorkload?: string | null; completedTasks?: number | null; detail?: string | null;
+  concurrentTasks?: number | null; concurrentLimit?: string | null; runningTasks?: number | null;
+  pace?: { tasks: number; seconds: number } | null; lastTaskMs?: number | null;
+};
+const count = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+// What sets how many tasks run at once (the backend's `concurrent_limit`), after "set by".
+const limitWords: Readonly<Record<string, string>> = {
+  server: 'the Jobs setting on your server',
+  memory: 'the free memory on this computer',
+  graphics: 'the most Frameleaf runs at once on a graphics card',
+  processor: 'this computer’s processor',
+  'memory-shortfall': 'Frameleaf, after tasks running together failed on this computer',
+  'one-at-a-time': 'your server, which sends each computer one task at a time',
+};
+function atOnceText(setup: WorkerSetup | null): string | null {
+  const taking = !!setup?.activeWorkload || ['working', 'waiting-for-work'].includes(setup?.state ?? '');
+  const allowed = setup?.concurrentTasks;
+  if (!taking || !count(allowed) || allowed < 1) return null;
+  const running = count(setup?.runningTasks) ? setup!.runningTasks! : 0;
+  const most = allowed === 1 ? 'one at a time' : `up to ${allowed.toLocaleString()} at once`;
+  const by = setup?.concurrentLimit ? limitWords[setup.concurrentLimit] : undefined;
+  return `${running.toLocaleString()} running now · ${most}${by ? `, set by ${by}` : ''}`;
+}
+function duration(ms: number): string {
+  if (ms < 10_000) return `${(Math.max(ms, 100) / 1000).toFixed(1)} seconds`;
+  if (ms < 120_000) return `${Math.round(ms / 1000)} seconds`;
+  return `${Math.round(ms / 60_000)} minutes`;
+}
+function paceText(setup: WorkerSetup | null): string | null {
+  if (!setup?.activeWorkload) return null;
+  const pace = setup.pace;
+  const last = count(setup.lastTaskMs) ? setup.lastTaskMs : null;
+  let rate: string | null = null;
+  if (pace && count(pace.tasks) && pace.tasks > 0 && count(pace.seconds) && pace.seconds > 0) {
+    const perMinute = (pace.tasks * 60) / pace.seconds;
+    rate = perMinute >= 1
+      ? `About ${perMinute >= 10 ? Math.round(perMinute).toLocaleString() : Number(perMinute.toFixed(1)).toLocaleString()} tasks a minute`
+      : `About 1 task every ${Math.round(1 / perMinute)} minutes`;
+  }
+  if (rate && last !== null) return `${rate} · the last one took ${duration(last)}`;
+  if (rate) return rate;
+  return last !== null ? `The last task took ${duration(last)}` : null;
+}
 
 // Setup stopped and stays stopped until the person acts: [headline, what to do].
 const needsYou: Partial<Record<WorkerReason, readonly [string, string]>> = {
@@ -115,13 +162,18 @@ export function workerView({ connectionState, connectionCode, workerSupported, c
   const state = setup?.state || connectionState || '';
   const code = setup?.code ?? null;
   const control = setup?.control ?? 'running';
-  const count = setup?.completedTasks;
-  const finished = typeof count === 'number' && Number.isSafeInteger(count) && count >= 0
-    ? `${count.toLocaleString()} ${count === 1 ? 'task' : 'tasks'} finished since AI processing last started`
+  const done = setup?.completedTasks;
+  const finished = count(done)
+    ? `${done.toLocaleString()} ${done === 1 ? 'task' : 'tasks'} finished since AI processing last started`
     : null;
   const label = workerStatus({ state, workerSupported });
   const view = (headline: string, detail: string, attention: WorkerAttention, pill: WorkerView['pill'], action: WorkerAction = null, reference: string | null = null): WorkerView =>
-    ({ headline, detail, reference, attention, action, pill, finished, diagnostic: attention === 'none' ? null : setup?.detail?.trim() || null });
+    ({
+      headline, detail, reference, attention, action, pill, finished,
+      atOnce: attention === 'none' ? atOnceText(setup) : null,
+      pace: attention === 'none' ? paceText(setup) : null,
+      diagnostic: attention === 'none' ? null : setup?.detail?.trim() || null,
+    });
   const needs = (headline: string, detail: string, action: WorkerAction = null, reference: string | null = null) =>
     view(headline, detail, 'needs-you', { label: 'Needs you', tone: 'bad' }, action, reference);
   const waits = (headline: string, detail: string) => view(headline, detail, 'waiting', { label: 'Waiting', tone: 'wait' });
@@ -134,7 +186,10 @@ export function workerView({ connectionState, connectionCode, workerSupported, c
     return needs('Computer setup needs attention', why ? `Photo sign-in succeeded, but this computer could not be enrolled. ${why}` : 'Photo sign-in succeeded, but this computer could not be enrolled. Reopen the app to retry setup.');
   }
 
-  if (setup?.activeWorkload) return view('Processing on this computer', 'This computer processes one selected AI task at a time while power, network and memory allow.', 'none', { label: 'Working', tone: 'ok' });
+  if (setup?.activeWorkload) {
+    const most = count(setup.concurrentTasks) && setup.concurrentTasks > 1 ? `up to ${setup.concurrentTasks.toLocaleString()} selected AI tasks at once` : 'one selected AI task at a time';
+    return view('Processing on this computer', `This computer processes ${most} while power, network and memory allow.`, 'none', { label: 'Working', tone: 'ok' });
+  }
   switch (state) {
     // The backend reports 'working' while it asks the server for a task and 'waiting-for-work' between
     // asks; only activeWorkload (above) means a task is running.

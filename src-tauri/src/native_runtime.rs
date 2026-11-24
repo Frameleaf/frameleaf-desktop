@@ -262,16 +262,13 @@ impl VerifiedRuntime {
     pub(crate) fn ffmpeg(&self) -> Option<PackFfmpeg> {
         PackFfmpeg::from_files(&self.root, &self.manifest.files)
     }
-    /// Every byte once per launch; after that, a file whose metadata changed is hashed again.
+    /// Every listed file is there at its listed size (`check_listed_files`).
     fn check_files(&self) -> Result<(), String> {
-        check_files_remembered(
-            &VERIFIED_RUNTIMES,
-            &self.root,
-            &self.manifest_sha256,
-            &self.manifest.files,
-            std::time::SystemTime::now(),
-        )
-        .map(|_| ())
+        check_listed_files(&self.root, &self.manifest.files)
+    }
+    /// Hash every file against the manifest: once, when this runtime is installed.
+    pub(crate) fn check_every_byte(&self) -> Result<(), String> {
+        verify_files(&self.root, &self.manifest.files)
     }
 }
 
@@ -308,132 +305,39 @@ impl PackFfmpeg {
         self.lease = Some(lease);
         self
     }
-    /// The program to run, with its folder read again against the signed list.
+    /// The program to run, its folder's files still there at their listed sizes.
     pub(crate) fn check(&self) -> Result<PathBuf, String> {
         for (name, artifact) in &self.files {
-            verify_file(&self.root, name, artifact)?;
+            listed_file(&self.root, name, artifact)?;
         }
         Ok(self.root.join(relative(&self.executable)?))
     }
 }
 
-/// A file newer than this when its hash began may still change within one timestamp tick, so it
-/// is not remembered as verified. Two seconds also covers the coarsest common filesystem clock.
-const STAMP_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// What the filesystem says about a file. A different stamp means it must be hashed again.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct FileStamp {
-    bytes: u64,
-    modified: std::time::SystemTime,
-    #[cfg(unix)]
-    changed: (i64, i64),
-    #[cfg(unix)]
-    identity: (u64, u64),
-    #[cfg(windows)]
-    created: u64,
-    #[cfg(windows)]
-    attributes: u32,
-}
-impl FileStamp {
-    /// `None` for anything but a plain file: a link or reparse point is never remembered.
-    pub(crate) fn read(path: &Path) -> Option<Self> {
-        let meta = no_link(path).ok()?;
-        if !meta.is_file() {
-            return None;
-        }
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt;
-        #[cfg(windows)]
-        use std::os::windows::fs::MetadataExt;
-        Some(Self {
-            bytes: meta.len(),
-            modified: meta.modified().ok()?,
-            #[cfg(unix)]
-            changed: (meta.ctime(), meta.ctime_nsec()),
-            #[cfg(unix)]
-            identity: (meta.dev(), meta.ino()),
-            #[cfg(windows)]
-            created: meta.creation_time(),
-            #[cfg(windows)]
-            attributes: meta.file_attributes(),
-        })
-    }
-    pub(crate) fn bytes(&self) -> u64 {
-        self.bytes
-    }
-    /// Whether the file was already at rest when a hash that began at `started` read it.
-    pub(crate) fn settled(&self, started: std::time::SystemTime) -> bool {
-        #[cfg(unix)]
-        let latest = match u64::try_from(self.changed.0) {
-            Ok(seconds) => self.modified.max(
-                std::time::UNIX_EPOCH
-                    + std::time::Duration::new(
-                        seconds,
-                        self.changed.1.clamp(0, 999_999_999) as u32,
-                    ),
-            ),
-            Err(_) => return false,
-        };
-        #[cfg(not(unix))]
-        let latest = self.modified;
-        started
-            .duration_since(latest)
-            .is_ok_and(|age| age >= STAMP_SETTLE)
+/// Exactly the manifest's files are there, each a plain file of its listed size: what a launch
+/// checks. Every byte is hashed once, when the runtime is installed (`check_every_byte`): a
+/// launch does not read the runtime again (owner, 2026-11-23). Anything amiss takes the full
+/// check, which names what is wrong.
+fn check_listed_files(root: &Path, files: &BTreeMap<String, Artifact>) -> Result<(), String> {
+    let listed = absolute_directory(root).is_ok()
+        && inventory(root)
+            .is_ok_and(|found| found == files.keys().cloned().collect::<BTreeSet<_>>())
+        && files
+            .iter()
+            .all(|(name, artifact)| listed_file(root, name, artifact).is_ok());
+    if listed {
+        Ok(())
+    } else {
+        verify_files(root, files)
     }
 }
-
-type RememberedRuntimes =
-    std::sync::Mutex<std::collections::HashMap<(PathBuf, String), Vec<FileStamp>>>;
-/// Kept in memory only, so each launch of the app hashes every runtime file at least once.
-static VERIFIED_RUNTIMES: std::sync::LazyLock<RememberedRuntimes> =
-    std::sync::LazyLock::new(Default::default);
-
-/// The stamps of exactly the manifest's files, or `None` when the folder no longer matches it.
-fn runtime_stamps(root: &Path, files: &BTreeMap<String, Artifact>) -> Option<Vec<FileStamp>> {
-    absolute_directory(root).ok()?;
-    if inventory(root).ok()? != files.keys().cloned().collect::<BTreeSet<_>>() {
-        return None;
+/// One listed file is there: no link, a plain file of its listed size.
+fn listed_file(root: &Path, name: &str, artifact: &Artifact) -> Result<(), String> {
+    let meta = no_link(&root.join(relative(name)?))?;
+    if !meta.is_file() || meta.len() != artifact.bytes {
+        return Err("runtime_artifact_changed".into());
     }
-    files
-        .iter()
-        .map(|(name, artifact)| {
-            let stamp = FileStamp::read(&root.join(relative(name).ok()?))?;
-            (stamp.bytes() == artifact.bytes).then_some(stamp)
-        })
-        .collect()
-}
-
-/// Returns whether the files were hashed. Anything unexpected takes the full check, which also
-/// names what is wrong. `now` is read before hashing, so a change during the hash is not trusted.
-fn check_files_remembered(
-    remembered: &RememberedRuntimes,
-    root: &Path,
-    manifest_sha256: &str,
-    files: &BTreeMap<String, Artifact>,
-    now: std::time::SystemTime,
-) -> Result<bool, String> {
-    let key = (root.to_path_buf(), manifest_sha256.to_owned());
-    let before = runtime_stamps(root, files);
-    {
-        let mut known = remembered.lock().unwrap_or_else(|error| error.into_inner());
-        if before.is_some() && known.get(&key) == before.as_ref() {
-            return Ok(false);
-        }
-        known.remove(&key);
-    }
-    verify_files(root, files)?;
-    if let Some(before) = before {
-        if before.iter().all(|stamp| stamp.settled(now))
-            && runtime_stamps(root, files).as_ref() == Some(&before)
-        {
-            remembered
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .insert(key, before);
-        }
-    }
-    Ok(true)
+    Ok(())
 }
 
 pub(crate) fn verify_files(root: &Path, files: &BTreeMap<String, Artifact>) -> Result<(), String> {
@@ -1440,9 +1344,8 @@ fn validate_report(
 }
 
 #[cfg(test)]
-mod remembered_file_tests {
+mod listed_file_tests {
     use super::*;
-    use std::time::{Duration, SystemTime};
 
     struct Fixture(PathBuf);
     impl Drop for Fixture {
@@ -1451,17 +1354,11 @@ mod remembered_file_tests {
         }
     }
     fn fixture() -> (Fixture, BTreeMap<String, Artifact>) {
-        let root = std::env::temp_dir().join(format!("frameleaf-stamps-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("frameleaf-listed-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let root = fs::canonicalize(&root).unwrap_or(root);
         // `canonicalize` gives a `\\?\` path on Windows, which every check here accepts.
         fs::write(root.join("a.bin"), b"hello").unwrap();
-        fs::OpenOptions::new()
-            .write(true)
-            .open(root.join("a.bin"))
-            .unwrap()
-            .set_modified(SystemTime::now() - Duration::from_secs(3600))
-            .unwrap();
         let files = BTreeMap::from([(
             "a.bin".to_owned(),
             Artifact {
@@ -1471,62 +1368,37 @@ mod remembered_file_tests {
         )]);
         (Fixture(root), files)
     }
-    /// Far enough ahead that even a just-written file's change time has settled.
-    fn later() -> SystemTime {
-        SystemTime::now() + Duration::from_secs(60)
-    }
 
     #[test]
-    fn a_runtime_is_hashed_once_until_a_file_changes() {
+    fn a_launch_checks_the_listed_files_and_their_sizes_without_reading_them() {
         let (root, files) = fixture();
-        let known = RememberedRuntimes::default();
-        let check = |now| check_files_remembered(&known, &root.0, "manifest", &files, now);
-        assert_eq!(check(later()), Ok(true));
-        assert_eq!(check(later()), Ok(false));
-        // The same length, so only the metadata can give it away before hashing.
+        assert_eq!(check_listed_files(&root.0, &files), Ok(()));
+        // The same length: only installing reads the bytes (owner, 2026-11-23).
         fs::write(root.0.join("a.bin"), b"jello").unwrap();
-        assert_eq!(check(later()), Err("runtime_artifact_changed".to_owned()));
-        assert_eq!(check(later()), Err("runtime_artifact_changed".to_owned()));
+        assert_eq!(check_listed_files(&root.0, &files), Ok(()));
+        assert_eq!(
+            verify_files(&root.0, &files),
+            Err("runtime_artifact_changed".to_owned())
+        );
+        // Another length is seen, and named.
+        fs::write(root.0.join("a.bin"), b"hello!").unwrap();
+        assert_eq!(
+            check_listed_files(&root.0, &files),
+            Err("runtime_artifact_changed".to_owned())
+        );
     }
 
     #[test]
-    fn a_file_added_to_a_remembered_runtime_is_refused() {
+    fn a_file_added_or_removed_is_refused() {
         let (root, files) = fixture();
-        let known = RememberedRuntimes::default();
-        let check = || check_files_remembered(&known, &root.0, "manifest", &files, later());
-        assert_eq!(check(), Ok(true));
         fs::write(root.0.join("extra.bin"), b"x").unwrap();
-        assert_eq!(check(), Err("runtime_inventory_mismatch".to_owned()));
-    }
-
-    #[test]
-    fn another_manifest_over_the_same_folder_is_hashed_for_itself() {
-        let (root, files) = fixture();
-        let known = RememberedRuntimes::default();
         assert_eq!(
-            check_files_remembered(&known, &root.0, "first", &files, later()),
-            Ok(true)
+            check_listed_files(&root.0, &files),
+            Err("runtime_inventory_mismatch".to_owned())
         );
-        assert_eq!(
-            check_files_remembered(&known, &root.0, "second", &files, later()),
-            Ok(true)
-        );
-    }
-
-    #[test]
-    fn a_file_written_moments_before_its_hash_is_not_remembered() {
-        let (root, files) = fixture();
-        fs::write(root.0.join("a.bin"), b"hello").unwrap();
-        let known = RememberedRuntimes::default();
-        let now = SystemTime::now();
-        assert_eq!(
-            check_files_remembered(&known, &root.0, "manifest", &files, now),
-            Ok(true)
-        );
-        assert_eq!(
-            check_files_remembered(&known, &root.0, "manifest", &files, now),
-            Ok(true)
-        );
+        fs::remove_file(root.0.join("extra.bin")).unwrap();
+        fs::remove_file(root.0.join("a.bin")).unwrap();
+        assert!(check_listed_files(&root.0, &files).is_err());
     }
 }
 
@@ -1565,11 +1437,14 @@ mod tests {
         assert_eq!(ffmpeg.files.len(), 2);
         assert_eq!(ffmpeg.check().unwrap(), root.join(name));
 
-        fs::write(root.join("media-tools/FFMPEG-LICENSE.txt"), b"licencf").unwrap();
+        // Before each conversion its files are checked by name and size (owner, 2026-11-23).
+        fs::write(root.join("media-tools/FFMPEG-LICENSE.txt"), b"licence!").unwrap();
         assert_eq!(ffmpeg.check().unwrap_err(), "runtime_artifact_changed");
         fs::write(root.join("media-tools/FFMPEG-LICENSE.txt"), b"licence").unwrap();
-        fs::write(root.join(name), b"encodes").unwrap();
+        fs::write(root.join(name), b"encoder!").unwrap();
         assert_eq!(ffmpeg.check().unwrap_err(), "runtime_artifact_changed");
+        fs::write(root.join(name), b"encodes").unwrap();
+        assert_eq!(ffmpeg.check().unwrap(), root.join(name));
         fs::remove_file(root.join(name)).unwrap();
         assert!(ffmpeg.check().is_err());
         #[cfg(unix)]

@@ -31,10 +31,50 @@ pub(crate) struct SetupStatus {
     pub detail: Option<String>,
     /// How many tasks this computer runs at once, when the server lets it hold several.
     pub concurrent_tasks: u32,
+    /// What sets `concurrent_tasks` (`concurrent_limit`), for the status display.
+    pub concurrent_limit: Option<String>,
+    /// Tasks in hand right now.
+    pub running_tasks: u32,
+    /// Tasks finished in the last few minutes, and over how many seconds, for the pace shown.
+    pub pace: Option<Pace>,
+    /// From claiming the last finished task to the server accepting its result.
+    pub last_task_ms: Option<u64>,
     /// The most this computer runs at once since it ran short of memory doing more. Kept for
     /// as long as AI processing runs, across restarts of its setup.
     #[serde(skip)]
     pub(crate) capacity_ceiling: Option<u32>,
+    /// When the tasks behind `pace` finished.
+    #[serde(skip)]
+    pub(crate) finished_at: std::collections::VecDeque<std::time::Instant>,
+}
+#[derive(Clone, Copy, Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Pace {
+    tasks: u32,
+    seconds: u32,
+}
+/// How far back the pace looks.
+const PACE_WINDOW: Duration = Duration::from_secs(5 * 60);
+/// Tasks finished within `PACE_WINDOW` of `now`, over at least a minute, so a first task or
+/// two do not read as a burst.
+fn pace(
+    finished_at: &mut std::collections::VecDeque<std::time::Instant>,
+    now: std::time::Instant,
+) -> Option<Pace> {
+    while finished_at
+        .front()
+        .is_some_and(|at| now.duration_since(*at) > PACE_WINDOW)
+    {
+        finished_at.pop_front();
+    }
+    let oldest = *finished_at.front()?;
+    Some(Pace {
+        tasks: finished_at.len() as u32,
+        seconds: now
+            .duration_since(oldest)
+            .as_secs()
+            .clamp(60, PACE_WINDOW.as_secs()) as u32,
+    })
 }
 #[derive(Clone, Serialize, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -88,7 +128,12 @@ impl Progress {
             providers: current.providers.clone(),
             detail: current.detail.clone(),
             concurrent_tasks: current.concurrent_tasks,
+            concurrent_limit: current.concurrent_limit.clone(),
+            running_tasks: 0,
+            pace: current.pace,
+            last_task_ms: current.last_task_ms,
             capacity_ceiling: current.capacity_ceiling,
+            finished_at: current.finished_at.clone(),
         };
         if *current == status {
             return;
@@ -110,11 +155,21 @@ impl Progress {
             (self.notify)(snapshot);
         }
     }
-    fn completed(&self) {
+    /// A task finished; `took` is from its claim to the server accepting its result.
+    fn completed(&self, took: Option<Duration>) {
+        let now = std::time::Instant::now();
         self.update(|status| {
             status.completed_tasks += 1;
             status.detail = None;
+            status.finished_at.push_back(now);
+            status.pace = pace(&mut status.finished_at, now);
+            if let Some(took) = took {
+                status.last_task_ms = Some(u64::try_from(took.as_millis()).unwrap_or(u64::MAX));
+            }
         });
+    }
+    fn running(&self, tasks: u32) {
+        self.update(|status| status.running_tasks = tasks);
     }
     /// Keep, and log, why the runtime process ended.
     fn crashed(&self, report: Option<String>) {
@@ -131,7 +186,10 @@ impl Progress {
             let ceiling = ceiling.max(1);
             status.capacity_ceiling =
                 Some(status.capacity_ceiling.map_or(ceiling, |c| c.min(ceiling)));
-            status.concurrent_tasks = status.concurrent_tasks.min(ceiling);
+            if status.concurrent_tasks > ceiling {
+                status.concurrent_tasks = ceiling;
+                status.concurrent_limit = Some("memory-shortfall".into());
+            }
         });
     }
     /// One more at once than it last ran short at, after a long run of tasks without trouble.
@@ -140,8 +198,11 @@ impl Progress {
             status.capacity_ceiling = status.capacity_ceiling.map(|ceiling| ceiling + 1);
         });
     }
-    fn running_at_once(&self, tasks: u32) {
-        self.update(|status| status.concurrent_tasks = tasks);
+    fn running_at_once(&self, tasks: u32, limit: &str) {
+        self.update(|status| {
+            status.concurrent_tasks = tasks;
+            status.concurrent_limit = Some(limit.into());
+        });
     }
     fn completed_tasks(&self) -> u64 {
         self.status.lock().unwrap().completed_tasks
@@ -433,20 +494,40 @@ fn inventory_concurrency(inventory: &serde_json::Value) -> std::collections::BTr
 ///
 /// It is a starting point, not a promise: a graphics card's own memory is not something this
 /// app can read, so running short while working lowers it (`Progress::lower_capacity`).
-fn local_capacity(
+///
+/// Also which of the two sets it: `memory`, or the device (`graphics` or `processor`).
+fn local_limit(
     accelerated: bool,
     cores: usize,
     available_memory: Option<u64>,
     model_memory: u64,
-) -> u32 {
+) -> (u32, &'static str) {
     let per_task = (model_memory / 4).max(256 * 1024 * 1024);
     let by_memory = available_memory.map_or(1, |free| free.saturating_sub(model_memory) / per_task);
-    let by_device = if accelerated {
-        8
+    let (by_device, device) = if accelerated {
+        (8, "graphics")
     } else {
-        (cores / 4).clamp(1, 2) as u64
+        ((cores / 4).clamp(1, 2) as u64, "processor")
     };
-    by_memory.clamp(1, by_device) as u32
+    let tasks = by_memory.clamp(1, by_device) as u32;
+    (
+        tasks,
+        if by_memory < by_device {
+            "memory"
+        } else {
+            device
+        },
+    )
+}
+/// What the server's Jobs settings allow for the tasks that are ready.
+fn server_allows(
+    limits: &std::collections::BTreeMap<String, u32>,
+    ready: &std::collections::BTreeSet<String>,
+) -> u32 {
+    ready
+        .iter()
+        .map(|workload| limits.get(workload).copied().unwrap_or(1))
+        .sum()
 }
 /// How many tasks to run at once: what the server allows for the tasks that are ready, what
 /// this computer can take, and no more than it managed since it last ran short of memory.
@@ -456,11 +537,32 @@ fn concurrent_tasks(
     local: u32,
     ceiling: Option<u32>,
 ) -> u32 {
-    let allowed: u32 = ready
-        .iter()
-        .map(|workload| limits.get(workload).copied().unwrap_or(1))
-        .sum();
-    allowed.min(local).min(ceiling.unwrap_or(u32::MAX)).max(1)
+    server_allows(limits, ready)
+        .min(local)
+        .min(ceiling.unwrap_or(u32::MAX))
+        .max(1)
+}
+/// What sets the number `concurrent_tasks` gives, for the status display: `one-at-a-time`
+/// (the server lets a desktop hold one lease), `memory-shortfall`, `server`, or the local
+/// limit `local_limit` named.
+fn concurrent_limit(
+    several_leases: bool,
+    limits: &std::collections::BTreeMap<String, u32>,
+    ready: &std::collections::BTreeSet<String>,
+    (local, local_reason): (u32, &'static str),
+    ceiling: Option<u32>,
+) -> &'static str {
+    if !several_leases {
+        return "one-at-a-time";
+    }
+    let allowed = server_allows(limits, ready);
+    if ceiling.is_some_and(|ceiling| ceiling < allowed.min(local)) {
+        "memory-shortfall"
+    } else if allowed <= local {
+        "server"
+    } else {
+        local_reason
+    }
 }
 /// What a runtime that ended or stopped answering means for how the work goes on.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -642,6 +744,10 @@ impl InHand {
         self.now
             .load(Ordering::Acquire)
             .max(self.at_drop.load(Ordering::Acquire))
+    }
+    /// Tasks in hand right now, for the status display.
+    fn now(&self) -> u32 {
+        self.now.load(Ordering::Acquire)
     }
 }
 /// The pool ended because the runtime ended or stopped answering: what comes next, with the
@@ -2209,12 +2315,22 @@ async fn serve(
                 .ok()
                 .and_then(|status| status.available_memory);
             let cores = std::thread::available_parallelism().map_or(1, |cores| cores.get());
-            let local = local_capacity(accelerated, cores, free_memory, required_memory);
+            let local_limits = local_limit(accelerated, cores, free_memory, required_memory);
+            let local = local_limits.0;
             let mut at_once = match several_leases {
                 true => concurrent_tasks(&limits, &ready, local, progress.capacity_ceiling()),
                 false => 1,
             };
-            progress.running_at_once(at_once);
+            let limit_now = |limits: &std::collections::BTreeMap<String, u32>| {
+                concurrent_limit(
+                    several_leases,
+                    limits,
+                    &ready,
+                    local_limits,
+                    progress.capacity_ceiling(),
+                )
+            };
+            progress.running_at_once(at_once, limit_now(&limits));
             // The process is started able to serve as many requests at once as this computer
             // could ever take, so a higher Jobs setting takes effect with the next claim.
             let threads = match several_leases {
@@ -2337,7 +2453,7 @@ async fn serve(
                                 local,
                                 progress.capacity_ceiling(),
                             );
-                            progress.running_at_once(at_once);
+                            progress.running_at_once(at_once, limit_now(&limits));
                         }
                     }
                 }
@@ -2400,7 +2516,7 @@ async fn serve(
                         failures.completed();
                         held_off = None;
                         strikes.completed(task.model.as_deref());
-                        progress.completed();
+                        progress.completed(task.took);
                         refused_in_a_row = 0;
                         // A long run without trouble: one more at once than it last ran
                         // short at, up to what the server allows and this computer can take.
@@ -2419,7 +2535,7 @@ async fn serve(
                                 progress.capacity_ceiling(),
                             );
                             at_once_now.store(more, Ordering::Release);
-                            progress.running_at_once(more);
+                            progress.running_at_once(more, limit_now(limits_now));
                         }
                         Some(Duration::ZERO)
                     }
@@ -2458,6 +2574,7 @@ async fn serve(
                 };
                 let on_step = |task: crate::native_predictor::TaskStep| {
                     in_hand.settled(&task);
+                    progress.running(in_hand.now());
                     on_task(task)
                 };
                 // A stop waits for every lease in hand to be handed back, one request each.
@@ -2470,6 +2587,7 @@ async fn serve(
                         &pool,
                         |workload| {
                             in_hand.claimed();
+                            progress.running(in_hand.now());
                             progress.active(Some(workload))
                         },
                         on_step,
@@ -2480,6 +2598,7 @@ async fn serve(
                 )
                 .await;
                 progress.active(None);
+                progress.running(0);
                 let running = at_once_now.load(Ordering::Acquire);
                 at_once = running;
                 // A runtime that ended or stopped answering: what it means depends on how
@@ -2683,15 +2802,58 @@ mod tests {
             notify: Arc::new(|_| {}),
         };
         progress.set("working", None);
-        progress.completed();
-        progress.completed();
+        progress.running(2);
+        progress.completed(None);
+        progress.completed(Some(Duration::from_millis(820)));
         progress.set("waiting-for-work", None);
         progress.set("paused", Some("memory_low".into()));
         let status = progress.status.lock().unwrap().clone();
         assert_eq!(status.completed_tasks, 2);
+        let shown = serde_json::to_value(&status).unwrap();
+        assert_eq!(shown["completedTasks"], serde_json::json!(2));
+        // The pace and the last task's time stay; a new state has no task in hand.
         assert_eq!(
-            serde_json::to_value(&status).unwrap()["completedTasks"],
-            serde_json::json!(2)
+            shown["pace"],
+            serde_json::json!({"tasks": 2, "seconds": 60})
+        );
+        assert_eq!(shown["lastTaskMs"], serde_json::json!(820));
+        assert_eq!(shown["runningTasks"], serde_json::json!(0));
+    }
+    #[test]
+    fn the_pace_counts_the_last_five_minutes_over_at_least_one() {
+        let start = std::time::Instant::now();
+        let mut finished = std::collections::VecDeque::new();
+        assert_eq!(pace(&mut finished, start), None);
+        for second in [0, 30, 90, 200] {
+            finished.push_back(start + Duration::from_secs(second));
+        }
+        // Four in 200 seconds.
+        let now = start + Duration::from_secs(200);
+        assert_eq!(
+            pace(&mut finished, now),
+            Some(Pace {
+                tasks: 4,
+                seconds: 200
+            })
+        );
+        // Six minutes on, the first two are older than the window and leave it.
+        let later = start + Duration::from_secs(360);
+        assert_eq!(
+            pace(&mut finished, later),
+            Some(Pace {
+                tasks: 2,
+                seconds: 270
+            })
+        );
+        assert_eq!(finished.len(), 2);
+        // Close together, they still count over a whole minute.
+        let mut burst = std::collections::VecDeque::from([start, start + Duration::from_secs(5)]);
+        assert_eq!(
+            pace(&mut burst, start + Duration::from_secs(5)),
+            Some(Pace {
+                tasks: 2,
+                seconds: 60
+            })
         );
     }
     #[test]
@@ -4030,7 +4192,7 @@ mod tests {
         let attempts = AtomicUsize::new(0);
         let result = reconnect(&progress, false, |_| {
             if attempts.fetch_add(1, Ordering::AcqRel) == 2 {
-                progress.completed();
+                progress.completed(None);
             }
             async { Err("runtime_process_stopped".into()) }
         })
@@ -4165,7 +4327,7 @@ mod tests {
             refreshes.lock().unwrap().push(refresh);
             let attempt = attempts.fetch_add(1, Ordering::AcqRel);
             if attempt == 2 {
-                progress.completed();
+                progress.completed(None);
             }
             async move {
                 match attempt {
@@ -4569,16 +4731,16 @@ mod tests {
     fn the_number_of_tasks_at_once_follows_the_server_and_this_computers_limits() {
         const GB: u64 = 1024 * 1024 * 1024;
         // The processor: one task, or two with eight cores, memory allowing.
-        assert_eq!(local_capacity(false, 4, Some(32 * GB), 2 * GB), 1);
-        assert_eq!(local_capacity(false, 8, Some(32 * GB), 2 * GB), 2);
-        assert_eq!(local_capacity(false, 16, Some(32 * GB), 2 * GB), 2);
+        assert_eq!(local_limit(false, 4, Some(32 * GB), 2 * GB).0, 1);
+        assert_eq!(local_limit(false, 8, Some(32 * GB), 2 * GB).0, 2);
+        assert_eq!(local_limit(false, 16, Some(32 * GB), 2 * GB).0, 2);
         // A graphics card or neural engine: up to eight, by the memory that is free beside
         // the models (2 GB of models: half a gigabyte of working memory for each task).
-        assert_eq!(local_capacity(true, 8, Some(32 * GB), 2 * GB), 8);
-        assert_eq!(local_capacity(true, 8, Some(3 * GB), 2 * GB), 2);
-        assert_eq!(local_capacity(true, 8, Some(GB), 2 * GB), 1);
+        assert_eq!(local_limit(true, 8, Some(32 * GB), 2 * GB).0, 8);
+        assert_eq!(local_limit(true, 8, Some(3 * GB), 2 * GB).0, 2);
+        assert_eq!(local_limit(true, 8, Some(GB), 2 * GB).0, 1);
         // Free memory that can't be read is one task.
-        assert_eq!(local_capacity(true, 8, None, 2 * GB), 1);
+        assert_eq!(local_limit(true, 8, None, 2 * GB).0, 1);
 
         let inventory = serde_json::json!({"workloads":[
             {"workload":"clip","state":"eligible","concurrency":4},
@@ -4609,13 +4771,56 @@ mod tests {
 
         // Running short lowers the number; it is not raised by being told a higher one.
         let progress = quiet();
-        progress.running_at_once(6);
+        progress.running_at_once(6, "server");
         progress.lower_capacity(3);
         progress.lower_capacity(5);
         assert_eq!(progress.capacity_ceiling(), Some(3));
         progress.set("working", None);
         assert_eq!(progress.capacity_ceiling(), Some(3));
         assert_eq!(progress.status.lock().unwrap().concurrent_tasks, 3);
+        assert_eq!(
+            progress.status.lock().unwrap().concurrent_limit.as_deref(),
+            Some("memory-shortfall")
+        );
+    }
+
+    #[test]
+    fn the_status_names_what_sets_the_number_of_tasks_at_once() {
+        const GB: u64 = 1024 * 1024 * 1024;
+        // The device, or free memory when that allows fewer.
+        assert_eq!(local_limit(true, 8, Some(32 * GB), 2 * GB), (8, "graphics"));
+        assert_eq!(local_limit(true, 8, Some(3 * GB), 2 * GB), (2, "memory"));
+        assert_eq!(local_limit(true, 8, None, 2 * GB), (1, "memory"));
+        assert_eq!(
+            local_limit(false, 8, Some(32 * GB), 2 * GB),
+            (2, "processor")
+        );
+        let limits =
+            std::collections::BTreeMap::from([("clip".to_owned(), 7), ("face".to_owned(), 1)]);
+        let ready = |names: &[&str]| names.iter().map(|name| name.to_string()).collect();
+        let both = ready(&["clip", "face"]);
+        // The server's Jobs settings allow 8 here.
+        assert_eq!(
+            concurrent_limit(true, &limits, &both, (8, "graphics"), None),
+            "server"
+        );
+        assert_eq!(
+            concurrent_limit(true, &limits, &both, (2, "memory"), None),
+            "memory"
+        );
+        assert_eq!(
+            concurrent_limit(true, &limits, &both, (8, "graphics"), Some(3)),
+            "memory-shortfall"
+        );
+        // A ceiling that limits nothing is not the reason.
+        assert_eq!(
+            concurrent_limit(true, &limits, &both, (2, "memory"), Some(4)),
+            "memory"
+        );
+        assert_eq!(
+            concurrent_limit(false, &limits, &both, (8, "graphics"), None),
+            "one-at-a-time"
+        );
     }
 
     #[test]
@@ -4709,6 +4914,7 @@ mod tests {
                 model: Some("clip".into()),
                 step,
                 reported: true,
+                took: None,
             }
         });
         in_hand.claimed();
@@ -4834,7 +5040,7 @@ mod tests {
             assert_eq!(ended, Err("runtime_process_stopped".into()));
             assert!(runtime_crash("runtime_process_stopped"));
             let progress = quiet();
-            progress.running_at_once(slots);
+            progress.running_at_once(slots, "server");
             let mut trouble = RuntimeTrouble::default();
             let after = after_crash(&mut trouble, &progress, in_hand.count(), accelerated);
             (in_hand.count(), after, progress.capacity_ceiling())
