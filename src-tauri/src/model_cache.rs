@@ -66,67 +66,22 @@ pub(crate) fn verify_file(
     }
     Ok(())
 }
-type RememberedFiles = std::sync::Mutex<
-    std::collections::HashMap<(PathBuf, String), crate::native_runtime::FileStamp>,
->;
-/// Kept in memory only, so each launch of the app hashes every model file at least once.
-static VERIFIED_FILES: std::sync::LazyLock<RememberedFiles> =
-    std::sync::LazyLock::new(Default::default);
-
-/// `verify_file` for a model file already in place: the three CLIP keys share their files, and
-/// setting up again in the same launch needs no second hash unless the file's metadata changed.
-pub(crate) fn verify_file_once(
-    path: &Path,
-    bytes: u64,
-    sha256: &str,
-    cancel: &AtomicBool,
-) -> Result<(), String> {
-    verify_file_remembered(
-        &VERIFIED_FILES,
-        path,
-        bytes,
-        sha256,
-        cancel,
-        std::time::SystemTime::now(),
-    )
-    .map(|_| ())
-}
-/// Returns whether the file was hashed. `now` is read before hashing, so a change during the
-/// hash is not trusted.
-fn verify_file_remembered(
-    remembered: &RememberedFiles,
-    path: &Path,
-    bytes: u64,
-    sha256: &str,
-    cancel: &AtomicBool,
-    now: std::time::SystemTime,
-) -> Result<bool, String> {
-    use crate::native_runtime::{absolute_directory, FileStamp};
-    check_cancel(cancel)?;
-    let key = (path.to_path_buf(), sha256.to_owned());
-    let before = FileStamp::read(path).filter(|stamp| stamp.bytes() == bytes);
+/// A model file already in place: a plain file of its listed size. Its bytes were hashed when it
+/// was downloaded (`verify_file`); a launch does not read them again (owner, 2026-11-23).
+pub(crate) fn check_file(path: &Path, bytes: u64) -> Result<(), String> {
+    crate::native_runtime::absolute_directory(path.parent().ok_or("model_path_invalid")?)?;
+    let meta = fs::symlink_metadata(path).map_err(|_| "model_file_unavailable")?;
+    if !meta.is_file() || meta.len() != bytes {
+        return Err("model_file_changed".into());
+    }
+    #[cfg(windows)]
     {
-        let mut known = remembered.lock().unwrap_or_else(|error| error.into_inner());
-        if before.is_some()
-            && known.get(&key) == before.as_ref()
-            && path
-                .parent()
-                .is_some_and(|parent| absolute_directory(parent).is_ok())
-        {
-            return Ok(false);
-        }
-        known.remove(&key);
-    }
-    verify_file(path, bytes, sha256, cancel)?;
-    if let Some(before) = before {
-        if before.settled(now) && FileStamp::read(path).as_ref() == Some(&before) {
-            remembered
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .insert(key, before);
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x400 != 0 {
+            return Err("model_link_forbidden".into());
         }
     }
-    Ok(true)
+    Ok(())
 }
 fn partial_path(path: &Path, sha256: &str) -> PathBuf {
     path.with_file_name(format!(".download-{sha256}"))
@@ -759,12 +714,7 @@ async fn prepare_once(
         check_cancel(cancel)?;
         let path = model.join(name);
         if complete {
-            verify_file_once(
-                &path,
-                *bytes,
-                plan.hashes[name].as_str().ok_or("model_plan_invalid")?,
-                cancel,
-            )?;
+            check_file(&path, *bytes)?;
             progress(CacheProgress::Verified(*bytes));
             continue;
         }
@@ -862,34 +812,27 @@ async fn prepare_once(
 }
 
 #[cfg(test)]
-mod remembered_file_tests {
+mod check_file_tests {
     use super::*;
-    use sha2::{Digest, Sha256};
-    use std::time::{Duration, SystemTime};
 
     #[test]
-    fn a_model_file_is_hashed_once_until_it_changes() {
+    fn a_model_file_in_place_is_checked_by_its_size_alone() {
         let root = std::env::temp_dir().join(format!("frameleaf-model-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(&root).unwrap_or(root);
         let path = root.join("model.onnx");
         fs::write(&path, b"weights").unwrap();
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(SystemTime::now() - Duration::from_secs(3600))
-            .unwrap();
-        let sha256 = format!("{:x}", Sha256::digest(b"weights"));
-        let known = RememberedFiles::default();
-        let cancel = AtomicBool::new(false);
-        let later = || SystemTime::now() + Duration::from_secs(60);
-        let check = || verify_file_remembered(&known, &path, 7, &sha256, &cancel, later());
-        assert_eq!(check(), Ok(true));
-        assert_eq!(check(), Ok(false));
+        assert_eq!(check_file(&path, 7), Ok(()));
+        // The same length: its bytes were hashed when it was downloaded, not at each launch.
         fs::write(&path, b"wrights").unwrap();
-        assert_eq!(check(), Err("model_file_changed".to_owned()));
+        assert_eq!(check_file(&path, 7), Ok(()));
+        fs::write(&path, b"weights!").unwrap();
+        assert_eq!(check_file(&path, 7), Err("model_file_changed".to_owned()));
         fs::remove_file(&path).unwrap();
-        assert_eq!(check(), Err("model_file_unavailable".to_owned()));
+        assert_eq!(
+            check_file(&path, 7),
+            Err("model_file_unavailable".to_owned())
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }
@@ -1259,8 +1202,9 @@ mod tests {
                 .unwrap(),
             cache
         );
-        // Without download permission a changed cache is discarded, never returned for use.
-        fs::write(cache.join("clip/test/visual/model.onnx"), b"changed").unwrap();
+        // Without download permission a changed cache (here, another size: a file in place is
+        // checked by size) is discarded, never returned for use.
+        fs::write(cache.join("clip/test/visual/model.onnx"), b"changed!").unwrap();
         assert_eq!(
             prepare(plan(), &root.0, &client, &cancel, false, |_| {})
                 .await
@@ -1446,7 +1390,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tampered_model_is_downloaded_again_once_then_succeeds() {
+    async fn a_model_of_another_size_is_downloaded_again_once_then_succeeds() {
         let root = Root::new();
         let staged = Staged::new(&root.0);
         let client = crate::transport::client().unwrap();
@@ -1455,7 +1399,17 @@ mod tests {
             .await
             .unwrap();
         let model = cache.join("clip/test/visual/model.onnx");
-        fs::write(&model, b"changed").unwrap();
+        // A file already in place is checked by size, not read (owner, 2026-11-23): the same
+        // length with other bytes is used as it is, without asking the mirror.
+        fs::write(&model, b"wrights").unwrap();
+        assert_eq!(
+            prepare(staged.plan(), &root.0, &client, &cancel, false, |_| {})
+                .await
+                .unwrap(),
+            cache
+        );
+        // Another length is noticed and repaired from the mirror, once.
+        fs::write(&model, b"changed!").unwrap();
         let (mirror, server) = serve(vec![reply("200 OK", "", 7, b"weights")]);
         let verified = std::cell::Cell::new(0);
         let repaired = prepare_from(
@@ -1484,7 +1438,7 @@ mod tests {
         assert_eq!(verified.get(), 47, "repair must not count a file twice");
         // A mirror that keeps serving other bytes fails after that one repair, with nothing
         // unverified left where the runtime would load it.
-        fs::write(&model, b"changed").unwrap();
+        fs::write(&model, b"changed!").unwrap();
         let (mirror, server) = serve(vec![
             reply("200 OK", "", 7, b"changed"),
             reply("200 OK", "", 7, b"changed"),

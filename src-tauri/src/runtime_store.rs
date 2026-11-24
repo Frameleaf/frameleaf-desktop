@@ -491,13 +491,15 @@ impl RuntimeStore {
             // release may be the damaged one.
             let share = if damaged { None } else { share };
             verified.copy_payload(&staging.0.join("payload"), share)?;
+            // The one time the installed bytes are read: launches check names and sizes.
             VerifiedRuntime::verify(
                 &staging.0.join("payload"),
                 raw,
                 signature,
                 &self.keys,
                 minimum,
-            )?;
+            )?
+            .check_every_byte()?;
             write_new(&staging.0.join("manifest.json"), raw)?;
             write_new(&staging.0.join("manifest.sig"), signature)?;
             fs::rename(&staging.0, &release).map_err(|_| "runtime_store_activation_failed")?;

@@ -354,7 +354,12 @@ mod tests {
             )
         };
         assert_eq!(verify().is_ok(), admitted);
+        // Installing reads every byte; a launch checks the listed files and their sizes.
         fs::write(root.join(PACKAGE).join("entry.py"), b"changed bytes").unwrap();
+        if admitted {
+            assert!(verify().unwrap().check_every_byte().is_err());
+        }
+        fs::write(root.join(PACKAGE).join("entry.py"), b"changed bytes!").unwrap();
         assert!(verify().is_err());
         fs::remove_dir_all(root).unwrap();
     }

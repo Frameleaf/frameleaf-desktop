@@ -356,6 +356,8 @@ pub(crate) struct TaskStep {
     /// The server acknowledged the failure report of a dropped task: only then has it counted
     /// the failure toward withdrawing the model.
     pub reported: bool,
+    /// From the claim to the server hearing what became of it; `None` when nothing was claimed.
+    pub took: Option<Duration>,
 }
 /// How the worker steers the pool of tasks in hand.
 pub(crate) struct Pool<'a> {
@@ -403,6 +405,7 @@ where
         (&in_hand, &crash_reported, &stopped, &predict);
     // One task in hand, from its input to the server hearing what became of it.
     let work = |index: usize, task: ClaimedTask, mut cancel: watch::Receiver<bool>| async move {
+        let began = tokio::time::Instant::now();
         let qualification = qualifications[index];
         let run = |held, input| predict(index, held, input);
         let outcome = run_claimed(transport, &task, qualification, &mut cancel, run).await;
@@ -419,7 +422,7 @@ where
         }
         let step = settle(transport, &task, qualification, outcome, crash_reported).await;
         in_hand.fetch_sub(1, Ordering::AcqRel);
-        (task.model_key, step)
+        (task.model_key, step, began.elapsed())
     };
     let mut running = FuturesUnordered::new();
     // A claim for more room, made while tasks are in hand. It is waited for alongside them:
@@ -461,6 +464,7 @@ where
                             model: None,
                             step,
                             reported: false,
+                            took: None,
                         });
                         return Ok(());
                     }
@@ -526,11 +530,12 @@ where
                     }
                 }
             }
-            Some((model, step)) = running.next(), if !running.is_empty() => match step {
+            Some((model, step, took)) = running.next(), if !running.is_empty() => match step {
                 Ok((step, reported)) => {
                     let done = step == Step::Completed;
                     let now = tokio::time::Instant::now();
-                    match on_step(TaskStep { model: Some(model), step, reported }) {
+                    let took = Some(took);
+                    match on_step(TaskStep { model: Some(model), step, reported, took }) {
                         // A place came free: ask for more now, whatever was being waited out.
                         Some(pause) if done => {
                             empty = 0;
@@ -756,6 +761,19 @@ pub struct NativePredictor {
 struct Lane {
     child: NativeSidecar,
     manifest_sha256: String,
+    /// Predictions its process accepts at once (`predictions_at_once`).
+    at_once: usize,
+}
+/// How many predictions one runtime process takes at once. Its server answers a third request
+/// with 503 (uvicorn `limit_concurrency=2` in every released pack), and on CoreML the device
+/// observer proves one call at a time and refuses a second (409). More tasks than this are
+/// still in hand at once, fetching inputs and reporting results: only the prediction waits.
+fn predictions_at_once(provider: &str) -> usize {
+    if provider == "CoreMLExecutionProvider" {
+        1
+    } else {
+        2
+    }
 }
 struct BoundRole {
     client: BoundClient,
@@ -893,6 +911,7 @@ impl NativePredictor {
                 Lane {
                     child,
                     manifest_sha256: installed.manifest_sha256().into(),
+                    at_once: predictions_at_once(installed.provider()),
                 },
                 *port,
             ));
@@ -1092,6 +1111,13 @@ impl NativePredictor {
         use std::sync::atomic::Ordering;
         self.ready(cancel).await?;
         let roles = &self.roles;
+        // Each process's turns: a prediction waits for one rather than being refused.
+        let turns: Vec<_> = self
+            .children
+            .iter()
+            .map(|lane| tokio::sync::Semaphore::new(lane.at_once))
+            .collect();
+        let turns = &turns;
         // Shared by the tasks in hand: each checks its own process after its prediction.
         let children = std::sync::Mutex::new(&mut self.children);
         // Set when this owner stops the processes itself: that is not a process to blame.
@@ -1134,6 +1160,10 @@ impl NativePredictor {
                 let (role, children) = (&roles[index], &children);
                 async move {
                     let running = || children.lock().unwrap()[role.lane].child.is_running();
+                    let _turn = turns[role.lane]
+                        .acquire()
+                        .await
+                        .map_err(|_| "runtime_not_ready")?;
                     let answer = role.client.predict(&task, &input, transport.now()?).await;
                     let value = match answer {
                         Ok(value) => value,
@@ -1289,6 +1319,7 @@ pub(crate) mod testing {
                 children: vec![Lane {
                     child,
                     manifest_sha256: self.manifest().into(),
+                    at_once: 2,
                 }],
                 roles: vec![BoundRole {
                     client: BoundClient::new(self.port, "a".repeat(64), &spec).unwrap(),
@@ -1313,6 +1344,18 @@ mod tests {
     fn a_serving_process_has_time_to_load_its_models() {
         // A single model's check may take 120 seconds; serving loads several before it answers.
         assert!(SERVING_LOAD_DEADLINE >= Duration::from_secs(240));
+    }
+    #[test]
+    fn a_process_is_sent_no_more_predictions_than_it_accepts() {
+        // CoreML's device observer refuses a second call; every pack's server a third request.
+        assert_eq!(predictions_at_once("CoreMLExecutionProvider"), 1);
+        for provider in [
+            "CPUExecutionProvider",
+            "CUDAExecutionProvider",
+            "OpenVINOExecutionProvider",
+        ] {
+            assert_eq!(predictions_at_once(provider), 2);
+        }
     }
     fn now_ms() -> i64 {
         (OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
@@ -1893,6 +1936,7 @@ mod tests {
             children: vec![Lane {
                 child,
                 manifest_sha256: pack.manifest_sha256().into(),
+                at_once: 2,
             }],
             roles: vec![BoundRole {
                 client: client(19998),
@@ -1973,6 +2017,7 @@ mod tests {
                     .start_sidecar(&root.join("cache"), &root.join("work"), port)
                     .unwrap(),
                 manifest_sha256: name.into(),
+                at_once: 2,
             };
             let role = |port: u16, lane: usize| BoundRole {
                 client: client(port),

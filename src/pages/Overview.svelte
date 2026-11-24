@@ -238,6 +238,12 @@
         {#if worker.finished}
           <div class="row"><span class="l"><b>Tasks finished</b><small>{worker.finished}</small></span></div>
         {/if}
+        {#if worker.atOnce}
+          <div class="row"><span class="l"><b>Tasks at once</b><small>{worker.atOnce}</small></span></div>
+        {/if}
+        {#if worker.pace}
+          <div class="row"><span class="l"><b>Pace</b><small>{worker.pace}</small></span></div>
+        {/if}
         {#if section === 'ai'}
           {#if setup?.activeWorkload}
             <div class="row"><span class="l"><b>{workloadName(setup.activeWorkload)}</b><small>Processing on this computer</small></span></div>
