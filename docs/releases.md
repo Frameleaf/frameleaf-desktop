@@ -488,12 +488,14 @@ and native target before bundling. macOS additionally verifies that the embedded
 runtime still passes this contract after app signing, plus strict app signature,
 Gatekeeper and stapled notarization checks. Windows installers are unsigned by
 design and are published as `Frameleaf_<version>_x64-setup-unsigned.exe` and
-`Frameleaf_<version>_x64_en-US-unsigned.msi`; like every release so far they get
-no updater signature and stay out of `latest.json`, so Windows installs update by
-downloading the new installer. Linux packages include
+`Frameleaf_<version>_x64_en-US-unsigned.msi`. The NSIS installer gets an updater
+signature and is offered in `latest.json` as `windows-x86_64-nsis`: Desktop checks
+that signature before installing, and NSIS installs per user, so an update needs no
+administrator prompt. The MSI is Chocolatey's package and gets no updater signature;
+MSI installs find no feed entry and update through Chocolatey. Linux packages include
 the same verified runtime. Linux package repositories use their own signing policy.
 
-For a tagged build, the workflow signs the verified NSIS, MSI, DEB and AppImage
+For a tagged build, the workflow signs the verified NSIS, DEB and AppImage
 packages and archives the signed, stapled macOS app for in-app upgrades. Desktop
 checks GitHub's Latest release for `latest.json` at launch and offers to install a
 newer version when the manifest includes its architecture and installer format.

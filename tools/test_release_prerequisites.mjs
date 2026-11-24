@@ -46,10 +46,11 @@ test("Windows release installers are unsigned by design; the companion host keep
       assert.ok(!workflow.includes(signing), `${name} still has ${signing}`);
   }
   const workflow = read(".github/workflows/release.yml");
-  // Published with an -unsigned suffix, which keeps them out of the update feed and package managers.
+  // Published with an -unsigned suffix. The NSIS installer gets an updater signature and enters the
+  // update feed; the MSI (Chocolatey's package) gets neither.
   assert.match(workflow, /name = f'\{path\.stem\}-unsigned\{path\.suffix\}' if sys\.platform == 'win32' else path\.name/);
-  assert.match(workflow, /\*-unsigned\.\*\) ;;/);
-  assert.match(workflow, /!\/-unsigned\\\.\/\.test\(name\)/);
+  assert.match(workflow, /\n {14}\*-unsigned\.msi\) ;;\n/);
+  assert.match(workflow, /!\/-unsigned\\\.msi\$\/\.test\(name\)/);
   assert.match(workflow, /\n  build:\n    needs: prepare\n    if: \$\{\{ !cancelled\(\) && needs\.prepare\.result == 'success' \}\}\n/);
   assert.match(workflow, /\n  stage:\n(?:    #.*\n)*    if: \$\{\{ !cancelled\(\) && inputs\.tag != '' && needs\.build\.result == 'success' \}\}\n/);
   assert.match(read(".github/workflows/installer-candidates.yml"), /'osSigned': False,/);
