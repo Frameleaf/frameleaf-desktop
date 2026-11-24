@@ -66,6 +66,15 @@ approved model catalogue and claim route on both sides. The current inventory an
 admission are unchanged. Installed resource, cancellation, and output-quality checks are
 required on the platforms where the provider will be offered.
 
+## Catalogue profiles (epoch 19)
+
+Library's catalogue epoch 19 has Qwen3.5-4B's profile for runtime source `35ba35dd`, with the model
+mirror's `frameleaf/Qwen3.5-4B` (the pinned unsloth export, revision `90ad97bb`). Library's
+`machine-learning/scripts/add_desktop_description_profiles.py` makes these profiles. Qwen2.5-VL-7B-Instruct
+(mirror revision `b58477fc`) is added by the same script once a computer with 11.75 GiB free qualifies it.
+The factory's CPU job builds the pinned `llama-server` (static, portable, no Metal) and passes it to the
+builder below, so every processor pack from that source can describe photos.
+
 ## Build the candidate runtime pack
 
 Use the CPU runtime profile and a self-contained native `llama-server`

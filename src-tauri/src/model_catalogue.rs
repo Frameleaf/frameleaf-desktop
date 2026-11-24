@@ -1460,8 +1460,8 @@ mod tests {
             "95593fc6887c74a705c85b0ab8c9685c79afb0e4",
             "24ea593e19ce160b2e1dd8cdafb0c15ff34240d0",
         ];
-        let (desktop, server_ai) = profiles.split_at(expected.len());
-        assert_eq!(server_ai.len(), 18);
+        let (desktop, rest) = profiles.split_at(expected.len());
+        let (server_ai, epoch19) = rest.split_at(18);
         for (index, profile) in server_ai.iter().enumerate() {
             assert_eq!(
                 profile.runtime_source_revision,
@@ -1475,12 +1475,47 @@ mod tests {
         assert!(desktop
             .iter()
             .all(|profile| !SERVER_AI_SOURCES.contains(&profile.runtime_source_revision.as_str())));
-        for (profile, expected) in desktop.iter().zip(expected) {
-            let (spec, _) = profile
-                .challenge("d621bd72-ad35-4199-95ab-76300756a38e")
-                .unwrap();
-            assert_eq!(digest(&spec), expected);
+        let challenge = |profile: &ProfileData| {
+            digest(
+                &profile
+                    .challenge("d621bd72-ad35-4199-95ab-76300756a38e")
+                    .unwrap()
+                    .0,
+            )
+        };
+        for (profile, expected) in desktop.iter().zip(&expected) {
+            assert_eq!(challenge(profile), *expected);
         }
+        // Epoch 19 (FD-31): the processor twins of b3905b4a under the desktop runtime source that adds
+        // photo descriptions, each with its original's specification and digest, then Qwen3.5-4B's
+        // description profile, whose digest is the server's (desktop-model-catalogue.spec.ts).
+        const RUNTIME_SOURCE: &str = "35ba35dda671b99eb9c027e9168e185c31ebabf1";
+        let originals: Vec<&str> = desktop
+            .iter()
+            .zip(&expected)
+            .filter(|(profile, _)| {
+                profile.runtime_source_revision == "b3905b4aebd22e48a1a3843c2831efcef543336e"
+                    && profile.spec["provider"] == "CPUExecutionProvider"
+            })
+            .map(|(_, digest)| *digest)
+            .collect();
+        assert_eq!(epoch19.len(), originals.len() + 1);
+        for (profile, original) in epoch19.iter().zip(&originals) {
+            assert_eq!(profile.runtime_source_revision, RUNTIME_SOURCE);
+            assert_eq!(challenge(profile), *original);
+        }
+        let description = epoch19.last().unwrap();
+        assert_eq!(
+            (
+                description.workload.as_str(),
+                description.model_name.as_str()
+            ),
+            ("description", "Qwen3.5-4B")
+        );
+        assert_eq!(
+            challenge(description),
+            "41abae7572292327a31bf47a4f9262eadd170b91646c95b7220c3e9c64b472d6"
+        );
     }
     #[test]
     fn current_profiles_preserve_all_released_bindings_and_select_only_the_qualified_source() {
