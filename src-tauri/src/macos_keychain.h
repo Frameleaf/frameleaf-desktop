@@ -6,3 +6,4 @@ typedef enum : unsigned {
 
 OSStatus frameleaf_keychain(FrameleafKeychainOperation operation, const char *name, bool presence,
                             unsigned prompt, const void *bytes, size_t size, CFDataRef *output);
+CFStringRef frameleaf_keychain_accessible(void);
