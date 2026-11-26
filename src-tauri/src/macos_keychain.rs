@@ -4,7 +4,8 @@ use core_foundation::{
     data::{CFData, CFDataRef},
 };
 use serde::de::DeserializeOwned;
-use std::{ffi::CString, ptr};
+use std::{collections::BTreeMap, ffi::CString, ptr, sync::Mutex};
+use zeroize::Zeroizing;
 
 #[repr(u32)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -25,6 +26,33 @@ extern "C" {
         size: usize,
         output: *mut CFDataRef,
     ) -> i32;
+}
+
+const INTERACTION_NOT_ALLOWED: i32 = -25308; // errSecInteractionNotAllowed: the screen is locked
+
+// The process reads user-presence items silently once its context is authorised. macOS can still refuse
+// that context while the screen is locked, so keep the last bytes this process read or wrote.
+// ponytail: process memory only, cleared on delete; same reach the authorised context already has.
+static UNLOCKED: Mutex<BTreeMap<String, Zeroizing<Vec<u8>>>> = Mutex::new(BTreeMap::new());
+fn keep(account: &str, bytes: Option<&[u8]>) {
+    let Ok(mut kept) = UNLOCKED.lock() else {
+        return;
+    };
+    match bytes {
+        Some(bytes) if user_presence(account) => {
+            kept.insert(account.into(), Zeroizing::new(bytes.to_vec()));
+        }
+        _ => {
+            kept.remove(account);
+        }
+    }
+}
+fn kept(account: &str) -> Option<CFData> {
+    UNLOCKED
+        .lock()
+        .ok()?
+        .get(account)
+        .map(|bytes| CFData::from_buffer(bytes))
 }
 
 fn user_presence(account: &str) -> bool {
@@ -52,10 +80,27 @@ fn operation(
             &mut output,
         )
     };
+    let data = (status == 0 && !output.is_null())
+        .then(|| unsafe { CFData::wrap_under_create_rule(output) });
+    match (op, status) {
+        (Operation::Write, 0) => keep(account, Some(bytes)),
+        (Operation::Delete, _) => keep(account, None),
+        (_, 0) => {
+            if let Some(data) = &data {
+                keep(account, Some(data.bytes()));
+            }
+        }
+        (Operation::Read, INTERACTION_NOT_ALLOWED) => {
+            if let Some(data) = kept(account) {
+                return Ok(Some(data));
+            }
+        }
+        _ => {}
+    }
     match status {
-        0 => Ok((!output.is_null()).then(|| unsafe { CFData::wrap_under_create_rule(output) })),
+        0 => Ok(data),
         -25300 if op != Operation::Write => Ok(None), // errSecItemNotFound
-        -128 | -25293 | -25308 => Err("credential_unlock_required".into()),
+        -128 | -25293 | INTERACTION_NOT_ALLOWED => Err("credential_unlock_required".into()),
         _ => Err("credential_store_locked_or_unavailable".into()),
     }
 }
@@ -102,6 +147,33 @@ mod tests {
         assert!(confirm(name, b"fixture", Prompt::Silent).is_err());
         assert!(write(name, b"fixture").is_err());
         assert!(delete(name).is_err());
+    }
+
+    #[test]
+    fn items_stay_readable_while_the_screen_is_locked() {
+        extern "C" {
+            fn frameleaf_keychain_accessible() -> core_foundation::string::CFStringRef;
+            static kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly:
+                core_foundation::string::CFStringRef;
+        }
+        let used = unsafe { frameleaf_keychain_accessible() };
+        // kSecAttrAccessibleWhenUnlocked* stops every background read the moment the Mac locks.
+        assert_eq!(used, unsafe {
+            kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        });
+    }
+
+    #[test]
+    fn a_locked_screen_reuses_only_the_presence_sign_in_this_process_already_has() {
+        keep("connection", Some(b"session"));
+        assert_eq!(kept("connection").unwrap().bytes(), b"session");
+        keep("connection", None);
+        assert!(kept("connection").is_none(), "sign-out forgets the copy");
+        keep("worker-session", Some(b"worker"));
+        assert!(
+            kept("worker-session").is_none(),
+            "unattended items are read from the keychain itself"
+        );
     }
 
     #[test]

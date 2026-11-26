@@ -15,18 +15,34 @@ static NSMutableDictionary *query(NSString *account) {
               KEY(kSecUseAuthenticationContext): session} mutableCopy];
 }
 
+// AfterFirstUnlock, not WhenUnlocked: background work (AI help, video, backups, the server session) keeps
+// reading these while the screen is locked. User presence still guards the sign-ins a person unlocks.
+#define accessible kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+CFStringRef frameleaf_keychain_accessible(void) { return accessible; }
+
+static NSDictionary *protection(bool presence) {
+    if (!presence) return @{KEY(kSecAttrAccessible): KEY(accessible)};
+    SecAccessControlRef access = SecAccessControlCreateWithFlags(NULL, accessible, kSecAccessControlUserPresence, NULL);
+    return access ? @{KEY(kSecAttrAccessControl): CFBridgingRelease(access)} : nil;
+}
+
 static OSStatus add(NSString *account, NSData *value, bool presence) {
     NSMutableDictionary *item = query(account);
-    if (presence) {
-        SecAccessControlRef access = SecAccessControlCreateWithFlags(NULL,
-            kSecAttrAccessibleWhenUnlockedThisDeviceOnly, kSecAccessControlUserPresence, NULL);
-        if (!access) return errSecParam;
-        item[KEY(kSecAttrAccessControl)] = CFBridgingRelease(access);
-    } else {
-        item[KEY(kSecAttrAccessible)] = KEY(kSecAttrAccessibleWhenUnlockedThisDeviceOnly);
-    }
+    NSDictionary *protected = protection(presence);
+    if (!protected) return errSecParam;
+    [item addEntriesFromDictionary:protected];
     item[KEY(kSecValueData)] = value;
     return SecItemAdd((__bridge CFDictionaryRef)item, NULL);
+}
+
+// Items saved by earlier versions were WhenUnlocked. Move each once a launch, after a read proves the Mac
+// is unlocked, through the same context that read it; a refusal is retried next launch.
+static NSMutableSet<NSString *> *upgraded;
+static void upgrade(NSString *account, bool presence) {
+    if ([upgraded containsObject:account]) return;
+    [upgraded addObject:account];
+    NSDictionary *protected = protection(presence);
+    if (protected) SecItemUpdate((__bridge CFDictionaryRef)query(account), (__bridge CFDictionaryRef)protected);
 }
 
 static OSStatus readModern(NSString *account, CFDataRef *output) {
@@ -111,6 +127,7 @@ OSStatus frameleaf_keychain(FrameleafKeychainOperation operation, const char *na
         @synchronized ([LAContext class]) {
             if (!session) session = [[LAContext alloc] init];
             if (!legacyCleared) legacyCleared = [NSMutableSet set];
+            if (!upgraded) upgraded = [NSMutableSet set];
             // Concurrent startup reads share both a successful context and a cancellation until an explicit retry.
             if (prompt == 2) cancelled = false; // An explicit user retry re-arms the sheet.
             bool interactive = prompt != 0 && !cancelled;
@@ -121,6 +138,7 @@ OSStatus frameleaf_keychain(FrameleafKeychainOperation operation, const char *na
             OSStatus status;
             if (operation == FrameleafKeychainRead) {
                 status = readAccount(account, presence, interactive, output);
+                if (!status) upgrade(account, presence);
             } else if (operation == FrameleafKeychainConfirm) {
                 // Verify the item just written; never consult a legacy item in its place.
                 status = readModern(account, output);
