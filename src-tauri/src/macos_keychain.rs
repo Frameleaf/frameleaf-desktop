@@ -33,11 +33,9 @@ const INTERACTION_NOT_ALLOWED: i32 = -25308; // errSecInteractionNotAllowed: the
 // The process reads user-presence items silently once its context is authorised. macOS can still refuse
 // that context while the screen is locked, so keep the last bytes this process read or wrote.
 // ponytail: process memory only, cleared on delete; same reach the authorised context already has.
-static UNLOCKED: Mutex<BTreeMap<String, Zeroizing<Vec<u8>>>> = Mutex::new(BTreeMap::new());
-fn keep(account: &str, bytes: Option<&[u8]>) {
-    let Ok(mut kept) = UNLOCKED.lock() else {
-        return;
-    };
+type Kept = BTreeMap<String, Zeroizing<Vec<u8>>>;
+static UNLOCKED: Mutex<Kept> = Mutex::new(BTreeMap::new());
+fn keep(kept: &mut Kept, account: &str, bytes: Option<&[u8]>) {
     match bytes {
         Some(bytes) if user_presence(account) => {
             kept.insert(account.into(), Zeroizing::new(bytes.to_vec()));
@@ -47,12 +45,8 @@ fn keep(account: &str, bytes: Option<&[u8]>) {
         }
     }
 }
-fn kept(account: &str) -> Option<CFData> {
-    UNLOCKED
-        .lock()
-        .ok()?
-        .get(account)
-        .map(|bytes| CFData::from_buffer(bytes))
+fn kept(kept: &Kept, account: &str) -> Option<CFData> {
+    kept.get(account).map(|bytes| CFData::from_buffer(bytes))
 }
 
 fn user_presence(account: &str) -> bool {
@@ -68,6 +62,11 @@ fn operation(
 ) -> Result<Option<CFData>, String> {
     let name = CString::new(account).map_err(|_| "credential_record_invalid")?;
     let mut output = ptr::null();
+    // Held across the native call (already serialized natively) so a slower read can never replace
+    // bytes a newer write cached.
+    let mut cache = UNLOCKED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // The synchronous native call borrows its input and returns only a create-rule CFData.
     let status = unsafe {
         frameleaf_keychain(
@@ -83,15 +82,15 @@ fn operation(
     let data = (status == 0 && !output.is_null())
         .then(|| unsafe { CFData::wrap_under_create_rule(output) });
     match (op, status) {
-        (Operation::Write, 0) => keep(account, Some(bytes)),
-        (Operation::Delete, _) => keep(account, None),
+        (Operation::Write, 0) => keep(&mut cache, account, Some(bytes)),
+        (Operation::Delete, _) => keep(&mut cache, account, None),
         (_, 0) => {
             if let Some(data) = &data {
-                keep(account, Some(data.bytes()));
+                keep(&mut cache, account, Some(data.bytes()));
             }
         }
         (Operation::Read, INTERACTION_NOT_ALLOWED) => {
-            if let Some(data) = kept(account) {
+            if let Some(data) = kept(&cache, account) {
                 return Ok(Some(data));
             }
         }
@@ -165,13 +164,17 @@ mod tests {
 
     #[test]
     fn a_locked_screen_reuses_only_the_presence_sign_in_this_process_already_has() {
-        keep("connection", Some(b"session"));
-        assert_eq!(kept("connection").unwrap().bytes(), b"session");
-        keep("connection", None);
-        assert!(kept("connection").is_none(), "sign-out forgets the copy");
-        keep("worker-session", Some(b"worker"));
+        let mut cache = Kept::new();
+        keep(&mut cache, "connection", Some(b"session"));
+        assert_eq!(kept(&cache, "connection").unwrap().bytes(), b"session");
+        keep(&mut cache, "connection", None);
         assert!(
-            kept("worker-session").is_none(),
+            kept(&cache, "connection").is_none(),
+            "sign-out forgets the copy"
+        );
+        keep(&mut cache, "worker-session", Some(b"worker"));
+        assert!(
+            kept(&cache, "worker-session").is_none(),
             "unattended items are read from the keychain itself"
         );
     }
