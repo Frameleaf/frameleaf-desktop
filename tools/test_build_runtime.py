@@ -59,12 +59,21 @@ class RuntimeBuilderTests(unittest.TestCase):
             with self.assertRaisesRegex(builder.BuildError, "digest_mismatch"):
                 builder.stage_qwen_binary(source, "0" * 64, site, notices, "macos")
 
+    FFMPEG_NOTICES = {
+        "media-tools/FFMPEG-LICENSE.txt",
+        "media-tools/FFMPEG-GPL-3.0.txt",
+        "media-tools/FFMPEG-SOURCE.txt",
+    }
+
     def ffmpeg_component(self, root, executable="ffmpeg"):
         media = root / "component/media"
         media.mkdir(parents=True)
         files = {}
         for name in (executable, "ffprobe", builder.FFMPEG_LICENSE):
             (media / name).write_text("synthetic " + name)
+            files[name] = {"sha256": builder.sha256(media / name), "bytes": 1}
+        builder.write_ffmpeg_notices(media, "8.1.3-1", "a" * 64)
+        for name in (builder.FFMPEG_GPL, builder.FFMPEG_SOURCE):
             files[name] = {"sha256": builder.sha256(media / name), "bytes": 1}
         report = {
             "qualification": "passed",
@@ -85,7 +94,16 @@ class RuntimeBuilderTests(unittest.TestCase):
             payload.mkdir()
             receipt = builder.stage_ffmpeg(component, payload, "macos")
             inventory = builder.inventory(payload)
-            self.assertEqual(set(inventory), {"media-tools/ffmpeg", "media-tools/FFMPEG-LICENSE.txt"})
+            self.assertEqual(
+                set(inventory),
+                {"media-tools/ffmpeg", *self.FFMPEG_NOTICES},
+            )
+            self.assertEqual(
+                inventory["media-tools/FFMPEG-GPL-3.0.txt"]["sha256"], builder.FFMPEG_GPL_SHA256
+            )
+            pointer = (payload / "media-tools/FFMPEG-SOURCE.txt").read_text()
+            self.assertIn("jellyfin-ffmpeg/tree/" + builder.FFMPEG_SOURCE_COMMITS["8.1.3-1"], pointer)
+            self.assertIn("a" * 64, pointer)
             self.assertEqual(inventory["media-tools/ffmpeg"]["sha256"], report["files"]["ffmpeg"]["sha256"])
             if os.name != "nt":  # Windows has no execute bit
                 self.assertTrue((payload / "media-tools/ffmpeg").stat().st_mode & 0o100)
@@ -111,7 +129,7 @@ class RuntimeBuilderTests(unittest.TestCase):
                 inventory = builder.inventory(payload)
                 self.assertEqual(
                     set(inventory),
-                    {f"media-tools/{executable}", "media-tools/FFMPEG-LICENSE.txt"},
+                    {f"media-tools/{executable}", *self.FFMPEG_NOTICES},
                 )
                 self.assertEqual(
                     inventory[f"media-tools/{executable}"]["sha256"],
@@ -178,6 +196,25 @@ class RuntimeBuilderTests(unittest.TestCase):
                 payload = root / "payload"
                 payload.mkdir()
                 with self.assertRaisesRegex(builder.BuildError, "runtime_(ffmpeg|link)"):
+                    builder.stage_ffmpeg(component, payload, "macos")
+
+    def test_pack_refuses_ffmpeg_without_its_exact_gpl_and_source_pointer(self):
+        for fault in ("no-gpl", "other-gpl", "no-pointer", "other-pointer", "unpinned-version"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                component, report = self.ffmpeg_component(root)
+                name = builder.FFMPEG_GPL if "gpl" in fault else builder.FFMPEG_SOURCE
+                if fault.startswith("no-"):
+                    del report["files"][name]
+                elif fault.startswith("other-"):
+                    (component / "media" / name).write_bytes(b"something else")
+                    report["files"][name]["sha256"] = builder.sha256(component / "media" / name)
+                else:
+                    report["version"] = "9.0.0-1"
+                (component / "qualification.json").write_text(json.dumps(report))
+                payload = root / "payload"
+                payload.mkdir()
+                with self.assertRaisesRegex(builder.BuildError, "runtime_ffmpeg"):
                     builder.stage_ffmpeg(component, payload, "macos")
 
     def test_only_the_packs_an_installer_carries_hold_ffmpeg(self):

@@ -3,6 +3,7 @@
 
 # Preserve the upstream bytes used by the backup component's license digest.
 runtime/host-backup-LICENSE.txt -text
+runtime/ffmpeg-GPL-3.0.txt -text
 
 # Recovery digest fixture is generated from actual Manager JSON bytes.
 src-tauri/src/host_state/activation/manager-safety-recovery.fixture.json -text

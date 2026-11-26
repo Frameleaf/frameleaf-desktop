@@ -332,8 +332,9 @@ def build(source: Path, revision: str, output: Path) -> None:
         (payload / "FFMPEG-LICENSE.txt").write_text(
             run([binaries["ffmpeg"], "-L"], cwd=work, env=env) + "\n"
         )
-        from build_runtime import inventory
+        from build_runtime import inventory, write_ffmpeg_notices
 
+        write_ffmpeg_notices(payload, descriptor["version"], pin["checksum"][7:])
         report["files"] = inventory(payload)
         report["qualification"] = "passed"
     finally:
