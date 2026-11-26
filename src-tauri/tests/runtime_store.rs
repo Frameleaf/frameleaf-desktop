@@ -472,7 +472,8 @@ fn attestation_preserves_signed_bytes_and_rechecks_installed_release() {
     fs::write(release.join("manifest.sig"), [0; 64]).unwrap();
     assert!(store.attestation(&installed).is_err());
     fs::write(release.join("manifest.sig"), signature).unwrap();
-    fs::write(release.join("payload/python"), b"changed").unwrap();
+    // A launch checks presence and size only; every byte is hashed once, at install.
+    fs::write(release.join("payload/python"), b"truncated").unwrap();
     assert!(store.attestation(&installed).is_err());
 }
 

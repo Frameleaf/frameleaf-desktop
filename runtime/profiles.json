@@ -13,7 +13,7 @@
         "linux-x86_64",
         "linux-aarch64"
       ],
-      "sourceRevision": "f2c451a6bf71ca3f3aec986e07f0852937268e2f",
+      "sourceRevision": "35ba35dda671b99eb9c027e9168e185c31ebabf1",
       "targetPins": {
         "macos-x86_64": {
           "onnxruntime": {
@@ -24,10 +24,21 @@
       },
       "additionalSources": {
         "macos-aarch64": [
+          "f2c451a6bf71ca3f3aec986e07f0852937268e2f",
           "1ca4d52e2b8158d89d8de8b17e1e6535e17691f4",
           "f93c34d196955da3e2760c095c08b27ccbf53315"
         ],
+        "macos-x86_64": [
+          "f2c451a6bf71ca3f3aec986e07f0852937268e2f"
+        ],
+        "windows-x86_64": [
+          "f2c451a6bf71ca3f3aec986e07f0852937268e2f"
+        ],
+        "linux-x86_64": [
+          "f2c451a6bf71ca3f3aec986e07f0852937268e2f"
+        ],
         "linux-aarch64": [
+          "f2c451a6bf71ca3f3aec986e07f0852937268e2f",
           "f93c34d196955da3e2760c095c08b27ccbf53315"
         ]
       }

@@ -22,7 +22,12 @@ const run = (names) => ({
 });
 const macos = () => run(["Frameleaf_1.2.3_aarch64.app.tar.gz", "Frameleaf_1.2.3_aarch64.dmg"]);
 const linux = () => run(["Frameleaf_1.2.3_amd64.deb", "Frameleaf_1.2.3_amd64.AppImage", "Frameleaf_1.2.3_arm64.deb", "Frameleaf_1.2.3_aarch64.AppImage"]);
-const windows = () => run(["Frameleaf_1.2.3_x64-setup.exe", "Frameleaf_1.2.3_x64_en-US.msi"]);
+// The MSI is published without an updater signature: Chocolatey installs it, the update feed never offers it.
+const windows = () => {
+  const built = run(["Frameleaf_1.2.3_x64-setup-unsigned.exe"]);
+  built.assets.push(asset("Frameleaf_1.2.3_x64_en-US-unsigned.msi"));
+  return built;
+};
 const merge = (existing, incoming) => mergeDraft({ tag, repository, existing, incoming });
 // Stage runs one after another, as the workflow does: each adds its new assets and replaces the two generated files.
 function stage(...runs) {
@@ -71,7 +76,7 @@ test("a later run for the same tag adds its platforms to one latest.json and one
   assert.equal(sums.size, macos().assets.length + linux().assets.length + 1);
 
   const third = stage(macos(), linux(), windows()).merged;
-  assert.equal(Object.keys(third.manifest.platforms).length, 7);
+  assert.equal(Object.keys(third.manifest.platforms).length, 6);
   // The order the platforms were released in does not change the result.
   const other = stage(windows(), linux(), macos()).merged;
   assert.equal(other.manifestText, third.manifestText);
@@ -235,13 +240,11 @@ test("the release workflow stages through the merge tool and never replaces a pa
   assert.doesNotMatch(workflow, /gh release (?:delete|edit [^\n]*--draft=false)|--latest/);
 });
 
-test("a Windows run adds its unsigned installers to a draft that already has a feed, and cannot start one", () => {
-  const unsigned = { assets: [asset("Frameleaf_1.2.3_x64-setup-unsigned.exe")], manifest: { version: "1.2.3", platforms: {} } };
-  assert.throws(() => merge(null, unsigned), /update_assets_missing/);
-  const first = merge(null, macos());
-  const existing = { assets: [...macos().assets, asset("latest.json", first.manifestText), asset("SHA256SUMS", first.checksums)], manifest: first.manifest };
-  const merged = merge(existing, unsigned);
-  assert.deepEqual(merged.upload, ["Frameleaf_1.2.3_x64-setup-unsigned.exe"]);
-  assert.deepEqual(merged.manifest, first.manifest);
-  assert.match(merged.checksums, /Frameleaf_1\.2\.3_x64-setup-unsigned\.exe/);
+test("a Windows run offers its NSIS installer, can start a draft, and uploads the MSI beside it", () => {
+  const alone = merge(null, windows());
+  assert.deepEqual(Object.keys(alone.manifest.platforms), ["windows-x86_64-nsis"]);
+  assert.deepEqual(alone.upload, [
+    "Frameleaf_1.2.3_x64-setup-unsigned.exe", "Frameleaf_1.2.3_x64-setup-unsigned.exe.sig", "Frameleaf_1.2.3_x64_en-US-unsigned.msi",
+  ]);
+  assert.match(alone.checksums, /Frameleaf_1\.2\.3_x64_en-US-unsigned\.msi/);
 });

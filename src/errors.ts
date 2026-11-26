@@ -377,7 +377,7 @@ const families: readonly (readonly [WorkerReason | '', string, string])[] = [
   ['update', 'Your server and this computer could not agree on an AI task. Update Frameleaf and your server, then try again.', 'worker_challenge_invalid worker_challenge_request_invalid worker_claim_invalid worker_config_invalid worker_deadline_invalid worker_input_invalid worker_input_too_large worker_lease_invalid worker_path_invalid worker_payload_invalid worker_proof_invalid worker_result_invalid worker_result_refused worker_result_too_large worker_session_response_invalid worker_text_invalid'],
   ['', 'AI setup was stopped before it finished. Try again when you are ready.', 'worker_setup_cancelled worker_cancelled runtime_cancelled'],
   ['', 'AI setup could not finish. Photos remain available. Try again when your server and network are ready.', 'worker_setup_failed'],
-  ['not-enabled', 'Your server has no AI task turned on that this computer can run. A server administrator can turn on Smart search, Face recognition or Text recognition, with a model Frameleaf supports on computers, in the server’s machine learning settings.', 'worker_no_eligible_workloads'],
+  ['not-enabled', 'Your server has no AI task turned on that this computer can run. A server administrator can turn on Smart search, Face recognition, Text recognition or Photo descriptions, with a model Frameleaf supports on computers, in the server’s machine learning settings.', 'worker_no_eligible_workloads'],
   // Desktop auto-setup (docs/desktop-worker-setup-protocol.md): one specific reason each.
   ['', 'Your server needs an update before this computer can do its AI work. Update Frameleaf on your server. This computer checks again every few minutes.', 'server_update_required desktop_pool_config_changed desktop_pool_destination_changed desktop_pool_route_changed desktop_route_review_required desktop_nas_producer_unavailable desktop_nas_face_producer_unavailable desktop_nas_fixture_mismatch desktop_nas_model_unavailable desktop_nas_producer_changed desktop_nas_producer_expired'],
   ['', 'Your server turned this AI task off, or changed its model, while this computer was checking it. Other tasks continue. Try again to use the new settings.', 'desktop_model_profile_unavailable desktop_model_profile_changed desktop_clip_profile_unavailable desktop_face_profile_unavailable desktop_clip_space_unavailable desktop_pool_model_unavailable'],
@@ -399,6 +399,7 @@ const families: readonly (readonly [WorkerReason | '', string, string])[] = [
   ['metered', 'AI processing pauses on metered networks. Photos remain available.', 'metered_network'],
   ['metered', 'Network cost could not be determined. AI processing is paused.', 'network_unknown'],
   ['memory', 'Waiting for enough memory for the selected model. Closing other apps can help.', 'memory_low'],
+  ['memory', 'Photo descriptions need more free memory than this computer has now. Other AI tasks continue, and descriptions are tried again later. Closing other apps can help.', 'workload_memory_low'],
   ['memory', 'Memory status could not be read. AI processing is paused.', 'memory_unknown'],
   ['', 'This computer’s power, network and memory could not be checked. AI processing is paused.', 'status_unavailable resource_status_unavailable'],
   // ---- photo folders and imports ----

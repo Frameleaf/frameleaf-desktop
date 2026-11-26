@@ -174,7 +174,10 @@ test('runtime history failures explain recovery without suggesting a network ret
   assert.equal(runtimeRecoveryMessage('runtime_epoch_unknown'), null);
 });
 
-const card = async (setup: { state: string; code?: string | null; control?: string; activeWorkload?: string | null; completedTasks?: number } | null, connectionState = 'preparing') => {
+const card = async (setup: {
+  state: string; code?: string | null; control?: string; activeWorkload?: string | null; completedTasks?: number;
+  concurrentTasks?: number; concurrentLimit?: string | null; runningTasks?: number; pace?: { tasks: number; seconds: number } | null; lastTaskMs?: number | null;
+} | null, connectionState = 'preparing') => {
   const { workerView } = await import('../src/mode-state.ts');
   return workerView({ connectionState, workerSupported: true, computer: 'Mac', setup });
 };
@@ -364,6 +367,42 @@ test('the card says working only while a task runs, and counts finished tasks', 
   for (const completedTasks of [undefined, -1, 1.5, Number.NaN]) assert.equal((await card({ state: 'working', completedTasks })).finished, null);
   assert.deepEqual((await card({ state: 'preparing-models' })).pill, { label: 'Setting up', tone: 'wait' });
   assert.deepEqual((await card({ state: 'stopped', control: 'stopped' })).pill, { label: 'Stopped', tone: 'off' });
+});
+
+test('the card says how many tasks run at once, what sets that, and how fast they finish', async () => {
+  const working = { state: 'working', code: null, activeWorkload: 'clip', completedTasks: 40, concurrentTasks: 7, concurrentLimit: 'server', runningTasks: 3 };
+  const busy = await card({ ...working, pace: { tasks: 36, seconds: 180 }, lastTaskMs: 820 });
+  assert.equal(busy.atOnce, '3 running now · up to 7 at once, set by the Jobs setting on your server');
+  assert.equal(busy.pace, 'About 12 tasks a minute · the last one took 0.8 seconds');
+  assert.equal(busy.detail, 'This computer processes up to 7 selected AI tasks at once while power, network and memory allow.');
+  for (const [limit, words] of [
+    ['memory', 'set by the free memory on this computer'],
+    ['graphics', 'set by the most Frameleaf runs at once on a graphics card'],
+    ['processor', 'set by this computer’s processor'],
+    ['memory-shortfall', 'set by Frameleaf, after tasks running together failed on this computer'],
+    ['one-at-a-time', 'set by your server, which sends each computer one task at a time'],
+  ] as const) assert.match((await card({ ...working, concurrentLimit: limit })).atOnce ?? '', new RegExp(`${words}$`));
+  // An unknown limit says nothing about why rather than something wrong.
+  assert.equal((await card({ ...working, concurrentLimit: 'something-new' })).atOnce, '3 running now · up to 7 at once');
+  assert.equal((await card({ ...working, concurrentTasks: 1, runningTasks: 1 })).atOnce, '1 running now · one at a time, set by the Jobs setting on your server');
+  // Slower or faster work reads naturally.
+  assert.equal((await card({ ...working, pace: { tasks: 3, seconds: 60 } })).pace, 'About 3 tasks a minute');
+  assert.equal((await card({ ...working, pace: { tasks: 5, seconds: 120 } })).pace, 'About 2.5 tasks a minute');
+  assert.equal((await card({ ...working, pace: { tasks: 1, seconds: 300 } })).pace, 'About 1 task every 5 minutes');
+  assert.equal((await card({ ...working, lastTaskMs: 45_000 })).pace, 'The last task took 45 seconds');
+  assert.equal((await card({ ...working, lastTaskMs: 300_000 })).pace, 'The last task took 5 minutes');
+  // Waiting for work still says how many it can take; the pace is only shown while a task runs.
+  const idle = await card({ ...working, state: 'waiting-for-work', activeWorkload: null, runningTasks: 0, pace: { tasks: 36, seconds: 180 } });
+  assert.equal(idle.atOnce, '0 running now · up to 7 at once, set by the Jobs setting on your server');
+  assert.equal(idle.pace, null);
+  // Setting up, stopped or stuck: neither line, and an older backend or a bad value shows none.
+  for (const state of ['preparing-models', 'stopped', 'setup-needs-attention']) {
+    const quiet = await card({ ...working, state, activeWorkload: null });
+    assert.equal(quiet.atOnce, null);
+    assert.equal(quiet.pace, null);
+  }
+  for (const concurrentTasks of [undefined, 0, -1, 1.5]) assert.equal((await card({ ...working, concurrentTasks })).atOnce, null);
+  assert.equal((await card({ ...working, pace: { tasks: Number.NaN, seconds: 60 } })).pace, null);
 });
 
 test('no worker card text shows a raw code or state name', async () => {

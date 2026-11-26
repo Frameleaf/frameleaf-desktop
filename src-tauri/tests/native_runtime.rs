@@ -60,7 +60,8 @@ fn only_trusted_current_platform_signed_complete_packs_are_accepted() {
         VerifiedRuntime::verify(&root.0, &raw, &signature, &[signing.verifying_key()], 7).is_err()
     );
     fs::remove_file(root.0.join("extra.py")).unwrap();
-    fs::write(root.0.join("python"), b"changed").unwrap();
+    // A launch checks presence and size only; every byte is hashed once, at install.
+    fs::write(root.0.join("python"), b"truncated").unwrap();
     assert!(
         VerifiedRuntime::verify(&root.0, &raw, &signature, &[signing.verifying_key()], 7).is_err()
     );

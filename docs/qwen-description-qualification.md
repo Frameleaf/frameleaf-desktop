@@ -20,6 +20,30 @@ python3 tools/qwen_description.py convert \
   --quantizer /path/to/llama-quantize --output /path/to/new-candidate
 ```
 
+FD-31 (owner, 2026-11-24) adds the larger model: pass `--model-name Qwen2.5-VL-7B-Instruct` to
+both commands with a [Qwen2.5-VL-7B-Instruct checkout](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/tree/cc594898137f460bfe9f0759e9844b3ce807cfb5).
+That checkpoint has no LICENSE file; its model card states Apache-2.0, so `convert` also takes
+`--license` with that license's text (Library's `licenses/texts/apache-2.0.txt`). It has no pinned
+third-party export, so `qualify` needs its conversion receipt. Each of its descriptions may take
+90 seconds on four processor threads (30 for Qwen3.5-4B).
+
+Build the quantizer and `llama-server` so they report the 9-character commit `7fe450e19` and build
+11146, as Library and Desktop require. A shallow clone abbreviates to 7 characters, and its build
+number is 1, which also makes the web UI asset download fail:
+
+```sh
+git -C /path/to/llama.cpp config core.abbrev 9
+cmake -S /path/to/llama.cpp -B /path/to/llama.cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_CURL=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_NUMBER=11146 \
+  -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+  -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_METAL=OFF -DGGML_OPENMP=OFF -DLLAMA_OPENSSL=OFF
+cmake --build /path/to/llama.cpp/build --target llama-server llama-quantize
+```
+
+The last line makes the `llama-server` a candidate pack copies self-contained and portable, as the
+factory builds it (`.github/workflows/factory-runtime.yml`, which also selects the static C runtime on
+Windows). The free-space check counts the space macOS frees on demand, as Finder does.
+
 The tool verifies the checkpoint files against Git and LFS, then converts to BF16, quantizes to
 Q4_K_M, exports the F16 vision projector, and copies the Apache license. The receipt records the
 exact inputs, converter revision, quantizer binary and resulting artifacts.
@@ -45,6 +69,16 @@ owned llama.cpp process, qualification for both GGUF files and the execution bac
 approved model catalogue and claim route on both sides. The current inventory and runtime
 admission are unchanged. Installed resource, cancellation, and output-quality checks are
 required on the platforms where the provider will be offered.
+
+## Catalogue profiles (epoch 20)
+
+Library's catalogue epoch 20 has both description profiles for runtime source `35ba35dd`:
+- Qwen3.5-4B, from the model mirror's `frameleaf/Qwen3.5-4B` (the pinned unsloth export, revision `90ad97bb`), with an 8 GiB floor.
+- Qwen2.5-VL-7B-Instruct, from `frameleaf/Qwen2.5-VL-7B-Instruct` (the pinned ggml-org export, revision `b58477fc`), with an 11.75 GiB floor.
+
+Library's `machine-learning/scripts/add_desktop_description_profiles.py` makes these profiles.
+The factory's CPU job builds the pinned `llama-server` (static, portable, no Metal) and passes it to the
+builder below, so every processor pack from that source can describe photos.
 
 ## Build the candidate runtime pack
 

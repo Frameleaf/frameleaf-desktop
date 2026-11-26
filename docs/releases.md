@@ -360,8 +360,12 @@ runtime in `runtime/profiles.json` is one the server approves.
 admit, and every source in it has profiles in the catalogue (the parity check
 fails otherwise). Today that is the CPU runtime on every target, `coreml-ort` on
 Apple Silicon, and `cuda-ort` and `openvino-ort` on Windows and Linux x86_64.
+The CPU profile builds `35ba35dd` (since catalogue epoch 20, FD-31): `b3905b4a` plus the native
+Qwen binding, with the same face and text keys as `f2c451a6`, whose packs stay packageable on every
+target. Its pack also carries the pinned `llama-server` for photo descriptions, which the factory
+builds in the same job (`.github/workflows/factory-runtime.yml`).
 The accelerated profiles build their own runtime source (since catalogue epoch 16;
-the catalogue is at epoch 17 today),
+the catalogue is at epoch 20 today),
 which verifies the model bytes a session loads; the CPU profile is unchanged.
 
 `python tools/build_runtime.py --profile coreml-ort` builds an accelerated pack:
@@ -372,7 +376,7 @@ The factory workflow builds it for `macos-aarch64` by default (`accelerated:
 default`; choose `none` for the processor pack alone), and signs both manifests
 (`manifest-accelerated.sig`) after Apple code signing; packaging ships the second
 manifest beside the first. Both manifests of that pack name the accelerated
-profile's source, so the server must already carry this catalogue's epoch (17
+profile's source, so the server must already carry this catalogue's epoch (20
 today): against an
 older server neither manifest is known and that Mac has no AI processing until
 the server is updated. Release the server first: a tagged release run stops in
@@ -488,12 +492,14 @@ and native target before bundling. macOS additionally verifies that the embedded
 runtime still passes this contract after app signing, plus strict app signature,
 Gatekeeper and stapled notarization checks. Windows installers are unsigned by
 design and are published as `Frameleaf_<version>_x64-setup-unsigned.exe` and
-`Frameleaf_<version>_x64_en-US-unsigned.msi`; like every release so far they get
-no updater signature and stay out of `latest.json`, so Windows installs update by
-downloading the new installer. Linux packages include
+`Frameleaf_<version>_x64_en-US-unsigned.msi`. The NSIS installer gets an updater
+signature and is offered in `latest.json` as `windows-x86_64-nsis`: Desktop checks
+that signature before installing, and NSIS installs per user, so an update needs no
+administrator prompt. The MSI is Chocolatey's package and gets no updater signature;
+MSI installs find no feed entry and update through Chocolatey. Linux packages include
 the same verified runtime. Linux package repositories use their own signing policy.
 
-For a tagged build, the workflow signs the verified NSIS, MSI, DEB and AppImage
+For a tagged build, the workflow signs the verified NSIS, DEB and AppImage
 packages and archives the signed, stapled macOS app for in-app upgrades. Desktop
 checks GitHub's Latest release for `latest.json` at launch and offers to install a
 newer version when the manifest includes its architecture and installer format.

@@ -36,6 +36,14 @@ SOURCE_FILES = (
     "model.safetensors.index.json", "preprocessor_config.json", "tokenizer.json",
     "tokenizer_config.json", "video_preprocessor_config.json", "vocab.json",
 )
+# Qwen/Qwen2.5-VL-7B-Instruct at its pinned upstream revision (filled from the verified checkout).
+QWEN25_SOURCE = "cc594898137f460bfe9f0759e9844b3ce807cfb5"
+QWEN25_FILES = (
+    "README.md", "chat_template.json", "config.json", "generation_config.json", "merges.txt",
+    *(f"model-0000{part}-of-00005.safetensors" for part in range(1, 6)),
+    "model.safetensors.index.json", "preprocessor_config.json", "tokenizer.json",
+    "tokenizer_config.json", "vocab.json",
+)
 SCHEMA = {
     "type": "object",
     "properties": {"description": {"type": "string", "maxLength": 240}},
@@ -44,6 +52,16 @@ SCHEMA = {
 }
 DESCRIPTION_TASK = "image-description-tagging"
 MODEL_NAME = "Qwen3.5-4B"
+# FD-31 (owner, 2026-11-24): both description models, each from its pinned upstream checkpoint.
+# `export` is the pinned third-party GGUF pair a diagnostic may use instead of a local conversion.
+MODELS = {
+    MODEL_NAME: {"source": SOURCE, "files": SOURCE_FILES, "export": (EXPORT, EXPORTED_FILES), "seconds": 30},
+    "Qwen2.5-VL-7B-Instruct": {
+        "source": QWEN25_SOURCE, "files": QWEN25_FILES, "export": None, "seconds": 90,
+        # The checkpoint ships no LICENSE file; its model card states the license, whose text is supplied.
+        "license": ("README.md", "apache-2.0"),
+    },
+}
 LIMIT = 64 * 1024
 MAX_IMAGE = 16 * 1024 * 1024
 
@@ -161,12 +179,13 @@ def git_bytes(repo, *args):
     return subprocess.check_output(["git", "-C", str(repo), *args], timeout=20)
 
 
-def verify_source(repo):
-    if git_bytes(repo, "rev-parse", "HEAD").decode().strip() != SOURCE:
+def verify_source(repo, model=MODEL_NAME):
+    source, files = MODELS[model]["source"], MODELS[model]["files"]
+    if git_bytes(repo, "rev-parse", "HEAD").decode().strip() != source:
         raise ValueError("The Qwen checkout must match the pinned revision")
     records = {}
-    for name in SOURCE_FILES:
-        blob = git_bytes(repo, "show", f"{SOURCE}:{name}")
+    for name in files:
+        blob = git_bytes(repo, "show", f"{source}:{name}")
         if blob.startswith(b"version https://git-lfs.github.com/spec/v1\n"):
             fields = dict(line.split(" ", 1) for line in blob.decode().splitlines()[1:])
             records[name] = checked_artifact(repo / name, (int(fields["size"]), fields["oid"].removeprefix("sha256:")))
@@ -175,14 +194,37 @@ def verify_source(repo):
     return records
 
 
-def convert(source, llama, quantizer, output):
-    if output.exists() or shutil.disk_usage(output.parent).free < 24 * 1024**3:
+def free_space(path):
+    """What the volume can store. macOS counts purgeable space it frees on demand, as Finder does; df does not."""
+    if sys.platform == "darwin":
+        script = (
+            'ObjC.import("Foundation"); var out = Ref(); '
+            f'$.NSURL.fileURLWithPath({json.dumps(str(path))}).getResourceValueForKeyError('
+            'out, $.NSURLVolumeAvailableCapacityForImportantUsageKey, null); String(ObjC.unwrap(out[0]))'
+        )
+        value = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", "-e", script],
+                               capture_output=True, text=True, timeout=20).stdout.strip()
+        if value.isdigit():
+            return int(value)
+    return shutil.disk_usage(path).free
+
+
+def convert(source, llama, quantizer, output, model=MODEL_NAME, license_text=None):
+    if output.exists() or free_space(output.parent) < 24 * 1024**3:
         raise ValueError("Conversion needs a new output directory and at least 24 GiB free")
     if git_bytes(llama, "rev-parse", "HEAD").decode().strip() != LLAMA or git_bytes(
         llama, "status", "--porcelain", "--untracked-files=normal"
     ):
         raise ValueError("The converter checkout must be clean and match the pinned revision")
-    source_files = verify_source(source)
+    source_files = verify_source(source, model)
+    statement = MODELS[model].get("license")
+    if statement:
+        card = (source / statement[0]).read_text(encoding="utf-8").split("---", 2)
+        if len(card) < 3 or f"license: {statement[1]}" not in card[1].splitlines() or license_text is None:
+            raise ValueError(f"Expected the model card to state {statement[1]} and that license's text (--license)")
+        license_source = license_text
+    else:
+        license_source = source / "LICENSE"
     quantizer_receipt = artifact(quantizer)
     output.mkdir(mode=0o700)
     with tempfile.TemporaryDirectory(prefix="conversion-", dir=output) as directory:
@@ -190,7 +232,7 @@ def convert(source, llama, quantizer, output):
         # The converter sees exactly the verified inputs, with no adjacent files.
         inputs = scratch / "source"
         inputs.mkdir()
-        for name in SOURCE_FILES:
+        for name in MODELS[model]["files"]:
             os.link(source / name, inputs / name)
         environment = {
             "PATH": os.defpath, "HOME": str(scratch), "TMPDIR": str(scratch), "LC_ALL": "C",
@@ -212,9 +254,9 @@ def convert(source, llama, quantizer, output):
             [*convert_script, "--mmproj", "--outtype", "f16", "--outfile", str(output / "mmproj.gguf")],
             check=True, timeout=900, env=environment, cwd=llama,
         )
-    shutil.copyfile(source / "LICENSE", output / "LICENSE")
+    shutil.copyfile(license_source, output / "LICENSE")
     receipt = {
-        "schemaVersion": 1, "sourceRevision": SOURCE, "converterRevision": LLAMA,
+        "schemaVersion": 1, "modelName": model, "sourceRevision": MODELS[model]["source"], "converterRevision": LLAMA,
         "sourceFiles": source_files, "quantizer": quantizer_receipt,
         "host": {"os": platform.system(), "architecture": platform.machine()},
         "python": platform.python_version(),
@@ -226,7 +268,7 @@ def convert(source, llama, quantizer, output):
         json.dump(receipt, file, indent=2)
 
 
-def converted_artifacts(receipt):
+def converted_artifacts(receipt, model=MODEL_NAME):
     with receipt.open("rb") as file:
         raw = file.read(LIMIT + 1)
     if len(raw) > LIMIT:
@@ -234,7 +276,8 @@ def converted_artifacts(receipt):
     value = json.loads(raw, object_pairs_hook=unique_fields)
     if (
         not isinstance(value, dict) or value.get("schemaVersion") != 1 or
-        value.get("sourceRevision") != SOURCE or value.get("converterRevision") != LLAMA or
+        value.get("modelName", MODEL_NAME) != model or
+        value.get("sourceRevision") != MODELS[model]["source"] or value.get("converterRevision") != LLAMA or
         value.get("releaseQualified") is not False
     ):
         raise ValueError("Unexpected conversion receipt")
@@ -275,16 +318,17 @@ def request_local(port, path, token, *, body=None, timeout=20):
         raise
 
 
-def worker_entries():
-    return {DESCRIPTION_TASK: {"visual": {"modelName": MODEL_NAME, "options": {}}}}
+def worker_entries(model=MODEL_NAME):
+    return {DESCRIPTION_TASK: {"visual": {"modelName": model, "options": {}}}}
 
 
 def predict_worker(port, token, entries, image):
     """Execute one bound Library image request against an already owned llama.cpp runtime."""
-    if entries != worker_entries():
+    model = entries.get(DESCRIPTION_TASK, {}).get("visual", {}).get("modelName") if isinstance(entries, dict) else None
+    if model not in MODELS or entries != worker_entries(model):
         raise ValueError("Native prediction does not match the Qwen binding")
     connection, response = request_local(
-        port, "/v1/chat/completions", token, body=request_body(image), timeout=30,
+        port, "/v1/chat/completions", token, body=request_body(image), timeout=MODELS[model]["seconds"],
     )
     try:
         if response.status != 200:
@@ -307,13 +351,16 @@ def stop(process):
             process.wait(timeout=5)
 
 
-def qualify(binary, model, projector, backend, output, receipt=None):
+def qualify(binary, model, projector, backend, output, receipt=None, model_name=MODEL_NAME):
     if os.name != "posix" or (backend == "metal" and sys.platform != "darwin"):
         raise ValueError("Expected a POSIX host with the requested backend")
     if output.exists():
         raise ValueError("Expected a new qualification report")
     paths = {"model": model, "projector": projector}
-    inventory = converted_artifacts(receipt) if receipt else EXPORTED_FILES
+    export = MODELS[model_name]["export"]
+    if not receipt and not export:
+        raise ValueError("This model has no pinned third-party export: qualify its conversion receipt")
+    inventory = converted_artifacts(receipt, model_name) if receipt else export[1]
     checked = {name: checked_artifact(paths[name], expected) for name, expected in inventory.items()}
     binary_receipt = artifact(binary)
     fixtures = [
@@ -342,7 +389,7 @@ def qualify(binary, model, projector, backend, output, receipt=None):
             ], env=environment, cwd=scratch,
                 stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
         try:
-            deadline = time.monotonic() + 45
+            deadline = time.monotonic() + 45 + MODELS[model_name]["seconds"]
             while time.monotonic() < deadline and process.poll() is None:
                 try:
                     connection, response = request_local(port, "/health", token, timeout=1)
@@ -353,7 +400,7 @@ def qualify(binary, model, projector, backend, output, receipt=None):
                     pass
                 time.sleep(0.1)
             else:
-                raise ValueError("Qwen did not become ready within 45 seconds")
+                raise ValueError("Qwen did not become ready in time")
             connection, response = request_local(port, "/props", token)
             try:
                 data = response.read(LIMIT + 1)
@@ -365,7 +412,7 @@ def qualify(binary, model, projector, backend, output, receipt=None):
             finally:
                 connection.close()
             for color, shape, image in fixtures:
-                result = predict_worker(port, token, worker_entries(), image)
+                result = predict_worker(port, token, worker_entries(model_name), image)
                 text = result[DESCRIPTION_TASK]["description"]
                 if not all(re.search(rf"\b{word}\b", text, re.IGNORECASE) for word in (color, shape)):
                     raise ValueError(f"Golden photo description mismatch: {text}")
@@ -400,7 +447,8 @@ def qualify(binary, model, projector, backend, output, receipt=None):
     with output.open("x") as file:
         json.dump({
             "schemaVersion": 1, "scope": "synthetic-local-component", "releaseQualified": False,
-            "modelProvenance": {"conversionReceipt": artifact(receipt)} if receipt else {"exportRevision": EXPORT},
+            "modelName": model_name,
+            "modelProvenance": {"conversionReceipt": artifact(receipt)} if receipt else {"exportRevision": export[0]},
             "runtimeRevision": LLAMA, "build": build, "binary": binary_receipt,
             "requestedBackend": backend, "verifiedBackend": verified_backend, "backendEvidence": backend_evidence,
             "artifacts": checked, "goldens": records, "cancelled": True,
@@ -414,16 +462,21 @@ def main():
     prepare = commands.add_parser("convert")
     for name in ("source", "llama", "quantizer", "output"):
         prepare.add_argument(f"--{name}", type=Path, required=True)
+    prepare.add_argument("--model-name", choices=list(MODELS), default=MODEL_NAME)
+    prepare.add_argument("--license", type=Path, help="License text, for a model whose card states its license")
     run = commands.add_parser("qualify")
     for name in ("binary", "model", "projector", "output"):
         run.add_argument(f"--{name}", type=Path, required=True)
     run.add_argument("--backend", choices=["cpu", "metal"], required=True)
+    run.add_argument("--model-name", choices=list(MODELS), default=MODEL_NAME)
     run.add_argument("--receipt", type=Path, help="Local conversion receipt; otherwise use the pinned third-party export")
     args = parser.parse_args()
     if args.command == "convert":
-        convert(*(getattr(args, name).absolute() for name in ("source", "llama", "quantizer", "output")))
+        convert(*(getattr(args, name).absolute() for name in ("source", "llama", "quantizer", "output")),
+                args.model_name, args.license and args.license.absolute())
     else:
-        qualify(args.binary.absolute(), args.model.absolute(), args.projector.absolute(), args.backend, args.output.absolute(), args.receipt)
+        qualify(args.binary.absolute(), args.model.absolute(), args.projector.absolute(), args.backend,
+                args.output.absolute(), args.receipt, args.model_name)
 
 
 if __name__ == "__main__":

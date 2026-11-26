@@ -98,7 +98,9 @@ function fallbackReason(code: string): string {
 
 /** "Runs on CoreML", or "Runs on CPU (GPU acceleration is not used: …)" after a fallback. Empty when the backend has not chosen. */
 export function workloadProvider(providers: WorkloadProvider[] | null | undefined, workload: string): string {
-  const chosen = providers?.find(item => item.workload === workload);
+  // FD-31: the server's `enrichment` row is the `description` work this computer runs.
+  const key = workload === 'enrichment' ? 'description' : workload;
+  const chosen = providers?.find(item => item.workload === key);
   if (!chosen) return '';
   const name = providerNames[chosen.provider];
   if (!name) return '';

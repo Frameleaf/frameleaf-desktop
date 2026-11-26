@@ -512,8 +512,9 @@ jobs:
           fi
           for file in release-assets/*; do
             case "$file" in
-              # Unsigned Windows installers never enter the update feed (updateManifest refuses them).
-              *-unsigned.*) ;;
+              # The Windows MSI is Chocolatey's package and stays out of the update feed. The NSIS
+              # installer gets an updater signature: Desktop checks it before installing, Authenticode or not.
+              *-unsigned.msi) ;;
               *.app.tar.gz|*.AppImage|*.deb|*.msi|*.exe)
                 npm run tauri -- signer sign --app-version "$version" "$file"
                 ;;
@@ -570,7 +571,6 @@ jobs:
       - name: Verify updater signatures and create this run's manifest
         env:
           RELEASE_TAG: ${{ inputs.tag }}
-          RELEASE_PLATFORMS: ${{ inputs.platforms }}
         shell: bash
         run: |
           set -euo pipefail
@@ -578,14 +578,9 @@ jobs:
           import { readFileSync, readdirSync, writeFileSync } from "node:fs";
           import { updateManifest, verifyUpdaterAsset } from "./tools/release_inputs.mjs";
           const dir = "release-assets";
-          const packages = readdirSync(dir).filter(name => /\.(app\.tar\.gz|AppImage|deb|exe|msi)$/.test(name) && !/-unsigned\./.test(name));
+          const packages = readdirSync(dir).filter(name => /\.(app\.tar\.gz|AppImage|deb|exe|msi)$/.test(name) && !/-unsigned\.msi$/.test(name));
           const signatures = Object.fromEntries(packages.map(name => [name, readFileSync(`${dir}/${name}.sig`, "utf8")]));
-          // Unsigned Windows installers never enter the update feed, so a Windows run adds nothing to it.
-          // The draft merge still refuses a draft whose feed is empty: release Windows after another platform.
-          const windowsOnly = process.env.RELEASE_PLATFORMS === "windows" && !packages.length;
-          const manifest = windowsOnly
-            ? { version: process.env.RELEASE_TAG.slice(1), platforms: {} }
-            : updateManifest(process.env.RELEASE_TAG, process.env.GITHUB_REPOSITORY, signatures);
+          const manifest = updateManifest(process.env.RELEASE_TAG, process.env.GITHUB_REPOSITORY, signatures);
           const { plugins: { updater } } = JSON.parse(readFileSync("src-tauri/tauri.conf.json", "utf8"));
           for (const name of packages) verifyUpdaterAsset(`${dir}/${name}`, signatures[name], updater.pubkey, manifest.version);
           writeFileSync(`${process.env.RUNNER_TEMP}/incoming-latest.json`, JSON.stringify(manifest));

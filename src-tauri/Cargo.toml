@@ -1,6 +1,6 @@
 [package]
 name = "frameleaf-desktop"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 rust-version = "1.90"
 default-run = "frameleaf-desktop"
@@ -79,6 +79,12 @@ core-foundation = "0.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dbus = "0.9"
+
+# On Arm, sha2 0.10 uses the processor's SHA-256 instructions only through its assembly backend:
+# 1.9 GB/s against 0.31 GB/s, so checking the 4.7 GB of models at each launch takes seconds, not
+# 14 s. x86_64 detects its SHA instructions without this; the backend does not build with MSVC.
+[target.'cfg(all(target_arch = "aarch64", not(target_env = "msvc")))'.dependencies]
+sha2 = { version = "0.10", features = ["asm"] }
 
 # Large signed-pack verification must stay practical in unsigned development builds.
 [profile.dev.package.frameleaf-desktop]

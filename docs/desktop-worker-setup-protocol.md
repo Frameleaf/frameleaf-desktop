@@ -14,8 +14,10 @@ the server checks, not the wire format, so older desktops keep working.
 The server's model catalogue (`server/resources/desktop/model-catalogue.json` in frameleaf-app) is the
 only one. The desktop runs exactly the profile the server sends for each model the server selected, and
 keeps no catalogue of its own. Downloads come only from Frameleaf's model mirror and are hash-checked
-against that profile. The model runs in the factory-signed runtime and must reproduce the profile's
-`expectedOutput`. `runtime/model-catalogue.json` in this repository is a copy kept for tests and
+against that profile once, when they arrive. Later launches check only that each file is still there
+at its listed size, and the same goes for the runtime, whose bytes are hashed when it is installed
+(owner, 2026-11-23: a photos app need not re-read gigabytes at every start). The model runs in the
+factory-signed runtime and must reproduce the profile's `expectedOutput`. `runtime/model-catalogue.json` in this repository is a copy kept for tests and
 release tools. The app never reads it, and the release check keeps it equal to the paired server tag.
 
 When the desktop is the server (local-server mode), the packaged Frameleaf server reads its own
@@ -36,6 +38,8 @@ Owner decisions made during this work, which replace the original design:
   under runtime source `95593fc6887c74a705c85b0ab8c9685c79afb0e4`. Each is a twin of the newest
   processor profile for the same request: the same files, fixture and expected output, with a
   model key of its own. Nothing was removed or changed; the first 162 profiles are as before.
+  Epoch 18 (180 profiles) does the same for the server's next AI build, runtime source
+  `24ea593e19ce160b2e1dd8cdafb0c15ff34240d0`: nine more processor twins, nothing else changed.
 - **No desktop is offered those nine.** No desktop runtime is built or factory-signed from that
   source, and `/models` lists a profile only for the runtime source the desktop reports. The
   desktop parses them like any other profile and never runs them.
@@ -83,7 +87,7 @@ JSON inside that string, exactly the bytes the request proof (`x-frameleaf-deskt
 | Step | Desktop | Server |
 |---|---|---|
 | 1 | `POST /api/desktop/worker/models` `{runtimeSourceRevision, provider, protocolVersion: 2}` | For each enabled task, returns the model keys and the full catalogue profile of each. |
-| 2 | Validates each served profile, then downloads its files from the model mirror and hash-checks them against that profile. | — |
+| 2 | Validates each served profile, then downloads the files it does not have from the model mirror and hash-checks them against that profile. Files already downloaded are checked by size. | — |
 | 3 | `POST /api/desktop/worker/challenges` `{requestId, modelKey, provider, runtimeSourceRevision, runtime}` | Checks the factory signature on the runtime attestation, then issues the catalogue profile's fixture bound to a nonce. |
 | 4 | Runs the fixture in the signed runtime, which compares the result with the profile's `expectedOutput`. | — |
 | 5 | `POST /api/desktop/worker/challenges/{id}/report` `{report}` | Validates the report against the profile and runtime, then grants the model to this worker. |

@@ -35,7 +35,7 @@ const REMEMBERED: &str = "provider-failures.json";
 /// How Windows names an Intel or NVIDIA display adapter (the PCI vendor of its hardware id).
 const INTEL_ADAPTER: &str = "pci\\ven_8086&";
 const NVIDIA_ADAPTER: &str = "pci\\ven_10de&";
-const WORKLOADS: [&str; 3] = ["clip", "ocr", "face"];
+const WORKLOADS: [&str; 4] = ["clip", "ocr", "face", "description"];
 
 /// What this computer has. Injected so each operating system's rule is tested on all of them.
 pub(crate) trait Probe {
