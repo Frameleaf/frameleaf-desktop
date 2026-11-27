@@ -1843,7 +1843,7 @@ async fn serve(
     progress: Progress,
     mut timing: crate::startup_timing::StartupTiming,
 ) -> Result<(), String> {
-    use crate::{native_predictor::Step, transport};
+    use crate::native_predictor::Step;
     let (source, provider) = (
         installed.source_revision().to_owned(),
         installed.provider().to_owned(),
@@ -1903,11 +1903,8 @@ async fn serve(
         })
     });
     progress.set("preparing-models", None);
-    // The model mirror is Frameleaf's host, not the person's server: its own client.
-    let mirror = transport::public_client_builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|_| "network_client_unavailable")?;
+    // Models come from Frameleaf's Hugging Face organisation, not the person's server.
+    let models_client = crate::model_cache::client()?;
     // Complete acquisition before requesting short-lived nonces.
     let models_began = std::time::Instant::now();
     let mut caches = Vec::new();
@@ -1921,7 +1918,7 @@ async fn serve(
             let result = acquisition(
                 profile.prepare_cache(
                     &paths.data.join("models"),
-                    &mirror,
+                    &models_client,
                     &progress.cancelled,
                     allow_download,
                     |event| {

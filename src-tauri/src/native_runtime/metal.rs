@@ -500,7 +500,7 @@ mod local_pack {
         };
         let key = SigningKey::from_bytes(&[71; 32]);
         let cancel = AtomicBool::new(false);
-        let client = crate::transport::client().unwrap();
+        let client = crate::model_cache::client().unwrap();
         let mut failures = Vec::new();
         for manifest in ["manifest.json", "manifest-accelerated.json"] {
             let raw = fs::read(pack.join(manifest)).unwrap();

@@ -54,7 +54,7 @@ pub(crate) fn server_proxy() -> reqwest::Proxy {
     })
 }
 
-/// For Frameleaf's own download hosts (the model mirror, the release host), never a person's
+/// For Frameleaf's own download hosts (its Hugging Face models, the release host), never a person's
 /// server: always through the system's proxy settings, whatever server is in use.
 pub(crate) fn public_client_builder() -> ClientBuilder {
     Client::builder()
