@@ -99,7 +99,7 @@ jobs:
           repository: Frameleaf/frameleaf-app
           github-server-url: https://github.com
           token: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
-          ref: b3905b4aebd22e48a1a3843c2831efcef543336e
+          ref: 8f59d32af167975a3469c53fa7d8f7dc96ae0aeb
           path: coreml-server
           persist-credentials: false
       - name: Construct the CoreML pack with its device collector
@@ -107,7 +107,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python desktop/tools/build_runtime.py --source coreml-server --output coreml-candidate --revision b3905b4aebd22e48a1a3843c2831efcef543336e --epoch 6 --profile coreml-ort
+          python desktop/tools/build_runtime.py --source coreml-server --output coreml-candidate --revision 8f59d32af167975a3469c53fa7d8f7dc96ae0aeb --epoch 6 --profile coreml-ort
           test -s coreml-candidate/manifest.json
           test -s coreml-candidate/manifest-accelerated.json
           coreml-candidate/payload/python/bin/python3.12 -I -B -c "import onnxruntime as ort; print(ort.__version__, ort.get_available_providers()); assert 'CoreMLExecutionProvider' in ort.get_available_providers()"
@@ -244,7 +244,7 @@ jobs:
           repository: Frameleaf/frameleaf-app
           github-server-url: https://github.com
           token: ${{ secrets.GH_PUBLISH_TOKEN || github.token }}
-          ref: b3905b4aebd22e48a1a3843c2831efcef543336e
+          ref: 8f59d32af167975a3469c53fa7d8f7dc96ae0aeb
           path: server
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
@@ -260,7 +260,7 @@ jobs:
           RUNTIME_PROFILE: ${{ matrix.profile }}
         run: |
           set -euo pipefail
-          python desktop/tools/build_runtime.py --source server --output candidate --revision b3905b4aebd22e48a1a3843c2831efcef543336e --epoch 6 --profile "$RUNTIME_PROFILE"
+          python desktop/tools/build_runtime.py --source server --output candidate --revision 8f59d32af167975a3469c53fa7d8f7dc96ae0aeb --epoch 6 --profile "$RUNTIME_PROFILE"
           test -s candidate/manifest.json
           test -s candidate/manifest-accelerated.json
           case "$RUNTIME_PROFILE" in

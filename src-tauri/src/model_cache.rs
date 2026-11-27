@@ -658,8 +658,12 @@ const TEST_REVISION: &[(&str, &str, &str)] = &[(
 const TEST_REVISION: &[(&str, &str, &str)] = &[];
 /// Runtime sources that compare only the files that decide a model's output (no snapshot refs,
 /// dotfiles or `*.md`, frameleaf-app FL-1831). Every other runtime hashes every file of a cache
-/// against its profile. None is released yet.
+/// against its profile. Both are FL-1839's ports of that rule onto the released sources, CPU
+/// (`35ba35dd`) and accelerated (`b3905b4a`). A CPU pack and a separately downloaded GPU pack share
+/// model caches, so on any one target both are decisive or neither is (`runtime/profiles.json`).
 const DECISIVE_RUNTIMES: &[&str] = &[
+    "eab833240036a10b33c1eff5155be154793143cc",
+    "8f59d32af167975a3469c53fa7d8f7dc96ae0aeb",
     #[cfg(test)]
     "dddddddddddddddddddddddddddddddddddddddd",
 ];
@@ -667,9 +671,64 @@ const DECISIVE_RUNTIMES: &[&str] = &[
 /// compares them all, and only the output-deciding ones (plus the snapshot ref Desktop writes
 /// itself) for one that does not.
 pub(crate) fn stored(name: &str, runtime: &str) -> bool {
-    !DECISIVE_RUNTIMES.contains(&runtime)
-        || !(name.to_ascii_lowercase().ends_with(".md")
-            || name.split('/').any(|part| part.starts_with('.')))
+    !(decisive(runtime) && non_deciding(name))
+}
+pub(crate) fn decisive(runtime: &str) -> bool {
+    DECISIVE_RUNTIMES.contains(&runtime)
+}
+/// A read-me file or a dotfile: never loaded, so it cannot change a model's output.
+fn non_deciding(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".md") || name.split('/').any(|part| part.starts_with('.'))
+}
+/// A cache published before its runtime compared only output-deciding files still holds the
+/// model cards and dotfiles, and its receipt lists them. When the receipt is exactly this plan's
+/// files plus such non-deciding ones, with the same hashes, those files are removed and the
+/// receipt rewritten, so the verified weights are kept instead of being downloaded again.
+/// Anything else is left for the usual checks, which discard and repair the cache.
+fn drop_non_deciding_files(
+    model: &Path,
+    hashes: &serde_json::Map<String, serde_json::Value>,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let receipt_path = model.join(".frameleaf-staged.json");
+    let Ok(meta) = fs::symlink_metadata(&receipt_path) else {
+        return Ok(());
+    };
+    if !meta.is_file() || meta.len() > 4 * 1024 * 1024 {
+        return Ok(());
+    }
+    let Some(old) = fs::read(&receipt_path).ok().and_then(|raw| {
+        serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&raw).ok()
+    }) else {
+        return Ok(());
+    };
+    let extra: Vec<&String> = old
+        .keys()
+        .filter(|name| !hashes.contains_key(*name))
+        .collect();
+    if extra.is_empty()
+        || !extra.iter().all(|name| non_deciding(name))
+        || !hashes
+            .iter()
+            .all(|(name, hash)| old.get(name) == Some(hash))
+    {
+        return Ok(());
+    }
+    for name in extra {
+        check_cancel(cancel)?;
+        let path = model.join(name);
+        crate::native_runtime::absolute_directory(path.parent().ok_or("model_path_invalid")?)?;
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() => {
+                fs::remove_file(&path).map_err(|_| "model_inventory_invalid")?
+            }
+            Ok(_) => return Err("model_inventory_invalid".into()),
+            Err(_) => {}
+        }
+    }
+    fs::remove_file(&receipt_path).map_err(|_| "model_inventory_invalid")?;
+    let receipt = serde_json::to_vec(hashes).map_err(|_| "model_plan_invalid")?;
+    write_pinned(&receipt_path, &receipt, cancel)
 }
 fn hugging_face_revision(name: &str, revision: &str) -> Option<&'static str> {
     HUGGING_FACE_REVISIONS
@@ -803,6 +862,9 @@ async fn prepare_once(
     if !complete {
         private_directory(&candidate.join(plan.task))?;
         private_directory(&model)?;
+    }
+    if complete {
+        drop_non_deciding_files(&model, plan.hashes, cancel)?;
     }
     let reference = format!("models--frameleaf--{}/refs/main", plan.name);
     // Frameleaf's Hugging Face repositories hold every file of each profile byte for byte except
@@ -1601,6 +1663,7 @@ mod tests {
         let catalogue: serde_json::Value =
             serde_json::from_str(include_str!("../../runtime/model-catalogue.json")).unwrap();
         let mut from_mirror = std::collections::BTreeSet::new();
+        let mut decisive_profiles = 0;
         for profile in catalogue["profiles"].as_array().unwrap() {
             let name = profile["modelName"].as_str().unwrap();
             let revision = profile["modelSnapshotRevision"].as_str().unwrap();
@@ -1611,14 +1674,23 @@ mod tests {
                 "{name}: {commit} is not a commit"
             );
             assert_ne!(commit, revision, "{name}");
-            // No released runtime is decisive, so every profile keeps its card and those
-            // profiles stay on the mirror.
+            // A runtime that hashes every file keeps the card, so that profile stays on the
+            // mirror; a decisive runtime keeps no card, so all of its profiles come from Hugging Face.
             let runtime = profile["runtimeSourceRevision"].as_str().unwrap();
             let artifacts = profile["artifactBytes"].as_object().unwrap();
-            assert!(artifacts.keys().all(|file| stored(file, runtime)));
-            if artifacts.contains_key("README.md") {
+            let decisive = DECISIVE_RUNTIMES.contains(&runtime);
+            assert_eq!(
+                artifacts.keys().all(|file| stored(file, runtime)),
+                !decisive || !artifacts.keys().any(|file| non_deciding(file)),
+                "{name} {runtime}"
+            );
+            if artifacts
+                .keys()
+                .any(|file| file == "README.md" && stored(file, runtime))
+            {
                 from_mirror.insert(name);
             }
+            decisive_profiles += usize::from(decisive);
         }
         assert_eq!(
             from_mirror,
@@ -1631,6 +1703,8 @@ mod tests {
                 "buffalo_s",
             ])
         );
+        // FL-1839: every profile of both released sources has a decisive twin.
+        assert_eq!(decisive_profiles, 77);
         assert_eq!(hugging_face_revision("buffalo_l", &"0".repeat(40)), None);
         assert_eq!(
             hugging_face_revision("buffalo_s", "d09715916a0778919a770c343533641e250b8699"),
@@ -1663,6 +1737,83 @@ mod tests {
                 "{file}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_cache_from_before_keeps_its_weights_and_loses_only_cards_and_dotfiles() {
+        let root = Root::new();
+        let revision = "1".repeat(40);
+        let model = root.0.join(&revision).join("clip/test");
+        for directory in ["visual", "models--frameleaf--test/refs"] {
+            fs::create_dir_all(model.join(directory)).unwrap();
+        }
+        fs::write(model.join("visual/model.onnx"), b"weights").unwrap();
+        fs::write(model.join("models--frameleaf--test/refs/main"), &revision).unwrap();
+        fs::write(model.join("README.md"), b"card").unwrap();
+        fs::write(model.join(".gitattributes"), b"attributes").unwrap();
+        let reference = format!("{:x}", Sha256::digest(revision.as_bytes()));
+        let full = serde_json::json!({
+            "visual/model.onnx": weights_hash(),
+            "models--frameleaf--test/refs/main": reference,
+            "README.md": format!("{:x}", Sha256::digest(b"card")),
+            ".gitattributes": format!("{:x}", Sha256::digest(b"attributes")),
+        });
+        fs::write(
+            model.join(".frameleaf-staged.json"),
+            serde_json::to_vec(&full).unwrap(),
+        )
+        .unwrap();
+        // The plan of a decisive runtime: the same profile without the card and the dotfile.
+        let hashes = serde_json::json!({
+            "visual/model.onnx": weights_hash(),
+            "models--frameleaf--test/refs/main": reference,
+        });
+        let sizes = std::collections::BTreeMap::from([
+            ("visual/model.onnx".into(), 7),
+            ("models--frameleaf--test/refs/main".into(), 40),
+        ]);
+        let plan = CachePlan {
+            task: "clip",
+            name: "test",
+            revision: &revision,
+            hashes: hashes.as_object().unwrap(),
+            sizes: &sizes,
+        };
+        let client = crate::transport::client().unwrap();
+        let cancel = AtomicBool::new(false);
+        // No download permission and no host: the cache is kept, not acquired again.
+        let cache = prepare(plan, &root.0, &client, &cancel, false, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(cache, root.0.join(&revision));
+        assert_eq!(
+            fs::read(model.join("visual/model.onnx")).unwrap(),
+            b"weights"
+        );
+        assert!(!model.join("README.md").exists());
+        assert!(!model.join(".gitattributes").exists());
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(model.join(".frameleaf-staged.json")).unwrap())
+                .unwrap();
+        assert_eq!(receipt, hashes);
+        // A receipt that differs in a model file is not rewritten: the cache is repaired as before.
+        let other = serde_json::json!({
+            "visual/model.onnx": "0".repeat(64),
+            "models--frameleaf--test/refs/main": reference,
+            "README.md": format!("{:x}", Sha256::digest(b"card")),
+        });
+        fs::remove_file(model.join(".frameleaf-staged.json")).unwrap();
+        fs::write(
+            model.join(".frameleaf-staged.json"),
+            serde_json::to_vec(&other).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            prepare(plan, &root.0, &client, &cancel, false, |_| {})
+                .await
+                .unwrap_err(),
+            "model_download_permission_required"
+        );
     }
 
     #[tokio::test]

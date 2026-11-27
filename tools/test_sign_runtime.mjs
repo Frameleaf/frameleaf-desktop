@@ -323,19 +323,19 @@ test("PR274 CPU source is packageable only through its qualified macOS ARM64 app
     ),
   ).profiles;
   const source = "1ca4d52e2b8158d89d8de8b17e1e6535e17691f4";
-  // FL-1329: the factory CPU source is the runtime the server admits for faces and text. FD-31: that
-  // is now 35ba35dd, b3905b4a plus the Qwen binding (the same face and text keys as f2c451a6), and
-  // f2c451a6's packs stay packageable on every target.
+  // FL-1329: the factory CPU source is the runtime the server admits for faces and text. FD-31 made
+  // that 35ba35dd (b3905b4a plus the Qwen binding); FL-1839 made it eab83324, 35ba35dd comparing only
+  // the files that decide a model's output. f2c451a6's packs stay packageable where no separately
+  // downloaded GPU pack runs beside them: a GPU pack (8f59d32a, decisive) and a CPU pack must agree on
+  // which files a shared model cache holds.
   const released = "f2c451a6bf71ca3f3aec986e07f0852937268e2f";
   assert.equal(
     profiles["cpu-ort"].sourceRevision,
-    "35ba35dda671b99eb9c027e9168e185c31ebabf1",
+    "eab833240036a10b33c1eff5155be154793143cc",
   );
   assert.deepEqual(profiles["cpu-ort"].additionalSources, {
     "macos-aarch64": [released, source, "f93c34d196955da3e2760c095c08b27ccbf53315"],
     "macos-x86_64": [released],
-    "windows-x86_64": [released],
-    "linux-x86_64": [released],
     "linux-aarch64": [released, "f93c34d196955da3e2760c095c08b27ccbf53315"],
   });
   assert.deepEqual(Object.keys(profiles), [

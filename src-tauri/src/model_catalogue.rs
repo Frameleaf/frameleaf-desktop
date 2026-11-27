@@ -667,7 +667,7 @@ fn parse_catalogue(raw: &str) -> Result<Vec<ProfileData>, String> {
     if catalogue.schema_version != 1
         || catalogue.epoch == 0
         || catalogue.profiles.is_empty()
-        || catalogue.profiles.len() > 256
+        || catalogue.profiles.len() > 512
     {
         return Err(invalid());
     }
@@ -1538,7 +1538,9 @@ mod tests {
             "35d71372c16239db149a0e3f4e3c239a8f42fcd4",
         ];
         let (desktop, rest) = profiles.split_at(expected.len());
-        let (server_ai, epoch20) = rest.split_at(27);
+        let (server_ai, rest) = rest.split_at(27);
+        let (epoch20, rest) = rest.split_at(17);
+        let (epoch21, epoch22) = rest.split_at(9);
         for (index, profile) in server_ai.iter().enumerate() {
             assert_eq!(
                 profile.runtime_source_revision,
@@ -1602,6 +1604,47 @@ mod tests {
                 ),
             ]
         );
+        // Epoch 21 (FL-1831): the server's own AI build again, nine smart-search profiles.
+        for profile in epoch21 {
+            assert_eq!(
+                profile.runtime_source_revision,
+                "594a747fc8c50e6b7108cd0a58e21cae775ed381"
+            );
+            assert_eq!(profile.workload, "clip");
+        }
+        // Epoch 22 (FL-1839): a twin of every b3905b4a and 35ba35dd profile under the runtime source
+        // that compares only output-deciding files: the same profile and so the same digest.
+        let sources = [
+            (
+                "b3905b4aebd22e48a1a3843c2831efcef543336e",
+                "8f59d32af167975a3469c53fa7d8f7dc96ae0aeb",
+            ),
+            (
+                "35ba35dda671b99eb9c027e9168e185c31ebabf1",
+                "eab833240036a10b33c1eff5155be154793143cc",
+            ),
+        ];
+        let originals: Vec<&ProfileData> = profiles[..profiles.len() - epoch22.len()]
+            .iter()
+            .filter(|profile| {
+                sources
+                    .iter()
+                    .any(|(old, _)| profile.runtime_source_revision == *old)
+            })
+            .collect();
+        assert_eq!(epoch22.len(), 77);
+        assert_eq!(originals.len(), 77);
+        for (twin, original) in epoch22.iter().zip(originals) {
+            let (_, source) = sources
+                .iter()
+                .find(|(old, _)| original.runtime_source_revision == *old)
+                .unwrap();
+            assert_eq!(twin.runtime_source_revision, *source);
+            assert_eq!(twin.model_key, original.model_key);
+            assert_eq!(twin.spec, original.spec);
+            assert_eq!(twin.artifact_bytes, original.artifact_bytes);
+            assert_eq!(challenge(twin), challenge(original));
+        }
     }
     #[test]
     fn current_profiles_preserve_all_released_bindings_and_select_only_the_qualified_source() {
@@ -1677,6 +1720,38 @@ mod tests {
                 "{name}"
             );
         }
+    }
+    #[test]
+    fn a_cpu_pack_and_a_downloaded_gpu_pack_agree_on_which_files_a_cache_holds() {
+        // FL-1839: an accelerated profile on another dependency set is a separately downloaded pack
+        // that shares model caches with the CPU pack, so both must be decisive or neither.
+        let runtime = runtime_profiles();
+        let profiles = runtime["profiles"].as_object().unwrap();
+        let cpu = &profiles["cpu-ort"];
+        let mut checked = 0;
+        for (name, profile) in profiles {
+            if name == "cpu-ort" || profile["extra"] == cpu["extra"] {
+                continue;
+            }
+            let accelerated =
+                crate::model_cache::decisive(profile["sourceRevision"].as_str().unwrap());
+            for target in profile["targets"].as_array().unwrap() {
+                let target = target.as_str().unwrap();
+                let additional = cpu["additionalSources"][target]
+                    .as_array()
+                    .into_iter()
+                    .flatten();
+                for source in std::iter::once(&cpu["sourceRevision"]).chain(additional) {
+                    checked += 1;
+                    assert_eq!(
+                        crate::model_cache::decisive(source.as_str().unwrap()),
+                        accelerated,
+                        "{name} on {target} beside CPU source {source}"
+                    );
+                }
+            }
+        }
+        assert!(checked > 0);
     }
     #[test]
     fn every_selectable_runtime_source_and_provider_has_a_catalogue_profile() {
