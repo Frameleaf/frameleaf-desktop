@@ -73,7 +73,7 @@ required on the platforms where the provider will be offered.
 ## Catalogue profiles (epoch 20)
 
 Library's catalogue epoch 20 has both description profiles for runtime source `35ba35dd`:
-- Qwen3.5-4B, from the model mirror's `frameleaf/Qwen3.5-4B` (the pinned unsloth export, revision `90ad97bb`), with an 8 GiB floor.
+- Qwen3.5-4B, from Hugging Face `frameleaf/Qwen3.5-4B` (the pinned unsloth export, revision `90ad97bb`), with an 8 GiB floor.
 - Qwen2.5-VL-7B-Instruct, from `frameleaf/Qwen2.5-VL-7B-Instruct` (the pinned ggml-org export, revision `b58477fc`), with an 11.75 GiB floor.
 
 Library's `machine-learning/scripts/add_desktop_description_profiles.py` makes these profiles.

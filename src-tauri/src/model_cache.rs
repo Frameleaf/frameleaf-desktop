@@ -190,7 +190,7 @@ fn restart(file: &fs::File, offset: &mut u64) -> Result<(), Halt> {
     *offset = 0;
     Ok(())
 }
-/// One request: continue the partial from `offset` with `Range`, or start over when the mirror
+/// One request: continue the partial from `offset` with `Range`, or start over when the host
 /// answers with the whole object or a different one.
 #[allow(clippy::too_many_arguments)]
 async fn fetch(
@@ -220,7 +220,7 @@ async fn fetch(
             if response.content_length().is_some_and(|size| size != bytes) {
                 return Err(Halt::Fatal("model_download_invalid".into()));
             }
-            // The mirror ignored Range or the object changed: this body is the whole file.
+            // The host ignored Range or the object changed: this body is the whole file.
             if *offset > 0 {
                 restart(file, offset)?;
             }
@@ -570,7 +570,173 @@ pub(crate) enum CacheProgress {
     Verified(u64),
     Download { received: u64, total: u64 },
 }
+/// The client for model downloads: anonymous, HTTPS only, through the redirect Hugging Face answers with for
+/// its CDN. Every file is still checked against the catalogue's SHA-256 wherever it was served from.
+pub(crate) fn client() -> Result<Client, String> {
+    crate::transport::public_client_builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|_| "network_client_unavailable".into())
+}
+/// The self-hosted mirror, kept only for profiles a shipped runtime cannot take from Hugging Face
+/// (see `prepare_once`); it goes once no granted profile needs it.
 const MIRROR: &str = "https://models.frameleaf.cloud/frameleaf";
+/// Frameleaf's own Hugging Face organisation, read anonymously (FL-1839).
+const HUGGING_FACE: &str = "https://huggingface.co/frameleaf";
+/// `(model, catalogue snapshot revision, Hugging Face commit)`. The catalogue pins the revisions
+/// the models were first qualified at; Frameleaf's Hugging Face repositories hold the same model
+/// files under their own commits. Files are fetched at that immutable commit, never at a branch,
+/// and each is still checked against the catalogue's SHA-256. A catalogue revision missing here
+/// is refused, never fetched from somewhere else.
+const HUGGING_FACE_REVISIONS: &[(&str, &str, &str)] = &[
+    (
+        "ViT-B-16-SigLIP-384__webli",
+        "77dda0dfc7afd494b918ec174cddca24854a73d1",
+        "b1f7280d66de57c4899fba12e04d4a53556cd863",
+    ),
+    (
+        "ViT-B-32__openai",
+        "a857c8de2c07bbcfa6646adfcf31b798845afa1e",
+        "f55d8eec1cdd158d82835b94379ed852a8f706b8",
+    ),
+    (
+        "ViT-SO400M-16-SigLIP2-384__webli",
+        "19baa26af70bd3639ca0ca17d1560cb8056dd983",
+        "33f713835144fc1e605578c5c14712ddc9e34f58",
+    ),
+    (
+        "PP-OCRv5_mobile",
+        "be303f8b8cfb14da088d60b5e8ba6f3eafa4a823",
+        "644109087ddbc4ce09614dffb5a46952eb912423",
+    ),
+    (
+        "PP-OCRv5_server",
+        "1892860981cc723ac039bcc7a1de1fd85b86d830",
+        "842d5090ca9656d355f74800c6deac548fffafed",
+    ),
+    (
+        "buffalo_l",
+        "d09715916a0778919a770c343533641e250b8699",
+        "86aefdd33aaca3b1620eb7a2689783a5c9b0e179",
+    ),
+    (
+        "buffalo_m",
+        "b95a1bc582b2e58f9555673bdcfd5e14e1fbdc61",
+        "992eb3d14db3f2319efa2453960d29a197812a25",
+    ),
+    (
+        "buffalo_s",
+        "0ff1751885575e62e084dff70549ce24a11fa5dc",
+        "b852f23a0aa07c05f751bafa0249938fa4a42766",
+    ),
+    (
+        "antelopev2",
+        "51ca7e153bccebdbae224779e23c9c243e2fec85",
+        "71ba0500c05fe3565b89f5022d612279b3d56ec1",
+    ),
+    (
+        "Qwen3.5-4B",
+        "90ad97bb0b99e8ec58c6eb1a53d04baac0570482",
+        "e146e7dca2fd5785b51aefb35b56afe369e05b2a",
+    ),
+    (
+        "Qwen2.5-VL-7B-Instruct",
+        "b58477fc3ac80fa7f38d5cabf30bd2cdc1d9444f",
+        "512762b2652e922aa6ccc6272296af4a9d29c641",
+    ),
+];
+/// The tests' stand-in model: catalogue revision `1…1`, served at commit `2…2`.
+#[cfg(test)]
+const TEST_REVISION: &[(&str, &str, &str)] = &[(
+    "test",
+    "1111111111111111111111111111111111111111",
+    "2222222222222222222222222222222222222222",
+)];
+#[cfg(not(test))]
+const TEST_REVISION: &[(&str, &str, &str)] = &[];
+/// Runtime sources that compare only the files that decide a model's output (no snapshot refs,
+/// dotfiles or `*.md`, frameleaf-app FL-1831). Every other runtime hashes every file of a cache
+/// against its profile. Both are FL-1839's ports of that rule onto the released sources, CPU
+/// (`35ba35dd`) and accelerated (`b3905b4a`). A CPU pack and a separately downloaded GPU pack share
+/// model caches, so on any one target both are decisive or neither is (`runtime/profiles.json`).
+const DECISIVE_RUNTIMES: &[&str] = &[
+    "eab833240036a10b33c1eff5155be154793143cc",
+    "8f59d32af167975a3469c53fa7d8f7dc96ae0aeb",
+    #[cfg(test)]
+    "dddddddddddddddddddddddddddddddddddddddd",
+];
+/// Whether a profile file is kept in the cache for a runtime: every file for a runtime that
+/// compares them all, and only the output-deciding ones (plus the snapshot ref Desktop writes
+/// itself) for one that does not.
+pub(crate) fn stored(name: &str, runtime: &str) -> bool {
+    !(decisive(runtime) && non_deciding(name))
+}
+pub(crate) fn decisive(runtime: &str) -> bool {
+    DECISIVE_RUNTIMES.contains(&runtime)
+}
+/// A read-me file or a dotfile: never loaded, so it cannot change a model's output.
+fn non_deciding(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".md") || name.split('/').any(|part| part.starts_with('.'))
+}
+/// A cache published before its runtime compared only output-deciding files still holds the
+/// model cards and dotfiles, and its receipt lists them. When the receipt is exactly this plan's
+/// files plus such non-deciding ones, with the same hashes, those files are removed and the
+/// receipt rewritten, so the verified weights are kept instead of being downloaded again.
+/// Anything else is left for the usual checks, which discard and repair the cache.
+fn drop_non_deciding_files(
+    model: &Path,
+    hashes: &serde_json::Map<String, serde_json::Value>,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let receipt_path = model.join(".frameleaf-staged.json");
+    let Ok(meta) = fs::symlink_metadata(&receipt_path) else {
+        return Ok(());
+    };
+    if !meta.is_file() || meta.len() > 4 * 1024 * 1024 {
+        return Ok(());
+    }
+    let Some(old) = fs::read(&receipt_path).ok().and_then(|raw| {
+        serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&raw).ok()
+    }) else {
+        return Ok(());
+    };
+    let extra: Vec<&String> = old
+        .keys()
+        .filter(|name| !hashes.contains_key(*name))
+        .collect();
+    if extra.is_empty()
+        || !extra.iter().all(|name| non_deciding(name))
+        || !hashes
+            .iter()
+            .all(|(name, hash)| old.get(name) == Some(hash))
+    {
+        return Ok(());
+    }
+    for name in extra {
+        check_cancel(cancel)?;
+        let path = model.join(name);
+        crate::native_runtime::absolute_directory(path.parent().ok_or("model_path_invalid")?)?;
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() => {
+                fs::remove_file(&path).map_err(|_| "model_inventory_invalid")?
+            }
+            Ok(_) => return Err("model_inventory_invalid".into()),
+            Err(_) => {}
+        }
+    }
+    fs::remove_file(&receipt_path).map_err(|_| "model_inventory_invalid")?;
+    let receipt = serde_json::to_vec(hashes).map_err(|_| "model_plan_invalid")?;
+    write_pinned(&receipt_path, &receipt, cancel)
+}
+fn hugging_face_revision(name: &str, revision: &str) -> Option<&'static str> {
+    HUGGING_FACE_REVISIONS
+        .iter()
+        .chain(TEST_REVISION)
+        .find(|(model, pinned, _)| *model == name && *pinned == revision)
+        .map(|(_, _, commit)| *commit)
+}
 /// Free space kept beyond the bytes still to download: the receipt, the published copy's
 /// directory entries, and whatever else on the computer is writing at the same time.
 const DISK_MARGIN: u64 = 64 * 1024 * 1024;
@@ -582,12 +748,21 @@ pub(crate) async fn prepare(
     allow_download: bool,
     progress: impl Fn(CacheProgress),
 ) -> Result<PathBuf, String> {
-    prepare_from(MIRROR, plan, root, client, cancel, allow_download, progress).await
+    prepare_from(
+        (MIRROR, HUGGING_FACE),
+        plan,
+        root,
+        client,
+        cancel,
+        allow_download,
+        progress,
+    )
+    .await
 }
 /// A cache that fails its hash or inventory check is discarded and acquired again once; nothing
 /// is returned for use until every file has passed the catalogue check.
 async fn prepare_from(
-    mirror: &str,
+    sources: (&str, &str),
     plan: CachePlan<'_>,
     root: &Path,
     client: &Client,
@@ -597,7 +772,7 @@ async fn prepare_from(
 ) -> Result<PathBuf, String> {
     let credited = std::sync::atomic::AtomicU64::new(0);
     let first = prepare_once(
-        mirror,
+        sources,
         plan,
         root,
         client,
@@ -637,7 +812,7 @@ async fn prepare_from(
     }
     // Files already reported as verified must not be counted twice.
     prepare_once(
-        mirror,
+        sources,
         plan,
         root,
         client,
@@ -653,7 +828,7 @@ async fn prepare_from(
     .await
 }
 async fn prepare_once(
-    mirror: &str,
+    (mirror, hugging_face): (&str, &str),
     plan: CachePlan<'_>,
     root: &Path,
     client: &Client,
@@ -688,7 +863,18 @@ async fn prepare_once(
         private_directory(&candidate.join(plan.task))?;
         private_directory(&model)?;
     }
+    if complete {
+        drop_non_deciding_files(&model, plan.hashes, cancel)?;
+    }
     let reference = format!("models--frameleaf--{}/refs/main", plan.name);
+    // Frameleaf's Hugging Face repositories hold every file of each profile byte for byte except
+    // the model cards (`README.md`), which are new there. A plan that still lists a card is for a
+    // runtime that hashes every file, so it comes from the mirror; every other plan comes from
+    // Hugging Face at the commit mapped from its catalogue revision.
+    let from_hugging_face = !plan
+        .sizes
+        .keys()
+        .any(|name| name.to_ascii_lowercase().ends_with(".md"));
     if !complete {
         // Before the first request: what is still to download must fit, with room to spare.
         let remaining: u64 = plan
@@ -730,27 +916,26 @@ async fn prepare_once(
             directory.push(part);
             private_directory(&directory)?;
         }
+        let sha256 = plan.hashes[name].as_str().ok_or("model_plan_invalid")?;
         if name == &reference {
             write_pinned(&path, plan.revision.as_bytes(), cancel)?;
         } else {
             if !path.exists() && !allow_download {
                 return Err("model_download_permission_required".into());
             }
-            let url = format!("{mirror}/{}/resolve/{}/{name}", plan.name, plan.revision);
-            acquire_file_with_progress(
-                client,
-                &url,
-                &path,
-                *bytes,
-                plan.hashes[name].as_str().ok_or("model_plan_invalid")?,
-                cancel,
-                |received| {
-                    progress(CacheProgress::Download {
-                        received,
-                        total: *bytes,
-                    })
-                },
-            )
+            let url = if from_hugging_face {
+                let commit = hugging_face_revision(plan.name, plan.revision)
+                    .ok_or("model_download_invalid")?;
+                format!("{hugging_face}/{}/resolve/{commit}/{name}", plan.name)
+            } else {
+                format!("{mirror}/{}/resolve/{}/{name}", plan.name, plan.revision)
+            };
+            acquire_file_with_progress(client, &url, &path, *bytes, sha256, cancel, |received| {
+                progress(CacheProgress::Download {
+                    received,
+                    total: *bytes,
+                })
+            })
             .await?;
         }
         progress(CacheProgress::Verified(*bytes));
@@ -1079,7 +1264,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mirror = format!("http://{}", listener.local_addr().unwrap());
         let result = prepare_from(
-            &mirror,
+            (&mirror, &mirror),
             CachePlan {
                 task: "clip",
                 name: "test",
@@ -1416,7 +1601,7 @@ mod tests {
         let (mirror, server) = serve(vec![reply("200 OK", "", 7, b"weights")]);
         let verified = std::cell::Cell::new(0);
         let repaired = prepare_from(
-            &mirror,
+            (&mirror, &mirror),
             staged.plan(),
             &root.0,
             &client,
@@ -1432,9 +1617,10 @@ mod tests {
         .unwrap();
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 1);
+        // At the Hugging Face commit mapped from the catalogue revision, never the revision itself.
         assert!(requests[0].starts_with(&format!(
             "get /test/resolve/{}/visual/model.onnx ",
-            staged.revision
+            "2".repeat(40)
         )));
         assert_eq!(repaired, cache);
         assert_eq!(fs::read(&model).unwrap(), b"weights");
@@ -1448,7 +1634,7 @@ mod tests {
         ]);
         assert_eq!(
             prepare_from(
-                &mirror,
+                (&mirror, &mirror),
                 staged.plan(),
                 &root.0,
                 &client,
@@ -1469,6 +1655,245 @@ mod tests {
                 staged.revision
             ))
             .exists());
+    }
+
+    #[test]
+    fn every_catalogue_model_has_a_fixed_hugging_face_commit_and_cards_stay_on_the_mirror() {
+        assert_eq!(HUGGING_FACE, "https://huggingface.co/frameleaf");
+        let catalogue: serde_json::Value =
+            serde_json::from_str(include_str!("../../runtime/model-catalogue.json")).unwrap();
+        let mut from_mirror = std::collections::BTreeSet::new();
+        let mut decisive_profiles = 0;
+        for profile in catalogue["profiles"].as_array().unwrap() {
+            let name = profile["modelName"].as_str().unwrap();
+            let revision = profile["modelSnapshotRevision"].as_str().unwrap();
+            let commit = hugging_face_revision(name, revision)
+                .unwrap_or_else(|| panic!("{name}@{revision} has no Hugging Face commit"));
+            assert!(
+                commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{name}: {commit} is not a commit"
+            );
+            assert_ne!(commit, revision, "{name}");
+            // A runtime that hashes every file keeps the card, so that profile stays on the
+            // mirror; a decisive runtime keeps no card, so all of its profiles come from Hugging Face.
+            let runtime = profile["runtimeSourceRevision"].as_str().unwrap();
+            let artifacts = profile["artifactBytes"].as_object().unwrap();
+            let decisive = DECISIVE_RUNTIMES.contains(&runtime);
+            assert_eq!(
+                artifacts.keys().all(|file| stored(file, runtime)),
+                !decisive || !artifacts.keys().any(|file| non_deciding(file)),
+                "{name} {runtime}"
+            );
+            if artifacts
+                .keys()
+                .any(|file| file == "README.md" && stored(file, runtime))
+            {
+                from_mirror.insert(name);
+            }
+            decisive_profiles += usize::from(decisive);
+        }
+        assert_eq!(
+            from_mirror,
+            std::collections::BTreeSet::from([
+                "ViT-B-16-SigLIP-384__webli",
+                "ViT-B-32__openai",
+                "ViT-SO400M-16-SigLIP2-384__webli",
+                "antelopev2",
+                "buffalo_m",
+                "buffalo_s",
+            ])
+        );
+        // FL-1839: every profile of both released sources has a decisive twin.
+        assert_eq!(decisive_profiles, 77);
+        assert_eq!(hugging_face_revision("buffalo_l", &"0".repeat(40)), None);
+        assert_eq!(
+            hugging_face_revision("buffalo_s", "d09715916a0778919a770c343533641e250b8699"),
+            None,
+            "a revision belongs to its own model only"
+        );
+    }
+
+    #[test]
+    fn a_decisive_runtime_keeps_only_output_deciding_files_and_the_snapshot_ref() {
+        let decisive = "d".repeat(40);
+        for file in [
+            "visual/model.onnx",
+            "config.json",
+            "textual/tokenizer.json",
+            "LICENSE",
+            "models--frameleaf--test/refs/main",
+        ] {
+            assert!(stored(file, &decisive), "{file}");
+        }
+        for file in [
+            "README.md",
+            "notes/Card.MD",
+            ".gitattributes",
+            "visual/.hidden",
+        ] {
+            assert!(!stored(file, &decisive), "{file}");
+            assert!(
+                stored(file, "25b22c16e47a27a2eb50017d838497abce850d11"),
+                "{file}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cache_from_before_keeps_its_weights_and_loses_only_cards_and_dotfiles() {
+        let root = Root::new();
+        let revision = "1".repeat(40);
+        let model = root.0.join(&revision).join("clip/test");
+        for directory in ["visual", "models--frameleaf--test/refs"] {
+            fs::create_dir_all(model.join(directory)).unwrap();
+        }
+        fs::write(model.join("visual/model.onnx"), b"weights").unwrap();
+        fs::write(model.join("models--frameleaf--test/refs/main"), &revision).unwrap();
+        fs::write(model.join("README.md"), b"card").unwrap();
+        fs::write(model.join(".gitattributes"), b"attributes").unwrap();
+        let reference = format!("{:x}", Sha256::digest(revision.as_bytes()));
+        let full = serde_json::json!({
+            "visual/model.onnx": weights_hash(),
+            "models--frameleaf--test/refs/main": reference,
+            "README.md": format!("{:x}", Sha256::digest(b"card")),
+            ".gitattributes": format!("{:x}", Sha256::digest(b"attributes")),
+        });
+        fs::write(
+            model.join(".frameleaf-staged.json"),
+            serde_json::to_vec(&full).unwrap(),
+        )
+        .unwrap();
+        // The plan of a decisive runtime: the same profile without the card and the dotfile.
+        let hashes = serde_json::json!({
+            "visual/model.onnx": weights_hash(),
+            "models--frameleaf--test/refs/main": reference,
+        });
+        let sizes = std::collections::BTreeMap::from([
+            ("visual/model.onnx".into(), 7),
+            ("models--frameleaf--test/refs/main".into(), 40),
+        ]);
+        let plan = CachePlan {
+            task: "clip",
+            name: "test",
+            revision: &revision,
+            hashes: hashes.as_object().unwrap(),
+            sizes: &sizes,
+        };
+        let client = crate::transport::client().unwrap();
+        let cancel = AtomicBool::new(false);
+        // No download permission and no host: the cache is kept, not acquired again.
+        let cache = prepare(plan, &root.0, &client, &cancel, false, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(cache, root.0.join(&revision));
+        assert_eq!(
+            fs::read(model.join("visual/model.onnx")).unwrap(),
+            b"weights"
+        );
+        assert!(!model.join("README.md").exists());
+        assert!(!model.join(".gitattributes").exists());
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(model.join(".frameleaf-staged.json")).unwrap())
+                .unwrap();
+        assert_eq!(receipt, hashes);
+        // A receipt that differs in a model file is not rewritten: the cache is repaired as before.
+        let other = serde_json::json!({
+            "visual/model.onnx": "0".repeat(64),
+            "models--frameleaf--test/refs/main": reference,
+            "README.md": format!("{:x}", Sha256::digest(b"card")),
+        });
+        fs::remove_file(model.join(".frameleaf-staged.json")).unwrap();
+        fs::write(
+            model.join(".frameleaf-staged.json"),
+            serde_json::to_vec(&other).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            prepare(plan, &root.0, &client, &cancel, false, |_| {})
+                .await
+                .unwrap_err(),
+            "model_download_permission_required"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plan_with_a_card_comes_from_the_mirror_at_its_catalogue_revision() {
+        let root = Root::new();
+        let card = b"card";
+        let revision = "1".repeat(40);
+        let hashes = serde_json::json!({
+            "README.md": format!("{:x}", Sha256::digest(card)),
+            "visual/model.onnx": weights_hash(),
+            "models--frameleaf--test/refs/main": format!("{:x}", Sha256::digest(revision.as_bytes())),
+        });
+        let sizes = std::collections::BTreeMap::from([
+            ("README.md".into(), 4),
+            ("visual/model.onnx".into(), 7),
+            ("models--frameleaf--test/refs/main".into(), 40),
+        ]);
+        let (mirror, server) = serve(vec![
+            reply("200 OK", "", 4, card),
+            reply("200 OK", "", 7, b"weights"),
+        ]);
+        let hugging_face = TcpListener::bind("127.0.0.1:0").unwrap();
+        let cache = prepare_from(
+            (
+                &mirror,
+                &format!("http://{}", hugging_face.local_addr().unwrap()),
+            ),
+            CachePlan {
+                task: "clip",
+                name: "test",
+                revision: &revision,
+                hashes: hashes.as_object().unwrap(),
+                sizes: &sizes,
+            },
+            &root.0,
+            &crate::transport::client().unwrap(),
+            &AtomicBool::new(false),
+            true,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with(&format!("get /test/resolve/{revision}/readme.md ")));
+        assert!(
+            requests[1].starts_with(&format!("get /test/resolve/{revision}/visual/model.onnx "))
+        );
+        hugging_face.set_nonblocking(true).unwrap();
+        assert!(hugging_face.accept().is_err(), "Hugging Face was contacted");
+        assert_eq!(fs::read(cache.join("clip/test/README.md")).unwrap(), card);
+    }
+
+    #[tokio::test]
+    async fn a_revision_without_a_hugging_face_commit_is_refused_without_a_request() {
+        let root = Root::new();
+        let revision = "3".repeat(40);
+        let hashes = serde_json::json!({"visual/model.onnx": weights_hash()});
+        let sizes = std::collections::BTreeMap::from([("visual/model.onnx".into(), 7)]);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let source = format!("http://{}", listener.local_addr().unwrap());
+        let result = prepare_from(
+            (&source, &source),
+            CachePlan {
+                task: "clip",
+                name: "test",
+                revision: &revision,
+                hashes: hashes.as_object().unwrap(),
+                sizes: &sizes,
+            },
+            &root.0,
+            &crate::transport::client().unwrap(),
+            &AtomicBool::new(false),
+            true,
+            |_| {},
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "model_download_invalid");
+        listener.set_nonblocking(true).unwrap();
+        assert!(listener.accept().is_err(), "the source was contacted");
+        assert!(!root.0.join(&revision).exists());
     }
 
     #[tokio::test]
@@ -1493,7 +1918,7 @@ mod tests {
             // The check alone reports what is missing; the repair acquires it again.
             assert_eq!(
                 prepare_once(
-                    "http://127.0.0.1:1",
+                    ("http://127.0.0.1:1", "http://127.0.0.1:1"),
                     staged.plan(),
                     &root.0,
                     &client,
@@ -1507,7 +1932,7 @@ mod tests {
             );
             let (mirror, server) = serve(vec![reply("200 OK", "", 7, b"weights")]);
             let repaired = prepare_from(
-                &mirror,
+                (&mirror, &mirror),
                 staged.plan(),
                 &root.0,
                 &client,

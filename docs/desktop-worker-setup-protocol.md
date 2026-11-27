@@ -13,7 +13,9 @@ the server checks, not the wire format, so older desktops keep working.
 
 The server's model catalogue (`server/resources/desktop/model-catalogue.json` in frameleaf-app) is the
 only one. The desktop runs exactly the profile the server sends for each model the server selected, and
-keeps no catalogue of its own. Downloads come only from Frameleaf's model mirror and are hash-checked
+keeps no catalogue of its own. Downloads come from Frameleaf's Hugging Face organisation
+(`huggingface.co/frameleaf`, anonymous, at a fixed commit per model), or from Frameleaf's model
+mirror for a profile that pins a model card the runtime hashes (`model_cache::prepare_once`), and are hash-checked
 against that profile once, when they arrive. Later launches check only that each file is still there
 at its listed size, and the same goes for the runtime, whose bytes are hashed when it is installed
 (owner, 2026-11-23: a photos app need not re-read gigabytes at every start). The model runs in the
@@ -87,7 +89,7 @@ JSON inside that string, exactly the bytes the request proof (`x-frameleaf-deskt
 | Step | Desktop | Server |
 |---|---|---|
 | 1 | `POST /api/desktop/worker/models` `{runtimeSourceRevision, provider, protocolVersion: 2}` | For each enabled task, returns the model keys and the full catalogue profile of each. |
-| 2 | Validates each served profile, then downloads the files it does not have from the model mirror and hash-checks them against that profile. Files already downloaded are checked by size. | — |
+| 2 | Validates each served profile, then downloads the files it does not have from Frameleaf's Hugging Face organisation (or the model mirror, for a profile that pins a model card) and hash-checks them against that profile. Files already downloaded are checked by size. | — |
 | 3 | `POST /api/desktop/worker/challenges` `{requestId, modelKey, provider, runtimeSourceRevision, runtime}` | Checks the factory signature on the runtime attestation, then issues the catalogue profile's fixture bound to a nonce. |
 | 4 | Runs the fixture in the signed runtime, which compares the result with the profile's `expectedOutput`. | — |
 | 5 | `POST /api/desktop/worker/challenges/{id}/report` `{report}` | Validates the report against the profile and runtime, then grants the model to this worker. |

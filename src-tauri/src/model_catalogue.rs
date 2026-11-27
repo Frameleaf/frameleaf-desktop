@@ -1,5 +1,5 @@
 //! Model profiles come from the server's catalogue, the only one: the server sends the profile of each model
-//! it selected, and this computer validates, downloads (from Frameleaf's model mirror, hash-checked) and runs
+//! it selected, and this computer validates, downloads (from Frameleaf's Hugging Face organisation, hash-checked) and runs
 //! exactly that profile in its factory-signed runtime. `runtime/model-catalogue.json` is a copy of the server's
 //! catalogue for tests and release tools only; the app never reads it.
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -83,7 +83,9 @@ impl ApprovedProfile {
         )
     }
     pub(crate) fn cache_bytes(&self) -> u64 {
-        self.0.artifact_bytes.values().copied().sum()
+        self.0
+            .stored_artifacts()
+            .map_or(0, |(_, sizes)| sizes.values().copied().sum())
     }
     pub(crate) async fn prepare_cache(
         &self,
@@ -93,6 +95,7 @@ impl ApprovedProfile {
         allow_download: bool,
         progress: impl Fn(crate::model_cache::CacheProgress),
     ) -> Result<std::path::PathBuf, String> {
+        let (hashes, sizes) = self.0.stored_artifacts()?;
         crate::model_cache::prepare(
             crate::model_cache::CachePlan {
                 task: self.0.spec["models"][0]["task"]
@@ -100,10 +103,8 @@ impl ApprovedProfile {
                     .ok_or_else(invalid)?,
                 name: &self.0.model_name,
                 revision: &self.0.model_snapshot_revision,
-                hashes: self.0.spec["models"][0]["artifacts"]
-                    .as_object()
-                    .ok_or_else(invalid)?,
-                sizes: &self.0.artifact_bytes,
+                hashes: &hashes,
+                sizes: &sizes,
             },
             root,
             client,
@@ -146,7 +147,29 @@ fn safe_path(value: &str) -> bool {
                     && matches!(stem.as_bytes()[3], b'1'..=b'9'))
         })
 }
+/// A profile's stored files: SHA-256 and size by path.
+type StoredArtifacts = (serde_json::Map<String, Value>, BTreeMap<String, u64>);
 impl ProfileData {
+    /// The profile's files this computer keeps for its runtime (`model_cache::stored`), with their
+    /// SHA-256 and size. The model key and challenge still name every file of the profile.
+    fn stored_artifacts(&self) -> Result<StoredArtifacts, String> {
+        let hashes = self.spec["models"][0]["artifacts"]
+            .as_object()
+            .ok_or_else(invalid)?;
+        let keep = |name: &String| crate::model_cache::stored(name, &self.runtime_source_revision);
+        Ok((
+            hashes
+                .iter()
+                .filter(|(name, _)| keep(name))
+                .map(|(name, hash)| (name.clone(), hash.clone()))
+                .collect(),
+            self.artifact_bytes
+                .iter()
+                .filter(|(name, _)| keep(name))
+                .map(|(name, bytes)| (name.clone(), *bytes))
+                .collect(),
+        ))
+    }
     pub fn model_key(&self) -> &str {
         &self.model_key
     }
@@ -644,7 +667,7 @@ fn parse_catalogue(raw: &str) -> Result<Vec<ProfileData>, String> {
     if catalogue.schema_version != 1
         || catalogue.epoch == 0
         || catalogue.profiles.is_empty()
-        || catalogue.profiles.len() > 256
+        || catalogue.profiles.len() > 512
     {
         return Err(invalid());
     }
@@ -751,10 +774,8 @@ pub(crate) fn shared_cache(
                 .ok_or_else(invalid)?,
         )
         .join(&profile.model_name);
-        let hashes = profile.spec["models"][0]["artifacts"]
-            .as_object()
-            .ok_or_else(invalid)?;
-        let receipt = serde_json::to_vec(hashes).map_err(|_| invalid())?;
+        let (hashes, sizes) = profile.stored_artifacts()?;
+        let receipt = serde_json::to_vec(&hashes).map_err(|_| invalid())?;
         let mut add = |name: &str, bytes: u64, hash: String| -> Result<(), String> {
             let relative = prefix.join(name);
             if let Some((_, old_bytes, old_hash)) = files.get(&relative) {
@@ -766,7 +787,7 @@ pub(crate) fn shared_cache(
             }
             Ok(())
         };
-        for (name, bytes) in &profile.artifact_bytes {
+        for (name, bytes) in &sizes {
             add(
                 name,
                 *bytes,
@@ -1075,6 +1096,61 @@ mod tests {
             assert_eq!(result.unwrap(), root.join(reference));
         }
     }
+    #[tokio::test]
+    async fn a_decisive_runtime_caches_and_counts_only_output_deciding_files() {
+        let mut profile: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/ocr-profile.json")).unwrap();
+        let (weights, card) = (b"fixture weights".as_slice(), b"card".as_slice());
+        let revision = profile["modelSnapshotRevision"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let ref_path = "models--frameleaf--PP-OCRv5_mobile/refs/main".to_owned();
+        let all = json!({"detection/model.onnx":digest(weights),"recognition/model.onnx":digest(weights),"README.md":digest(card),".gitattributes":digest(card),ref_path.clone():digest(revision.as_bytes())});
+        profile["artifactBytes"] = json!({"detection/model.onnx":weights.len(),"recognition/model.onnx":weights.len(),"README.md":card.len(),".gitattributes":card.len(),ref_path.clone():revision.len()});
+        profile["runtimeSourceRevision"] = json!("d".repeat(40));
+        for model in profile["spec"]["models"].as_array_mut().unwrap() {
+            model["artifacts"] = all.clone();
+        }
+        let identity = json!({"protocolVersion":1,"entries":profile["spec"]["entries"],"models":profile["spec"]["models"],"preprocessingSha256":profile["spec"]["preprocessingSha256"]});
+        let key = format!("ocr:{}", digest(&serde_json::to_vec(&identity).unwrap()));
+        profile["modelKey"] = json!(key);
+        profile["spec"]["modelKey"] = json!(key);
+        let profile = ApprovedProfile::from_served(&profile).unwrap();
+        assert_eq!(
+            profile.cache_bytes(),
+            (weights.len() * 2 + revision.len()) as u64
+        );
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("frameleaf-decisive-cache-{}", Uuid::new_v4()));
+        let model = root.join(&revision).join("ocr/PP-OCRv5_mobile");
+        for role in ["detection", "recognition"] {
+            std::fs::create_dir_all(model.join(role)).unwrap();
+            std::fs::write(model.join(role).join("model.onnx"), weights).unwrap();
+        }
+        std::fs::create_dir_all(model.join(&ref_path).parent().unwrap()).unwrap();
+        std::fs::write(model.join(&ref_path), revision.as_bytes()).unwrap();
+        // The runtime checks this receipt against the files on disk, so it lists only those.
+        let stored = json!({"detection/model.onnx":digest(weights),"recognition/model.onnx":digest(weights),ref_path.clone():digest(revision.as_bytes())});
+        std::fs::write(
+            model.join(".frameleaf-staged.json"),
+            serde_json::to_vec(&stored).unwrap(),
+        )
+        .unwrap();
+        let result = profile
+            .prepare_cache(
+                &root,
+                &crate::transport::client().unwrap(),
+                &std::sync::atomic::AtomicBool::new(false),
+                false,
+                |_| {},
+            )
+            .await;
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(result.unwrap(), root.join(revision));
+    }
     #[test]
     fn refuses_face_engine_vector_and_output_changes_with_a_recomputed_identity() {
         let original: Value =
@@ -1169,7 +1245,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(profiles.len(), 3);
-        let client = crate::transport::client().unwrap();
+        let client = crate::model_cache::client().unwrap();
         for profile in profiles {
             let path = profile
                 .prepare_cache(
@@ -1462,7 +1538,9 @@ mod tests {
             "35d71372c16239db149a0e3f4e3c239a8f42fcd4",
         ];
         let (desktop, rest) = profiles.split_at(expected.len());
-        let (server_ai, epoch20) = rest.split_at(27);
+        let (server_ai, rest) = rest.split_at(27);
+        let (epoch20, rest) = rest.split_at(17);
+        let (epoch21, epoch22) = rest.split_at(9);
         for (index, profile) in server_ai.iter().enumerate() {
             assert_eq!(
                 profile.runtime_source_revision,
@@ -1526,6 +1604,47 @@ mod tests {
                 ),
             ]
         );
+        // Epoch 21 (FL-1831): the server's own AI build again, nine smart-search profiles.
+        for profile in epoch21 {
+            assert_eq!(
+                profile.runtime_source_revision,
+                "594a747fc8c50e6b7108cd0a58e21cae775ed381"
+            );
+            assert_eq!(profile.workload, "clip");
+        }
+        // Epoch 22 (FL-1839): a twin of every b3905b4a and 35ba35dd profile under the runtime source
+        // that compares only output-deciding files: the same profile and so the same digest.
+        let sources = [
+            (
+                "b3905b4aebd22e48a1a3843c2831efcef543336e",
+                "8f59d32af167975a3469c53fa7d8f7dc96ae0aeb",
+            ),
+            (
+                "35ba35dda671b99eb9c027e9168e185c31ebabf1",
+                "eab833240036a10b33c1eff5155be154793143cc",
+            ),
+        ];
+        let originals: Vec<&ProfileData> = profiles[..profiles.len() - epoch22.len()]
+            .iter()
+            .filter(|profile| {
+                sources
+                    .iter()
+                    .any(|(old, _)| profile.runtime_source_revision == *old)
+            })
+            .collect();
+        assert_eq!(epoch22.len(), 77);
+        assert_eq!(originals.len(), 77);
+        for (twin, original) in epoch22.iter().zip(originals) {
+            let (_, source) = sources
+                .iter()
+                .find(|(old, _)| original.runtime_source_revision == *old)
+                .unwrap();
+            assert_eq!(twin.runtime_source_revision, *source);
+            assert_eq!(twin.model_key, original.model_key);
+            assert_eq!(twin.spec, original.spec);
+            assert_eq!(twin.artifact_bytes, original.artifact_bytes);
+            assert_eq!(challenge(twin), challenge(original));
+        }
     }
     #[test]
     fn current_profiles_preserve_all_released_bindings_and_select_only_the_qualified_source() {
@@ -1601,6 +1720,38 @@ mod tests {
                 "{name}"
             );
         }
+    }
+    #[test]
+    fn a_cpu_pack_and_a_downloaded_gpu_pack_agree_on_which_files_a_cache_holds() {
+        // FL-1839: an accelerated profile on another dependency set is a separately downloaded pack
+        // that shares model caches with the CPU pack, so both must be decisive or neither.
+        let runtime = runtime_profiles();
+        let profiles = runtime["profiles"].as_object().unwrap();
+        let cpu = &profiles["cpu-ort"];
+        let mut checked = 0;
+        for (name, profile) in profiles {
+            if name == "cpu-ort" || profile["extra"] == cpu["extra"] {
+                continue;
+            }
+            let accelerated =
+                crate::model_cache::decisive(profile["sourceRevision"].as_str().unwrap());
+            for target in profile["targets"].as_array().unwrap() {
+                let target = target.as_str().unwrap();
+                let additional = cpu["additionalSources"][target]
+                    .as_array()
+                    .into_iter()
+                    .flatten();
+                for source in std::iter::once(&cpu["sourceRevision"]).chain(additional) {
+                    checked += 1;
+                    assert_eq!(
+                        crate::model_cache::decisive(source.as_str().unwrap()),
+                        accelerated,
+                        "{name} on {target} beside CPU source {source}"
+                    );
+                }
+            }
+        }
+        assert!(checked > 0);
     }
     #[test]
     fn every_selectable_runtime_source_and_provider_has_a_catalogue_profile() {
